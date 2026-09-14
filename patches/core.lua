@@ -72,19 +72,19 @@ M.install = function()
     end
 
     -- =========================================================================
-    -- 补丁2：ReadHistory — 番茄缓存文件不进入阅读历史
+    -- 补丁2：ReadHistory — 已移除，让番茄章节进历史（支持"继续阅读"）
     -- =========================================================================
-    local ReadHistory = require("readhistory")
-    if not ReadHistory[M._mark] then
-        local original_addItem = ReadHistory.addItem
-        function ReadHistory:addItem(file, ts, no_flush)
-            if is_fanqie_path(file) then
-                return
-            end
-            return original_addItem(self, file, ts, no_flush)
-        end
-        ReadHistory[M._mark] = true
-    end
+    -- local ReadHistory = require("readhistory")
+    -- if not ReadHistory[M._mark] then
+    --     local original_addItem = ReadHistory.addItem
+    --     function ReadHistory:addItem(file, ts, no_flush)
+    --         if is_fanqie_path(file) then
+    --             return
+    --         end
+    --         return original_addItem(self, file, ts, no_flush)
+    --     end
+    --     ReadHistory[M._mark] = true
+    -- end
 
     -- =========================================================================
     -- 补丁3：ReaderPaging — 在第一页前翻页时触发上一章
