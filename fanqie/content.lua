@@ -1,3 +1,5 @@
+local util = require("util")
+
 local function rshift(n, k)
     return math.floor(n / (2 ^ k))
 end
@@ -171,9 +173,18 @@ local function fix_svg_imgs_in_text(text)
 end
 
 local function basename_safe(value)
-    value = tostring(value or ""):gsub("[^%w%._-]", "_")
+    value = tostring(value or "")
+        :gsub("[/\\:%*%?\"<>|]", "_")
+        :gsub("%c", "")
+        :gsub("^%s+", ""):gsub("%s+$", "")
+        :gsub("^%.+", ""):gsub("%.+$", "")
     if value == "" then
         value = "fanqie"
+    end
+    -- 最多 10 个字符
+    local chars = util.splitToChars(value)
+    if #chars > 10 then
+        value = table.concat(chars, "", 1, 10)
     end
     return value
 end
@@ -181,7 +192,23 @@ end
 
 
 function Content.book_cache_dir(settings, book_id)
-    return settings.cache_dir .. "/" .. basename_safe(book_id)
+    local base = settings.cache_dir
+    local id = basename_safe(book_id)
+
+    -- 扫 base 下所有文件夹，按"最后一段 id"匹配（兼容纯 id 和 <title>-<id>）
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(base, "mode") == "directory" then
+        for entry in lfs.dir(base) do
+            if entry ~= "." and entry ~= ".." then
+                if entry == id or entry:sub(-(#id + 1)) == "-" .. id then
+                    return base .. "/" .. entry
+                end
+            end
+        end
+    end
+
+    -- 没找到（首次建目录前）：返回纯 id 路径，由调用方决定怎么建
+    return base .. "/" .. id
 end
 
 -- Cache index: persists item_id → file path mapping across restarts
@@ -250,18 +277,38 @@ end
 
 -- Catalog (chapter directory) persistence: saves the full chapter list
 -- so we don't have to re-fetch it from the server every time.
-function Content.save_catalog_cache(settings, book_id, chapters)
+function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
+    local base = settings.cache_dir
+    local id = basename_safe(book_id)
+
+    -- 第一次建目录：用 <title>-<id>（拿不到 title 时退回纯 id）
     local dir = Content.book_cache_dir(settings, book_id)
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(dir, "mode") ~= "directory" and title and title ~= "" then
+        dir = base .. "/" .. basename_safe(title) .. "-" .. id
+    end
     H.make_dir(dir)
+
+    -- 第一次建目录时写入 cover.jpg
+    local cover_path = dir .. "/cover.jpg"
+    if not H.file_exists(cover_path) and cover and cover ~= "" then
+        local ok, data = pcall(function()
+            return require("fanqie.client"):new(settings):get_binary(cover)
+        end)
+        if ok and data and #data > 0 then
+            H.write_file(cover_path, data)
+        end
+    end
+
     local path = H.join_path(dir, "catalog_cache.lua")
     -- Serialize chapters as a Lua table. Only keep fields needed for display.
     local parts = { "return {" }
     for i, ch in ipairs(chapters or {}) do
         local item_id = tostring(ch.itemId or ch.item_id or "")
-        local title = tostring(ch.title or "")
+        local t = tostring(ch.title or "")
         -- Escape quotes/backslashes in title
-        title = title:gsub("\\", "\\\\"):gsub('"', '\\"')
-        table.insert(parts, string.format('  { itemId = "%s", title = "%s" },', item_id, title))
+        t = t:gsub("\\", "\\\\"):gsub('"', '\\"')
+        table.insert(parts, string.format('  { itemId = "%s", title = "%s" },', item_id, t))
     end
     table.insert(parts, "}")
     H.write_file(path, table.concat(parts, "\n"))
@@ -1297,12 +1344,14 @@ end
 
 function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     local book_id = book.book_id or book.bookId
+    local title = chapter.title or book.title or "FanQie"
+
     local dir = Content.book_cache_dir(settings, book_id)
     H.make_dir(dir)
+
     local images_dir = dir .. "/images"
     local item_id = tostring(chapter.itemId)
     local path = dir .. "/" .. "chapter_" .. item_id .. ".html"
-    local title = chapter.title or book.title or "FanQie"
 
     -- 1. Write downloaded image assets to actual files on disk (relative-path fallback for crengine)
     --    href in assets is "images/img_001.png"; relative to dir this resolves correctly.
