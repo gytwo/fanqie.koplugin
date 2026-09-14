@@ -1691,6 +1691,9 @@ function FanQiePlugin:showBookList(books)
         on_refresh = function()
             self:showBookshelf({ force_refresh = true })
         end,
+        on_search = function()
+            self:onSearchBooks()
+        end,
         on_page_changed = function(page, first, last, current)
             self:_onShelfPage(books, current, page, first, last)
         end,
@@ -1699,6 +1702,71 @@ function FanQiePlugin:showBookList(books)
 
     -- 后台批量预下载所有未缓存的封面（串行，避免阻塞 UI）
     self:_preloadAllCovers(books)
+end
+
+-- 搜索入口：弹输入框，先搜书架、再搜书源
+function FanQiePlugin:onSearchBooks()
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("搜索书籍"),
+        input = "",
+        input_hint = _("输入书名"),
+        buttons = {{
+            { text = _("取消"), callback = function() UIManager:close(dialog) end },
+            { text = _("搜索"), is_enter_default = true, callback = function()
+                local kw = dialog:getInputText()
+                UIManager:close(dialog)
+                if kw and kw ~= "" then self:_doSearch(kw) end
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function FanQiePlugin:_doSearch(keyword)
+    -- 1. 先搜番茄书架（读本地 shelf_cache.lua）
+    local shelf = self:_loadShelfForSearch()
+    local hits = {}
+    for _, b in ipairs(shelf or {}) do
+        if b.title and b.title:find(keyword, 1, true) then
+            table.insert(hits, b)
+        end
+    end
+    if #hits > 0 then
+        if Log then Log.info("_doSearch: 书架命中 " .. #hits .. " 本") end
+        self:showBookList(hits)
+        return
+    end
+
+    -- 2. 书架没有 → 搜大灰狼
+    if Log then Log.info("_doSearch: 书架无命中，转搜大灰狼 keyword=" .. tostring(keyword)) end
+    self:showBusy(_("正在搜索..."))
+    local client = self.client
+    Async.run(function()
+        return client:dahuilang_search(keyword)
+    end, function(ok, books, err)
+        self:closeBusy()
+        if not ok or type(books) ~= "table" then
+            self:showError(T(_("搜索失败:\n%1"), display_error(err or books)))
+            return
+        end
+        if #books == 0 then
+            self:showInfo(_("没有找到相关书籍"))
+            return
+        end
+        self:showBookList(books)
+    end, { poll_interval = 0.3, timeout = 60 })
+end
+
+-- 读本地书架缓存用于搜索（shelf_cache.lua）
+function FanQiePlugin:_loadShelfForSearch()
+    local path = self.settings:get_download_dir() .. "/shelf_cache.lua"
+    if not H.file_exists(path) then return {} end
+    local ok, data = pcall(dofile, path)
+    if ok and type(data) == "table" then return data end
+    return {}
 end
 
 function FanQiePlugin:_cancelCoverLoading()
@@ -2585,6 +2653,10 @@ end
 -- 不再阻塞界面（消除章节开始 / 每 10 页时的几秒卡顿）。
 function FanQiePlugin:syncCurrentProgress()
     if not _state.current_book or not _state.current_chapters then return end
+    -- 只有番茄书架的书才同步进度到番茄官方；搜索来的书/直接打开的章节不同步
+    if not _state.current_book._fanqie_sync then
+        return
+    end
     local idx = _state.current_chapter_index
     if not idx or idx < 1 then return end
     local chapter = _state.current_chapters[idx]
@@ -2819,7 +2891,7 @@ function FanQiePlugin:onEndOfBook()
     local chapters = _state.current_chapters
     local book = _state.current_book
 
-    if book.book_id and current_idx > 0 then
+    if book.book_id and current_idx > 0 and book._fanqie_sync then
         local chapter = chapters[current_idx]
         if chapter and chapter.itemId then
             local last_report = _state.getLastProgressReport(chapter.itemId)
