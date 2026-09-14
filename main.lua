@@ -250,6 +250,12 @@ function FanQiePlugin:onDispatcherRegisterActions()
         title = _("返回番茄目录"),
         reader = true,
     })
+    Dispatcher:registerAction("fanqie_shelf_or_toc", {
+        category = "none",
+        event = "ShowFanQieShelfOrToc",
+        title = _("番茄书架/目录"),
+        general = true,
+    })
 end
 
 function FanQiePlugin:safeCallback(label, callback)
@@ -3016,6 +3022,60 @@ function FanQiePlugin:onCloseWidget()
 end
 
 function FanQiePlugin:onShowFanQieToc()
+    -- 状态为空时，从当前文档路径反推 book_id，补全 _state
+    if not (_state.current_book and _state.current_chapters) then
+        local doc_path = self.ui and self.ui.document
+            and (self.ui.document.file or self.ui.document.path)
+        if doc_path then
+            local book_id, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
+            if book_id then
+                local chapters = Content.load_catalog_cache(self.settings, book_id)
+                if chapters and #chapters > 0 then
+                    -- 从书架缓存补书名/作者，避免标题显示成一串数字
+                    local title, author = nil, nil
+                    local shelf_cache_path = self.settings:get_download_dir() .. "/shelf_cache.lua"
+                    if H.file_exists(shelf_cache_path) then
+                        local ok_shelf, shelf = pcall(dofile, shelf_cache_path)
+                        if ok_shelf and type(shelf) == "table" then
+                            for _, b in ipairs(shelf) do
+                                if tostring(b.book_id) == tostring(book_id) then
+                                    title = b.title
+                                    author = b.author
+                                    break
+                                end
+                            end
+                        end
+                    end
+
+                    _state.current_book = {
+                        book_id = book_id,
+                        title = title or _("番茄小说"),
+                        author = author or "",
+                    }
+                    _state.current_chapters = chapters
+                    for i, ch in ipairs(chapters) do
+                        if tostring(ch.itemId) == tostring(item_id) then
+                            _state.current_chapter_index = i
+                            break
+                        end
+                    end
+                    if Log then
+                        Log.info("[FanQie] onShowFanQieToc: 从路径恢复 _state, book_id="
+                            .. tostring(book_id) .. " item_id=" .. tostring(item_id)
+                            .. " index=" .. tostring(_state.current_chapter_index)
+                            .. " title=" .. tostring(title))
+                    end
+                else
+                    if Log then
+                        Log.warn("[FanQie] onShowFanQieToc: 无目录缓存 book_id=" .. tostring(book_id))
+                    end
+                    self:showInfo(_("未找到本书目录缓存，请先从番茄书架打开一次"))
+                    return true
+                end
+            end
+        end
+    end
+
     if not (_state.current_book and _state.current_chapters) then
         return false
     end
@@ -3028,8 +3088,6 @@ function FanQiePlugin:onShowFanQieToc()
     end
 
     self:syncCurrentProgress()
-    -- Reuse showChapterListing so the reader-side TOC also gets the
-    -- persistent catalog cache and the refresh button.
     self:showChapterListing(_state.current_book)
     return true
 end
@@ -3038,6 +3096,27 @@ function FanQiePlugin:onShowFanQieBookshelf()
     if not (self.ui and self.ui.document) then
         self:showBookshelf()
     end
+    return true
+end
+
+function FanQiePlugin:onShowFanQieShelfOrToc()
+    local RUI = require("apps/reader/readerui")
+    local FM = require("apps/filemanager/filemanager")
+
+    local reader = RUI and RUI.instance
+    local fm = FM and FM.instance
+
+    if reader then
+        -- 阅读器界面 → 目录
+        return self:onShowFanQieToc()
+    end
+
+    if fm then
+        -- 文件管理器界面 → 书架
+        self:showBookshelf()
+        return true
+    end
+
     return true
 end
 
