@@ -241,25 +241,25 @@ function FanQiePlugin:onDispatcherRegisterActions()
     Dispatcher:registerAction("fanqie_search_books", {
         category = "none",
         event = "FanQieSearchBooks",
-        title = _("搜索番茄书籍"),
+        title = _("番茄-搜索书籍"),
         general = true,  
     })
     Dispatcher:registerAction("show_fanqie_bookshelf", {
         category = "none",
         event = "ShowFanQieBookshelf",
-        title = _("番茄书架"),
+        title = _("番茄-书架"),
         filemanager = true,
     })
     Dispatcher:registerAction("return_fanqie_toc", {
         category = "none",
         event = "ShowFanQieToc",
-        title = _("返回番茄目录"),
+        title = _("番茄-目录"),
         reader = true,
     })
     Dispatcher:registerAction("fanqie_shelf_or_toc", {
         category = "none",
         event = "ShowFanQieShelfOrToc",
-        title = _("番茄书架/目录"),
+        title = _("番茄-书架/目录"),
         general = true,
     })
 end
