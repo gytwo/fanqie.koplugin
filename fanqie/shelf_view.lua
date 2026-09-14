@@ -171,27 +171,38 @@ local ShelfMenu = Menu:extend{
 
 -- 左上角按钮：弹出操作菜单（与目录界面一致，图标为 appbar.menu 三横杠）
 function ShelfMenu:onLeftButtonTap()
-    if not self._on_refresh then return end
+    if not self._on_refresh and not self._on_search then return end
     local ButtonDialog = require("ui/widget/buttondialog")
     local action_dialog
+    local buttons = {}
+    if self._on_search then
+        table.insert(buttons, {{
+            text = _("搜索书籍"),
+            callback = function()
+                UIManager:close(action_dialog)
+                self._on_search()
+            end,
+        }})
+    end
+    if self._on_refresh then
+        table.insert(buttons, {{
+            text = _("刷新书架"),
+            callback = function()
+                UIManager:close(action_dialog)
+                self._on_refresh()
+            end,
+        }})
+    end
+    table.insert(buttons, {{
+        text = _("关闭"),
+        callback = function()
+            UIManager:close(action_dialog)
+        end,
+    }})
     action_dialog = ButtonDialog:new{
         title = _("书架操作"),
         title_align = "center",
-        buttons = {
-            {{
-                text = _("刷新书架"),
-                callback = function()
-                    UIManager:close(action_dialog)
-                    self._on_refresh()
-                end,
-            }},
-            {{
-                text = _("关闭"),
-                callback = function()
-                    UIManager:close(action_dialog)
-                end,
-            }},
-        },
+        buttons = buttons,
     }
     UIManager:show(action_dialog)
 end
@@ -292,6 +303,7 @@ function ShelfView.show(opts)
         on_page_changed = page_callback,
     }
     menu._on_refresh = opts.on_refresh
+    menu._on_search = opts.on_search
     UIManager:show(menu)
     return menu
 end
