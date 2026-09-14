@@ -667,6 +667,29 @@ function FanQiePlugin:onFanQieParaReview(idx)
         if Log then Log.debug("[段评] onFanQieParaReview: 章节切换中，跳过 idx=" .. tostring(idx)) end
         return true
     end
+
+    -- 从文件管理器/历史记录直接打开缓存章节时，插件没走过 navigateToChapter，
+    -- _state.current_para_reviews 是空的。点气泡时从文档路径反推 book_id/item_id，
+    -- 现场加载段评数据，避免误报"段评数据无效"。
+    local reviews = _state.getCurrentParaReviews()
+    if not reviews or #reviews == 0 then
+        local doc_path = self.ui and self.ui.document
+            and (self.ui.document.file or self.ui.document.path)
+        if doc_path then
+            local book_id, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
+            if book_id and item_id then
+                local loaded = Content.load_para_reviews_index(self.settings, book_id, item_id)
+                if loaded and #loaded > 0 then
+                    _state.setCurrentParaReviews(loaded)
+                    if Log then
+                        Log.info("[段评] onFanQieParaReview: 兜底加载段评成功, item_id="
+                            .. tostring(item_id) .. " count=" .. tostring(#loaded))
+                    end
+                end
+            end
+        end
+    end
+
     if Log then Log.info("[段评] onFanQieParaReview: idx=" .. tostring(idx)) end
     self:showParaReviewDetail(idx)
     return true
