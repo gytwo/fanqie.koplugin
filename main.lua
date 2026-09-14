@@ -676,7 +676,8 @@ function FanQiePlugin:onFanQieParaReview(idx)
         local doc_path = self.ui and self.ui.document
             and (self.ui.document.file or self.ui.document.path)
         if doc_path then
-            local book_id, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
+            local folder, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
+            local book_id = folder and (folder:find("%-") and folder:match("([^%-]+)$") or folder)
             if book_id and item_id then
                 local loaded = Content.load_para_reviews_index(self.settings, book_id, item_id)
                 if loaded and #loaded > 0 then
@@ -2340,7 +2341,7 @@ function FanQiePlugin:showChapterListing(book, opts)
         end
 
         -- 获取成功：覆盖旧缓存
-        Content.save_catalog_cache(settings, book_id, fetched)
+        Content.save_catalog_cache(settings, book_id, fetched, book.title, book.cover)
         -- 同时更新内存缓存
         _state.setDirectoryCache(book_id, fetched)
 
@@ -2462,7 +2463,7 @@ function FanQiePlugin:navigateToChapter(book, chapters, chapter_index, opts)
     _state.is_downloading = true
     self:showBusy(T(_("正在下载: %1"), chapter.title or ""))
 
-    local b = { book_id = book.book_id, title = book.title, author = book.author }
+    local b = { book_id = book.book_id, title = book.title, author = book.author, cover = book.cover }
     local client = self.client
     local settings = self.settings
     -- 段评获取与章节正文下载一起在子进程执行，UI 线程仅轮询，不再卡顿
@@ -2643,7 +2644,7 @@ function FanQiePlugin:preDownloadChapters(book, chapters, current_index)
         end
 
         Log.info("pre-download: starting download for chapter", target_idx)
-        local b = { book_id = book.book_id, title = book.title, author = book.author }
+        local b = { book_id = book.book_id, title = book.title, author = book.author, cover = book.cover }
         -- 置 is_downloading：让 onEndOfBook/navigateToChapter 感知预下载进行中，
         -- 避免与它们重复下载同一章；on_done 中先清零再调度下一章。
         _state.is_downloading = true
@@ -2884,7 +2885,7 @@ function FanQiePlugin:onFanQiePrevChapter()
             path = found_path
         else
             self:showBusy(T(_("正在下载: %1"), prev_chapter.title or ""))
-            local b = { book_id = book.book_id, title = book.title, author = book.author }
+            local b = { book_id = book.book_id, title = book.title, author = book.author, cover = book.cover }
             local client = self.client
             local settings = self.settings
             Async.run(function()
@@ -3026,7 +3027,7 @@ function FanQiePlugin:onEndOfBook()
     -- 2) 异步下载路径：标记重入，避免末页重复触发下载同一章
     _state.end_of_book_jumping = true
 
-    local b = { book_id = book.book_id, title = book.title, author = book.author }
+    local b = { book_id = book.book_id, title = book.title, author = book.author, cover = book.cover }
     local client = self.client
     local settings = self.settings
 
@@ -3140,9 +3141,16 @@ function FanQiePlugin:onShowFanQieToc()
     if not (_state.current_book and _state.current_chapters) then
         local doc_path = self.ui and self.ui.document
             and (self.ui.document.file or self.ui.document.path)
-        if doc_path then
-            local book_id, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
-            if book_id then
+            if doc_path then
+                local folder, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
+                if folder then
+                    -- 文件夹名可能是 <title>-<id> 或纯 <id>，取最后一段当 book_id
+                    local book_id
+                    if folder:find("%-") then
+                        book_id = folder:match("([^%-]+)$")
+                    else
+                        book_id = folder
+                    end
                 local chapters = Content.load_catalog_cache(self.settings, book_id)
                 if chapters and #chapters > 0 then
                     -- 从书架缓存补书名/作者，避免标题显示成一串数字
@@ -3679,7 +3687,7 @@ function FanQiePlugin:openBook(book)
 
         -- 持久化新拉取的目录（缓存命中时不重复写）
         if result.chapters and #result.chapters > 0 then
-            Content.save_catalog_cache(settings, book_id, result.chapters)
+            Content.save_catalog_cache(settings, book_id, result.chapters, book.title, book.cover)
             _state.setDirectoryCache(book_id, result.chapters)
         end
 
