@@ -165,6 +165,10 @@ function Client:new(settings)
         dahuilang = function(bid, iid, opts) return obj:dahuilang_get_content(bid, iid, opts) end,
         official = function(bid, iid) return obj:official_get_content(bid, iid) end,
     }
+    obj._catalog_fetchers = {
+        dahuilang = function(bid, opts) return obj:dahuilang_get_catalog(bid, opts) end,
+        -- qingtian 待有接口再加
+    }
     return obj
 end
 
@@ -1122,18 +1126,41 @@ function Client:update_read_progress(book_id, item_id, index, progress)
 end
 
 function Client:fetch_chapter_directory(book_id)
-    -- 目录直接使用官方 API
+    -- 1. 番茄官方优先
     local ok, result = pcall(function()
         return self:get_json(FanQie.directory_url(book_id))
     end)
-    
+
     if ok and result and result.code == 0 and result.data then
-        return result
+        -- 检查官方返回是否真能解析出章节（防止空壳 data 被误判成功）
+        local Content = require("fanqie.content")
+        local chapters = Content.readable_chapters(
+            Content.normalize_chapters(result, book_id))
+        if #chapters > 0 then
+            return result
+        end
     end
-    
-    local err_msg = "官方 API 获取目录失败"
+
+    -- 2. 官方失败或空 → 依次试各源 /catalog（目前只有大灰狼）
+    if self._catalog_fetchers then
+        for src_id, fetcher in pairs(self._catalog_fetchers) do
+            local src = self.settings:get_source(src_id)
+            local enabled = src and src.enabled ~= false
+            local has_server = src and H.trim(src.server_url or "") ~= ""
+            if enabled and has_server then
+                local ok_src, chapters = pcall(fetcher, book_id, {})
+                if ok_src and type(chapters) == "table" and #chapters > 0 then
+                    -- 包成官方格式，让 normalize_chapters 能处理
+                    return { code = 0, data = { chapterList = chapters } }
+                end
+            end
+        end
+    end
+
+    local err_msg = "无法获取目录（官方和所有书源均为空）"
     if result then
-        err_msg = err_msg .. ": code=" .. tostring(result.code) .. " message=" .. tostring(result.message or "")
+        err_msg = err_msg .. ": code=" .. tostring(result.code)
+            .. " message=" .. tostring(result.message or "")
     end
     error(err_msg)
 end
@@ -1591,6 +1618,124 @@ function Client:dahuilang_get_content(book_id, item_id, opts)
 
     error(string.format("大灰狼返回内容过短: itemId=%s, 长度=%s",
         tostring(item_id), tostring(#content)))
+end
+
+-- 大灰狼搜索：GET {server}/search?title=...&tab=小说&source=番茄&page=1
+function Client:dahuilang_search(keyword, opts)
+    opts = opts or {}
+    local token, device_id, detected_url = self:_dahuilang_ensure_login()
+    local dl = self.settings:get_source("dahuilang")
+    local base = (detected_url or H.trim(dl.server_url or "")):gsub("/+$", "")
+
+    if base == "" then
+        error("大灰狼服务器地址未配置")
+    end
+
+    local source = H.trim(opts.source or dl.source or "番茄")
+    local tab = H.trim(opts.tab or dl.tab or "小说")
+    local page = opts.page or 1
+
+    local url = string.format(
+        "%s/search?title=%s&tab=%s&source=%s&page=%d&disabled_sources=0",
+        base, H.url_encode(keyword), H.url_encode(tab),
+        H.url_encode(source), page
+    )
+
+    local cookie_str = "qttoken=" .. token
+    if device_id and device_id ~= "" then
+        cookie_str = cookie_str .. ";deviceId=" .. device_id
+    end
+
+    local text, code = self:request({
+        url = url,
+        method = "GET",
+        headers = {
+            ["User-Agent"] = FanQie.MOBILE_UA,
+            ["Accept"] = "application/json, text/plain, */*",
+            ["Cookie"] = cookie_str,
+        },
+        timeout = 15,
+    })
+
+    if not code or code < 200 or code >= 300 then
+        error("大灰狼搜索失败: HTTP " .. tostring(code))
+    end
+
+    local ok, result = pcall(function() return self:json_decode(text) end)
+    if not ok or type(result) ~= "table" then
+        error("大灰狼搜索响应解析失败")
+    end
+
+    local books = {}
+    for _, item in ipairs(result.data or {}) do
+        table.insert(books, {
+            book_id = item.book_id,
+            title = item.book_name or item.title or "未知",
+            author = item.author or "",
+            cover = item.thumb_url,
+            desc = item.abstract or "",
+            -- 不加 _fanqie_sync：搜索来的书不同步进度到番茄
+        })
+    end
+    return books
+end
+
+-- 大灰狼目录：POST {server}/catalog?book_id=...&source=...&tab=...&variable=...
+function Client:dahuilang_get_catalog(book_id, opts)
+    opts = opts or {}
+    local token, device_id, detected_url = self:_dahuilang_ensure_login()
+    local dl = self.settings:get_source("dahuilang")
+    local base = (detected_url or H.trim(dl.server_url or "")):gsub("/+$", "")
+
+    if base == "" then
+        error("大灰狼服务器地址未配置")
+    end
+
+    local source = H.trim(opts.source or dl.source or "番茄")
+    local tab = H.trim(opts.tab or dl.tab or "小说")
+
+    local url = string.format(
+        "%s/catalog?book_id=%s&source=%s&tab=%s&variable=%s",
+        base, H.url_encode(tostring(book_id)),
+        H.url_encode(source), H.url_encode(tab),
+        H.url_encode('{"custom":""}')
+    )
+
+    local cookie_str = "qttoken=" .. token
+    if device_id and device_id ~= "" then
+        cookie_str = cookie_str .. ";deviceId=" .. device_id
+    end
+
+    local text, code = self:request({
+        url = url,
+        method = "POST",
+        headers = {
+            ["User-Agent"] = FanQie.MOBILE_UA,
+            ["Content-Type"] = "application/json",
+            ["Accept"] = "application/json, text/plain, */*",
+            ["Cookie"] = cookie_str,
+        },
+        body = self:json_encode({ html = "" }),
+        timeout = 20,
+    })
+
+    if not code or code < 200 or code >= 300 then
+        error("大灰狼目录失败: HTTP " .. tostring(code))
+    end
+
+    local ok, result = pcall(function() return self:json_decode(text) end)
+    if not ok or type(result) ~= "table" then
+        error("大灰狼目录响应解析失败")
+    end
+
+    local chapters = {}
+    for _, item in ipairs(result.data or {}) do
+        table.insert(chapters, {
+            itemId = tostring(item.item_id or item.itemId or ""),
+            title = item.title or "",
+        })
+    end
+    return chapters
 end
 
 -- 大灰狼段评 API
