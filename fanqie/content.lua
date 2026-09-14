@@ -1191,6 +1191,7 @@ function Content.fetch_catalog(client, book)
     local result = client:fetch_chapter_directory(book_id)
     local chapters = Content.readable_chapters(Content.normalize_chapters(result, book_id))
     book.chapters = chapters
+    book.total_chapters = #chapters
     return chapters
 end
 
