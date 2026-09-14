@@ -330,6 +330,7 @@ function Bookshelf:get_shelf(force_refresh)
                 item_id = item.item_id or item.itemId,
                 total_chapters = total_chapters,
                 read_chapters = read_chapters,
+                _fanqie_sync = true,   -- 番茄书架的书，进度可同步到番茄官方
             }
             if book.book_id then
                 table.insert(books, book)
