@@ -189,11 +189,16 @@ local function basename_safe(value)
     return value
 end
 
-
+-- book_id 专用：只清非法字符，不截断
+local function id_safe(value)
+    value = tostring(value or ""):gsub("[/\\:%*%?\"<>|]", "_")
+    if value == "" then value = "fanqie" end
+    return value
+end
 
 function Content.book_cache_dir(settings, book_id)
     local base = settings.cache_dir
-    local id = basename_safe(book_id)
+    local id = id_safe(book_id) 
 
     -- 扫 base 下所有文件夹，按"最后一段 id"匹配（兼容纯 id 和 <title>-<id>）
     local lfs = require("libs/libkoreader-lfs")
@@ -279,7 +284,7 @@ end
 -- so we don't have to re-fetch it from the server every time.
 function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
     local base = settings.cache_dir
-    local id = basename_safe(book_id)
+    local id = id_safe(book_id) 
 
     -- 第一次建目录：用 <title>-<id>（拿不到 title 时退回纯 id）
     local dir = Content.book_cache_dir(settings, book_id)
