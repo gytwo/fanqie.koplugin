@@ -238,6 +238,12 @@ end
 
 
 function FanQiePlugin:onDispatcherRegisterActions()
+    Dispatcher:registerAction("fanqie_search_books", {
+        category = "none",
+        event = "FanQieSearchBooks",
+        title = _("搜索番茄书籍"),
+        general = true,  
+    })
     Dispatcher:registerAction("show_fanqie_bookshelf", {
         category = "none",
         event = "ShowFanQieBookshelf",
@@ -284,6 +290,12 @@ function FanQiePlugin:addToMainMenu(menu_items)
                         text = _("书架"),
                         callback = self:safeCallback(_("书架"), function()
                             self:showBookshelf()
+                        end),
+                    },
+                    {
+                        text = _("搜索书籍"),
+                        callback = self:safeCallback(_("搜索书籍"), function()
+                            self:onSearchBooks()
                         end),
                     },
                     {
@@ -666,6 +678,12 @@ function FanQiePlugin:getMainMenuItems()
             text = _("书架"),
             callback = self:safeCallback(_("书架"), function()
                 self:showBookshelf()
+            end),
+        },
+        {
+            text = _("搜索书籍"),
+            callback = self:safeCallback(_("搜索书籍"), function()
+                self:onSearchBooks()
             end),
         },
         {
@@ -1653,7 +1671,8 @@ end
 
 
 
-function FanQiePlugin:showBookList(books)
+function FanQiePlugin:showBookList(books, opts)
+    opts = opts or {}
     -- 先关闭旧的书架菜单，避免后台刷新后两个书架 UI 叠在一起
     if self.book_list_menu then
         self:_cancelCoverLoading()
@@ -1676,7 +1695,7 @@ function FanQiePlugin:showBookList(books)
 
     local ShelfView = require("fanqie.shelf_view")
     self.book_list_menu = ShelfView.show{
-        title = _("番茄书架"),
+         title = opts.title or _("番茄书架"), 
         books = books,
         show_covers = true,
         on_select = function(book)
@@ -1736,7 +1755,7 @@ function FanQiePlugin:_doSearch(keyword)
     end
     if #hits > 0 then
         if Log then Log.info("_doSearch: 书架命中 " .. #hits .. " 本") end
-        self:showBookList(hits)
+        self:showBookList(hits, { title = _("番茄书架") })
         return
     end
 
@@ -1756,7 +1775,7 @@ function FanQiePlugin:_doSearch(keyword)
             self:showInfo(_("没有找到相关书籍"))
             return
         end
-        self:showBookList(books)
+        self:showBookList(books, { title = T(_("搜索: %1"), keyword) })
     end, { poll_interval = 0.3, timeout = 60 })
 end
 
@@ -3189,6 +3208,11 @@ function FanQiePlugin:onShowFanQieShelfOrToc()
         return true
     end
 
+    return true
+end
+
+function FanQiePlugin:onFanQieSearchBooks()
+    self:onSearchBooks()
     return true
 end
 
