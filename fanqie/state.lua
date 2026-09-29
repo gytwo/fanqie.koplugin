@@ -1,3 +1,10 @@
+local ok_Log, Log = pcall(require, "fanqie.logger")
+
+-- 状态变更调试日志：走插件日志，受开发者开关控制，避免无条件打到 stdout
+local function log_debug(...)
+    if ok_Log and Log and Log.debug then Log.debug("[state]", ...) end
+end
+
 local CACHE_EXPIRY_SECONDS = 86400
 
 local M = {
@@ -87,7 +94,7 @@ M.loadDownloadState = function()
     end
     -- 加载未完成的下载任务
     local ok_t, task = pcall(function() return M._settings_ref:get("download_task") end)
-    print("[FanQie][state] loadDownloadState: history_count=" .. tostring(#M.download_history)
+    log_debug("loadDownloadState: history_count=" .. tostring(#M.download_history)
         .. " persisted_task=" .. tostring(task and task.book_title or "nil")
         .. " task_status=" .. tostring(task and task.status or "nil"))
     if ok_t and task and task.status == "downloading" then
@@ -102,7 +109,7 @@ M.loadDownloadState = function()
         M.is_downloading = false
         persist_download_history()
         persist_download_task()
-        print("[FanQie][state] loadDownloadState: found interrupted task, moved to history")
+        log_debug("loadDownloadState: found interrupted task, moved to history")
     elseif ok_t and task then
         M.download_task = task
         M.is_downloading = task.status == "downloading"
@@ -270,7 +277,7 @@ M.setDownloadTask = function(task)
     M.download_task = task
     M.is_downloading = task and true or false
     persist_download_task()
-    print("[FanQie][state] setDownloadTask: " .. (task and task.book_title or "nil")
+    log_debug("setDownloadTask: " .. (task and task.book_title or "nil")
         .. " status=" .. (task and task.status or "nil"))
 end
 
@@ -287,7 +294,7 @@ M.updateDownloadProgress = function(current, total, chapter)
 end
 
 M.clearDownloadTask = function()
-    print("[FanQie][state] clearDownloadTask: was=" .. tostring(M.download_task and M.download_task.book_title or "nil"))
+    log_debug("clearDownloadTask: was=" .. tostring(M.download_task and M.download_task.book_title or "nil"))
     M.download_task = nil
     M.is_downloading = false
     persist_download_task()
@@ -302,7 +309,7 @@ M.addDownloadHistory = function(task)
         table.remove(M.download_history)
     end
     persist_download_history()
-    print("[FanQie][state] addDownloadHistory: " .. tostring(task.book_title)
+    log_debug("addDownloadHistory: " .. tostring(task.book_title)
         .. " status=" .. tostring(task.status)
         .. " history_count=" .. tostring(#M.download_history))
 end

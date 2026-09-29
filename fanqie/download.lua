@@ -23,15 +23,6 @@ local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(text) return text end
 local T = ok_ffiutil and ffiutil.template or function(fmt, ...) return fmt end
 
--- 高精度计时（ms），与 content.lua 一致
-local ok_socket, socket = pcall(require, "socket")
-local function now_ms()
-    if ok_socket and socket and socket.gettime then
-        return socket.gettime() * 1000
-    end
-    return os.clock() * 1000
-end
-
 local Download = {}
 
 -- 将秒数格式化为 "Xs" / "X分Y秒" / "X时Y分"
@@ -345,7 +336,7 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
         else
             -- 降级：同步执行（极少触发，仅当 Async 模块未加载）
             local ok_sync, res = pcall(work_fn)
-            on_done(ok_sync, res, ok_sync and nil or res)
+            on_done(ok_sync, res, not ok_sync and res or nil)
         end
     end
 

@@ -7,13 +7,13 @@ local ok_https, https = pcall(require, "ssl.https")
 local ok_http, http = pcall(require, "socket.http")
 
 -- High-resolution wall-clock timer for perf logging (millisecond precision).
--- Falls back to os.clock() (CPU time) if socket is unavailable.
+-- Falls back to os.time() (second precision) if socket is unavailable.
 local ok_socket_perf, socket_perf = pcall(require, "socket")
 local function now_ms()
     if ok_socket_perf and socket_perf and socket_perf.gettime then
         return socket_perf.gettime() * 1000
     end
-    return os.clock() * 1000
+    return os.time() * 1000
 end
 
 local ok_json, json = pcall(require, "json")
@@ -23,8 +23,6 @@ end
 
 local DEFAULT_TIMEOUT_SECONDS = 15
 local SHELF_CACHE_TTL = 5 * 60 -- 5 minutes for shelf cache
-local unpack_args = unpack or table.unpack
-
 -- Rate limiting is now handled per-source by fanqie.sources.SourceManager,
 -- invoked from get_chapter_content_with_fallback (not inside each fetcher).
 
@@ -280,155 +278,120 @@ function Client:download_binary(url)
     return nil, code
 end
 
-function Client:post_json(url, data, opts)
+-- 统一报错：鉴权失效走带标记的错误表，其余直接抛消息
+local function raise_http_error(client, code, text, resp_headers, err_msg)
+    if is_auth_error(client, code, text, resp_headers) then
+        error({ auth_expired = true, message = err_msg })
+    end
+    error(err_msg)
+end
+
+-- 公共请求封装：拼装 Cookie/Referer/自定义头 → 发请求 → 回写 Set-Cookie。
+-- referer 三态：nil=默认首页；false=一个都不发（部分 CDN 防盗链）；字符串=原样。
+-- 返回 text, code, resp_headers（与底层 request/request_follow 一致）
+function Client:_request_common(method, url, opts, follow)
     opts = opts or {}
     local cookies = self.settings:get("cookies", {})
-    local headers = {
-        ["Content-Type"] = "application/json;charset=UTF-8",
-        ["Origin"] = FanQie.BASE_URL,
-        ["Referer"] = opts.referer or (FanQie.BASE_URL .. "/"),
-    }
-    local cookie_header = Cookie.to_header(cookies)
-    if cookie_header ~= "" then
-        headers["Cookie"] = cookie_header
-    end
-    if opts.headers then
-        for key, value in pairs(opts.headers) do
+    local headers = {}
+    if opts.base_headers then
+        for key, value in pairs(opts.base_headers) do
             headers[key] = value
         end
     end
-
-    local text, code, resp_headers = self:request({
-        url = url,
-        method = "POST",
-        headers = headers,
-        body = self:json_encode(data),
-    })
-    local set_cookie = header_value(resp_headers, "set-cookie")
-    if set_cookie then
-        self.settings:set("cookies", Cookie.merge_set_cookie(cookies, set_cookie))
-        self.settings:flush()
-    end
-    if code and code >= 200 and code < 300 then
-        return self:json_decode(text), code, resp_headers
-    end
-    local err_detail = http_error(self, code, text, resp_headers)
-    local err_msg = string.format("POST %s => %s", url, err_detail)
-    if is_auth_error(self, code, text, resp_headers) then
-        error({ auth_expired = true, message = err_msg })
-    else
-        error(err_msg)
-    end
-end
-
-function Client:get_json(url, opts)
-    opts = opts or {}
-    local cookies = self.settings:get("cookies", {})
-    local headers = {
-        ["Accept"] = "application/json, text/plain, */*",
-        ["Referer"] = opts.referer or (FanQie.BASE_URL .. "/"),
-    }
-    local cookie_header = Cookie.to_header(cookies)
-    if cookie_header ~= "" then
-        headers["Cookie"] = cookie_header
-    end
-    if opts.headers then
-        for key, value in pairs(opts.headers) do
-            headers[key] = value
-        end
-    end
-
-    local text, code, resp_headers = self:request({
-        url = url,
-        method = "GET",
-        headers = headers,
-    })
-    local set_cookie = header_value(resp_headers, "set-cookie")
-    if set_cookie then
-        self.settings:set("cookies", Cookie.merge_set_cookie(cookies, set_cookie))
-        self.settings:flush()
-    end
-    if code and code >= 200 and code < 300 then
-        return self:json_decode(text), code, resp_headers
-    end
-    local err_detail = http_error(self, code, text, resp_headers)
-    local err_msg = string.format("GET %s => %s", url, err_detail)
-    if is_auth_error(self, code, text, resp_headers) then
-        error({ auth_expired = true, message = err_msg })
-    else
-        error(err_msg)
-    end
-end
-
-function Client:get_text(url, opts)
-    opts = opts or {}
-    local cookies = self.settings:get("cookies", {})
-    local headers = {
-        ["Accept"] = opts.accept or "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        ["Referer"] = opts.referer or (FanQie.BASE_URL .. "/"),
-        ["Cookie"] = Cookie.to_header(cookies),
-    }
-    local text, code, resp_headers = self:request({
-        url = url,
-        method = "GET",
-        headers = headers,
-    })
-    local set_cookie = header_value(resp_headers, "set-cookie")
-    if set_cookie then
-        self.settings:set("cookies", Cookie.merge_set_cookie(cookies, set_cookie))
-        self.settings:flush()
-    end
-    if code and code >= 200 and code < 300 then
-        return text
-    end
-    local err_msg = http_error(self, code, text, resp_headers)
-    if is_auth_error(self, code, text, resp_headers) then
-        error({ auth_expired = true, message = err_msg })
-    else
-        error(err_msg)
-    end
-end
-
-function Client:get_binary(url, opts)
-    opts = opts or {}
-    local cookies = self.settings:get("cookies", {})
-    local headers = {
-        ["Accept"] = opts.accept or "*/*",
-        ["Cookie"] = Cookie.to_header(cookies),
-    }
-    -- Referer: explicit string → use it; false → send none; nil → default base URL.
-    -- Some CDNs (e.g. fqnovelpic.com) reject any Referer as anti-leech.
     if opts.referer == false then
-        -- intentionally no Referer header
+        -- 显式要求不带 Referer
     elseif opts.referer then
         headers["Referer"] = opts.referer
     else
         headers["Referer"] = FanQie.BASE_URL .. "/"
     end
+    local cookie_header = Cookie.to_header(cookies)
+    if cookie_header ~= "" then
+        headers["Cookie"] = cookie_header
+    end
     if opts.headers then
         for key, value in pairs(opts.headers) do
             headers[key] = value
         end
     end
-    local text, code, resp_headers = self:request_follow({
-        url = url,
-        method = "GET",
-        headers = headers,
-    })
+
+    local req = { url = url, method = method, headers = headers, body = opts.body }
+    local text, code, resp_headers
+    if follow then
+        text, code, resp_headers = self:request_follow(req)
+    else
+        text, code, resp_headers = self:request(req)
+    end
+
     local set_cookie = header_value(resp_headers, "set-cookie")
     if set_cookie then
         self.settings:set("cookies", Cookie.merge_set_cookie(cookies, set_cookie))
         self.settings:flush()
     end
+    return text, code, resp_headers
+end
+
+function Client:post_json(url, data, opts)
+    opts = opts or {}
+    local text, code, resp_headers = self:_request_common("POST", url, {
+        base_headers = {
+            ["Content-Type"] = "application/json;charset=UTF-8",
+            ["Origin"] = FanQie.BASE_URL,
+        },
+        referer = opts.referer,
+        headers = opts.headers,
+        body = self:json_encode(data),
+    })
+    if code and code >= 200 and code < 300 then
+        return self:json_decode(text), code, resp_headers
+    end
+    local err_msg = string.format("POST %s => %s", url, http_error(self, code, text, resp_headers))
+    raise_http_error(self, code, text, resp_headers, err_msg)
+end
+
+function Client:get_json(url, opts)
+    opts = opts or {}
+    local text, code, resp_headers = self:_request_common("GET", url, {
+        base_headers = { ["Accept"] = "application/json, text/plain, */*" },
+        referer = opts.referer,
+        headers = opts.headers,
+    })
+    if code and code >= 200 and code < 300 then
+        return self:json_decode(text), code, resp_headers
+    end
+    local err_msg = string.format("GET %s => %s", url, http_error(self, code, text, resp_headers))
+    raise_http_error(self, code, text, resp_headers, err_msg)
+end
+
+function Client:get_text(url, opts)
+    opts = opts or {}
+    local text, code, resp_headers = self:_request_common("GET", url, {
+        base_headers = {
+            ["Accept"] = opts.accept
+                or "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        referer = opts.referer,
+        headers = opts.headers,
+    })
+    if code and code >= 200 and code < 300 then
+        return text
+    end
+    raise_http_error(self, code, text, resp_headers, http_error(self, code, text, resp_headers))
+end
+
+function Client:get_binary(url, opts)
+    opts = opts or {}
+    -- Referer: explicit string → use it; false → send none; nil → default base URL.
+    -- Some CDNs (e.g. fqnovelpic.com) reject any Referer as anti-leech.
+    local text, code, resp_headers = self:_request_common("GET", url, {
+        base_headers = { ["Accept"] = opts.accept or "*/*" },
+        referer = opts.referer,
+        headers = opts.headers,
+    }, true) -- true = 跟随重定向
     if code and code >= 200 and code < 300 then
         return text, code, resp_headers
     end
-    local err_msg = http_error(self, code, text, resp_headers)
-    if is_auth_error(self, code, text, resp_headers) then
-        error({ auth_expired = true, message = err_msg })
-    else
-        error(err_msg)
-    end
+    raise_http_error(self, code, text, resp_headers, http_error(self, code, text, resp_headers))
 end
 
 function Client:fetch_shelf_info()
@@ -462,25 +425,25 @@ function Client:fetch_shelf_detail(force_refresh)
     if not force_refresh and cached and (now - cached.timestamp) < SHELF_CACHE_TTL then
         return cached.data
     end
-    
+
     -- 书架直接使用官方 API
     local shelf_info = self:fetch_shelf_info()
     if type(shelf_info) ~= "table" or type(shelf_info.data) ~= "table" then
         return { code = 0, data = { detail_list = {} } }
     end
-    
+
     local book_shelf_info = shelf_info.data.book_shelf_info or shelf_info.data.bookShelfInfo or shelf_info.data
     if type(book_shelf_info) ~= "table" or #book_shelf_info == 0 then
         return { code = 0, data = { detail_list = {} } }
     end
-    
+
     local shelf_book_ids = {}
     for _, item in ipairs(book_shelf_info) do
         if item.book_id then
             table.insert(shelf_book_ids, item.book_id)
         end
     end
-    
+
     local progress_result = self:fetch_read_progress()
     local progress_map = {}
     if progress_result and progress_result.data then
@@ -492,7 +455,7 @@ function Client:fetch_shelf_detail(force_refresh)
             }
         end
     end
-    
+
     local books = {}
     for _, book_id in ipairs(shelf_book_ids) do
         local progress = progress_map[tostring(book_id)]
@@ -501,7 +464,7 @@ function Client:fetch_shelf_detail(force_refresh)
             item_id = progress and progress.item_id or "0",
         })
     end
-    
+
     local detail_result = self:post_json(FanQie.bookshelf_multidetail_url(), { books = books })
     if detail_result and detail_result.data and detail_result.data.detail_list then
         for _, book in ipairs(detail_result.data.detail_list) do
@@ -513,12 +476,12 @@ function Client:fetch_shelf_detail(force_refresh)
             end
         end
     end
-    
+
     SHELF_CACHE[cache_key] = {
         timestamp = now,
         data = detail_result,
     }
-    
+
     return detail_result
 end
 
@@ -542,11 +505,11 @@ function Client:fetch_chapter_directory(book_id)
     local ok, result = pcall(function()
         return self:get_json(FanQie.directory_url(book_id))
     end)
-    
+
     if ok and result and result.code == 0 and result.data then
         return result
     end
-    
+
     local err_msg = "官方 API 获取目录失败"
     if result then
         err_msg = err_msg .. ": code=" .. tostring(result.code) .. " message=" .. tostring(result.message or "")

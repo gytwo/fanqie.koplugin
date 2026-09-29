@@ -163,7 +163,6 @@ function ZhiQiu.get_content(client, settings, book_id, item_id, opts)
                 -- <comment> 占位符错误地堆到末尾。因此段评模式下必须先把正文转成
                 -- 每段一个 <p> 的 HTML，让 clean 走 <p> 分支，每段气泡才能就地保留。
                 local html_lines = {}
-                local reviews_inserted = {} -- pid -> 已插入，用于段内 <comment>
                 for idx, line in ipairs(lines) do
                     local pid = idx - 1
                     -- 该段是否有段评？

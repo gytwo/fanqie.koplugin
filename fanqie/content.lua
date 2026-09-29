@@ -14,13 +14,13 @@ if not ok_logger then
 end
 local LOG_MODULE = "[FanQie]"
 
--- High-resolution wall-clock timer (ms). Falls back to os.clock if no socket.
+-- High-resolution wall-clock timer (ms). Falls back to os.time() (second precision) if no socket.
 local ok_socket_perf, socket_perf = pcall(require, "socket")
 local function now_ms()
     if ok_socket_perf and socket_perf and socket_perf.gettime then
         return socket_perf.gettime() * 1000
     end
-    return os.clock() * 1000
+    return os.time() * 1000
 end
 
 local H = require("fanqie.helper")
@@ -1367,7 +1367,6 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     -- 4. Process <img> tags in the body:
     --    (a) downloaded src -> embed as base64 data URI (preferred)
     --    (b) everything else: decode HTML entities in the src URL (&amp; -> &) so online links work
-    local visited = {}
     body = body:gsub('<[iI][mM][gG]([^>]*)>', function(attrs)
         -- Extract current src (quoted variants first)
         local src, quote_char = nil, nil
@@ -1504,7 +1503,7 @@ a.para-comment {
     book.cached_file = path
     book.item_id = chapter.itemId
     book.reader_url = book.reader_url or FanQie.reader_url(chapter.itemId)
-    
+
     -- 存储段评数据到缓存
     if para_reviews and #para_reviews > 0 then
         Content.save_para_reviews_index(settings, book_id, item_id, para_reviews)
@@ -1542,7 +1541,7 @@ function Content.save_para_reviews_index(settings, book_id, item_id, para_review
     local parts = { "return {" }
     for i, pr in ipairs(para_reviews or {}) do
         if pr.ident and pr.count then
-            table.insert(parts, string.format('  { ident = "%s", count = %d },', 
+            table.insert(parts, string.format('  { ident = "%s", count = %d },',
                 tostring(pr.ident):gsub('"', '\\"'), pr.count))
         end
     end

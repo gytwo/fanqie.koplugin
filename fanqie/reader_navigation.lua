@@ -168,7 +168,7 @@ function ReaderNavigation:navigateToChapter(book, chapters, chapter_index, opts)
     else
         -- 降级：同步执行
         local ok_sync, res = pcall(work_fn)
-        on_done(ok_sync, res, ok_sync and nil or res)
+        on_done(ok_sync, res, not ok_sync and res or nil)
     end
 
     return true
@@ -323,7 +323,7 @@ function ReaderNavigation:preDownloadChapters(book, chapters, current_index)
         else
             -- 降级：同步执行
             local ok_sync, res = pcall(work_fn)
-            on_done(ok_sync, res, ok_sync and nil or res)
+            on_done(ok_sync, res, not ok_sync and res or nil)
         end
     end
 
@@ -352,7 +352,6 @@ function ReaderNavigation:syncCurrentProgress()
     if not chapter or not chapter.itemId then return end
 
     local page_progress = self:getCurrentPageProgress()
-    local chapter_progress = (current_idx - 1 + page_progress) / #chapters
 
     local last_report = _state.getLastProgressReport(chapter.itemId)
     if last_report and last_report.progress >= page_progress then
@@ -377,16 +376,24 @@ function ReaderNavigation:syncCurrentProgress()
 end
 
 function ReaderNavigation:retryPendingProgress()
-    local pending = _state.getPendingProgressList()
-    if not pending or #pending == 0 then return end
+    -- pending 是以 "book_id_item_id" 为键的 map，先收集成数组再顺序上报
+    local pending = _state.getPendingProgress()
+    if not pending then return end
+    local queue = {}
+    for _key, item in pairs(pending) do
+        table.insert(queue, item)
+    end
+    if #queue == 0 then return end
 
-    for _, item in ipairs(pending) do
+    for _, item in ipairs(queue) do
         local ok, err = pcall(function()
-            self.client:update_read_progress(item.book_id, item.item_id, item.chapter_index, item.progress)
+            self.client:update_read_progress(item.book_id, item.item_id, item.chapter_idx, item.progress)
         end)
         if ok then
             _state.setLastProgressReport(item.item_id, item.progress)
             _state.removePendingProgress(item.book_id, item.item_id)
+        elseif Log then
+            Log.warn("retryPendingProgress 上报失败:", item.item_id, tostring(err))
         end
     end
 end
@@ -400,15 +407,15 @@ end
 
 function ReaderNavigation:onStartOfBook()
     if Log then Log.info("fanqie onStartOfBook called") end
-    
+
     if not _state.current_book or not _state.current_chapters then
         if Log then Log.info("fanqie onStartOfBook: current_book or current_chapters is nil") end
         return false
     end
-    
+
     local is_fanqie = self:isCurrentDocFanqie()
     if Log then Log.info("fanqie onStartOfBook: is_fanqie=", is_fanqie) end
-    
+
     if not is_fanqie then
         return false
     end
@@ -447,15 +454,15 @@ end
 
 function ReaderNavigation:onEndOfBook()
     if Log then Log.info("fanqie onEndOfBook called") end
-    
+
     if not _state.current_book or not _state.current_chapters then
         if Log then Log.info("fanqie onEndOfBook: current_book or current_chapters is nil") end
         return false
     end
-    
+
     local is_fanqie = self:isCurrentDocFanqie()
     if Log then Log.info("fanqie onEndOfBook: is_fanqie=", is_fanqie) end
-    
+
     if not is_fanqie then
         return false
     end

@@ -308,7 +308,7 @@ function Settings:apply_config(config, options)
     if type(config) ~= "table" then
         return false, "config must return a table"
     end
-    
+
     local apply_preferences = options.apply_preferences ~= false
     local override_existing = options.override_existing or false
     local force = options.force or false
@@ -321,7 +321,7 @@ function Settings:apply_config(config, options)
             return true, "config unchanged, skipped"
         end
     end
-    
+
     -- Cookie 优先级：扫码登录写入的 settings.cookies 优先，
     -- config.cookie_string / config.cookies 仅作保底 fallback。
     -- 已有扫码 cookie（任意非空值）时跳过，避免 config 覆盖扫码结果。
@@ -351,7 +351,7 @@ function Settings:apply_config(config, options)
             self:set("cookies", cookies)
         end
     end
-    
+
     if apply_preferences and H.is_tbl(config.sync) then
         local sync = self:get("sync")
         if override_existing then
@@ -367,7 +367,7 @@ function Settings:apply_config(config, options)
         end
         self:set("sync", sync)
     end
-    
+
     if apply_preferences and H.is_tbl(config.cache) then
         local cache = self:get("cache")
         if override_existing then
@@ -383,7 +383,7 @@ function Settings:apply_config(config, options)
         end
         self:set("cache", cache)
     end
-    
+
     if apply_preferences and H.is_tbl(config.read_report) then
         local rr = self:get("read_report")
         if override_existing then
@@ -403,7 +403,7 @@ function Settings:apply_config(config, options)
         end
         self:set("read_report", rr)
     end
-    
+
     if apply_preferences and H.is_tbl(config.shelf) then
         local shelf = self:get("shelf")
         if override_existing then
@@ -419,7 +419,7 @@ function Settings:apply_config(config, options)
         end
         self:set("shelf", shelf)
     end
-    
+
     -- New unified sources config (nil-only: don't overwrite user-edited values)
     if H.is_tbl(config.sources) then
         local sources = self:get("sources")
@@ -442,7 +442,7 @@ function Settings:apply_config(config, options)
     -- Save config hash so next call can skip if unchanged
     local config_hash = self:compute_config_hash(config)
     self:set("config_hash", config_hash)
-    
+
     self:set("config_loaded", true)
     self:flush()
     return true

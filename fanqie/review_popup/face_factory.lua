@@ -83,7 +83,17 @@ function FaceFactory:findEmojiFont()
         end
     end
 
-    for _, dir in ipairs({ "/mnt/us/fonts/", "/usr/share/fonts/truetype/" }) do
+    -- 候选目录：KOReader 数据目录下的 fonts 是跨平台通用的，放最前；
+    -- /mnt/us/fonts 仅 Kindle 存在，/usr/share/fonts/truetype 仅桌面 Linux 存在。
+    local font_dirs = { "/mnt/us/fonts/", "/usr/share/fonts/truetype/" }
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    if ok_ds and DataStorage and DataStorage.getFullDataDir then
+        local ok_dir, data_dir = pcall(DataStorage.getFullDataDir, DataStorage)
+        if ok_dir and data_dir then
+            table.insert(font_dirs, 1, data_dir .. "/fonts/")
+        end
+    end
+    for _, dir in ipairs(font_dirs) do
         local fp = dir .. "NotoEmoji-Regular.ttf"
         if ok_lfs and lfs.attributes(fp, "mode") == "file" then
             self.emoji_path = fp

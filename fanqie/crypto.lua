@@ -3,7 +3,7 @@ if not bit then
     local function toUInt32(x)
         return (x % 4294967296)
     end
-    
+
     local function band_func(a, b, ...)
         local result = toUInt32(a)
         b = toUInt32(b)
@@ -33,7 +33,7 @@ if not bit then
         end
         return r
     end
-    
+
     local function bor_func(a, b, ...)
         local result = toUInt32(a)
         b = toUInt32(b)
@@ -63,7 +63,7 @@ if not bit then
         end
         return r
     end
-    
+
     local function bxor_func(a, b, ...)
         local result = toUInt32(a)
         b = toUInt32(b)
@@ -93,7 +93,7 @@ if not bit then
         end
         return r
     end
-    
+
     local function bnot_func(a)
         a = toUInt32(a)
         local r = 0
@@ -107,7 +107,7 @@ if not bit then
         end
         return r
     end
-    
+
     local function lshift_func(a, b)
         a = toUInt32(a)
         b = b % 32
@@ -119,7 +119,7 @@ if not bit then
         end
         return a
     end
-    
+
     local function rshift_func(a, b)
         a = toUInt32(a)
         b = b % 32
@@ -128,7 +128,7 @@ if not bit then
         end
         return a
     end
-    
+
     local function rol_func(a, b)
         a = toUInt32(a)
         b = b % 32
@@ -142,7 +142,7 @@ if not bit then
         end
         return a
     end
-    
+
     local function ror_func(a, b)
         a = toUInt32(a)
         b = b % 32
@@ -155,7 +155,7 @@ if not bit then
         end
         return a
     end
-    
+
     band = band_func
     bor = bor_func
     bxor = bxor_func

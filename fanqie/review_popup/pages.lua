@@ -28,6 +28,16 @@ local Paginator = require("fanqie.review_popup.paginator")
 local Screen = Device.screen
 local logger = require("fanqie.logger")
 
+-- 墙钟计时（ms）。注意不能用 CPU 时间计时函数：进程空转等待时不增长，
+-- 用它测耗时会让性能日志严重失真，这里统一用 luasocket 的 gettime。
+local ok_socket_perf, socket_perf = pcall(require, "socket")
+local function now_ms()
+    if ok_socket_perf and socket_perf and socket_perf.gettime then
+        return socket_perf.gettime() * 1000
+    end
+    return os.time() * 1000
+end
+
 local PAGE_BB_CACHE_MAX = 8
 local PIECE_CACHE_MAX = 200
 local LAYOUT_CACHE_MAX = 6
@@ -148,9 +158,9 @@ function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margin
 end
 
 function PageRenderer:paginate()
-    local t0 = os.clock()
+    local t0 = now_ms()
     local blocks = ContentBuilder.build(self.items, { contrast = self.contrast, skip_quote = self.skip_quote })
-    local t1 = os.clock()
+    local t1 = now_ms()
 
     local item_width = math.min(math.ceil(self.doc_margins.right * 2 / 5), Screen:scaleBySize(10))
     local inner_w = self.content_width or Screen:getWidth()
@@ -204,10 +214,10 @@ function PageRenderer:paginate()
     end
 
     local content_h = math.max(1, y)
-    local t2 = os.clock()
+    local t2 = now_ms()
     logger.info(string.format(
         "thought popup paginated in %.1fms (blocks %.1fms) items=%d content_h=%d",
-        (t2 - t0) * 1000, (t1 - t0) * 1000, #self.items, content_h))
+        (t2 - t0), (t1 - t0), #self.items, content_h))
     return {
         pieces = pieces,
         boundaries = boundaries,

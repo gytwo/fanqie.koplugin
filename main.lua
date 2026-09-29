@@ -1,5 +1,17 @@
 local LOG_MODULE = "[FanQie]"
 
+-- 墙钟计时（秒）。不能用 CPU 时间计时函数：等待网络/子进程时几乎不增长，
+-- 用它统计耗时会让日志完全失真，统一用 luasocket 的 gettime。
+local ok_socket_perf, socket_perf = pcall(require, "socket")
+local function now_sec()
+    if ok_socket_perf and socket_perf and socket_perf.gettime then
+        return socket_perf.gettime()
+    end
+    return os.time()
+end
+
+-- 注意：这里刻意用 print 而非插件日志——本函数正是用来加载模块的，
+-- 若失败的是 logger 本身，此时用 Log 会二次报错。加载失败必须可见，故保留 print。
 local function safe_require(module_name, required)
     local ok, result = pcall(require, module_name)
     if not ok then
@@ -41,9 +53,6 @@ local PathChooser = safe_require("ui/widget/pathchooser")
 
 local Event = safe_require("ui/event")
 
-local GestureRange = safe_require("ui/gesturerange")
-
-local logger = safe_require("logger")
 
 local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(text) return text end
@@ -61,8 +70,6 @@ local Client = safe_require("fanqie.client")
 local H = safe_require("fanqie.helper")
 
 local Content = safe_require("fanqie.content")
-
-local DownloadProgress = safe_require("fanqie.download_progress")
 
 local FanQie = safe_require("fanqie.fanqie")
 
@@ -218,13 +225,16 @@ end
 
 function FanQiePlugin:logInitError(step, err)
     local err_msg = log_error(err)
-    if logger and logger.err then
-        logger.err(LOG_MODULE, step .. ":", err_msg)
-    end
     if Log and Log.error then
         Log.error(step .. ":", err_msg)
     end
-    local file = io.open("/mnt/us/koreader/fanqie_init_error.log", "a")
+    -- 独立文件兜底：必须用 DataStorage 定位数据目录，不能写死 /mnt/us（Kindle 专用），
+    -- 否则 Kobo(/mnt/onboard) 与安卓(/sdcard) 上会静默丢失这条初始化错误。
+    local ok_dir, data_dir = pcall(function()
+        return DataStorage and DataStorage.getFullDataDir and DataStorage:getFullDataDir() or nil
+    end)
+    if not ok_dir or not data_dir then return end
+    local file = io.open(data_dir .. "/fanqie_init_error.log", "a")
     if file then
         file:write("[" .. os.date("%Y-%m-%d %H:%M:%S") .. "] " .. step .. ": " .. err_msg .. "\n")
         file:close()
@@ -281,7 +291,7 @@ function FanQiePlugin:safeCallback(label, callback)
         end, debug.traceback)
         if not ok then
             self_ref:closeBusy()
-            if logger and logger.err then logger.err(LOG_MODULE, "action failed:", label, log_error(err)) end
+            if Log and Log.error then Log.error("action failed:", label, log_error(err)) end
             self_ref:showInfo(T(_("%1 failed:\n%2"), label, display_error(err)))
         end
     end
@@ -389,7 +399,7 @@ function FanQiePlugin:showParaReviewList()
         self:showInfo(_("当前章节暂无段评数据"))
         return
     end
-    
+
     -- 构建段评列表项
     local items = {}
     for i, pr in ipairs(reviews) do
@@ -400,7 +410,7 @@ function FanQiePlugin:showParaReviewList()
             end,
         })
     end
-    
+
     local menu = Menu:new{
         title = _("段评列表"),
         item_table = items,
@@ -884,7 +894,7 @@ function FanQiePlugin:getMainMenuItems()
             end,
         },
     }
-    
+
     -- Add "Reload current chapter" option only when reading a fanqie chapter
     if self:isCurrentDocFanqie() and _state.current_chapter_index and _state.current_chapter_index > 0 then
         table.insert(items, {
@@ -895,7 +905,7 @@ function FanQiePlugin:getMainMenuItems()
             end),
         })
     end
-    
+
     table.insert(items, {
         text = _("关于"),
         callback = self:safeCallback(_("关于"), function()
@@ -904,7 +914,7 @@ function FanQiePlugin:getMainMenuItems()
             })
         end),
     })
-    
+
     return items
 end
 
@@ -939,7 +949,7 @@ function FanQiePlugin:getSettingsMenuItems()
                     checked_func = function() local c = self.settings:get("cache", {}); return (c and c.pre_download_chapters or 3) == 10 end },
             },
         },
-        
+
         {
             text = _("下载图片"),
             checked_func = function()
@@ -1039,7 +1049,6 @@ function FanQiePlugin:getSourceMenuItems()
         local cfg = src.config
         local meta = src.meta
         local is_dev = meta.in_development == true
-        local is_enabled = cfg.enabled ~= false
         local is_configured = SourceManager.is_configured(src.id, cfg, self.settings)
         local name = meta.name
         if is_dev then name = name .. _(" (开发中)") end
@@ -1196,7 +1205,6 @@ function FanQiePlugin:getSourceDetailMenuItems(source_id)
             text_func = function()
                 local c = self.settings:get_source("shushan")
                 local key = H.trim(c.api_key or "")
-                local aid = H.trim(c.android_id or "")
                 if key ~= "" then
                     return _("登录: 已获取api_key")
                 end
@@ -1669,24 +1677,13 @@ function FanQiePlugin:getLogMenuItems()
                 end
                 dst:write(content)
                 dst:close()
-                -- Open with file manager / text viewer
-                local FileManager = safe_require("ui/filemanager")
-                if FileManager then
-                    local fm = FileManager:new{
-                        dimen = Screen:getDeviceScreenSize(),
-                        covers_fullscreen = true,
-                    }
-                    -- Navigate to temp dir and open the file
-                    -- Simpler approach: show in text viewer
-                    local TextViewer = safe_require("ui/widget/textviewer")
-                    if TextViewer then
-                        UIManager:show(TextViewer:new{
-                            title = _("FanQie 插件日志"),
-                            text = content,
-                        })
-                    else
-                        self:showInfo(_("日志已复制到: %1", tmp_path))
-                    end
+                -- 直接用文本查看器展示（原先会先构造一个从未使用的 FileManager
+                -- 实例，白白初始化文件管理器，已移除）
+                if TextViewer then
+                    UIManager:show(TextViewer:new{
+                        title = _("FanQie 插件日志"),
+                        text = content,
+                    })
                 else
                     self:showInfo(_("日志已复制到: %1", tmp_path))
                 end
@@ -1754,18 +1751,18 @@ end
 function FanQiePlugin:loadConfigFile(silent, force)
     local plugin_path = self:getPluginPath()
     local config_path = plugin_path .. "/config.lua"
-    
+
     local file = io.open(config_path, "r")
     if not file then return end
     file:close()
-    
+
     local ok, config = pcall(dofile, config_path)
     if not ok or type(config) ~= "table" then return end
-    
+
     pcall(function()
         self.settings:apply_config(config, { apply_preferences = true, force = force })
     end)
-    
+
     if not silent then
         UIManager:show(InfoMessage:new{
             text = _("config.lua loaded."), timeout = 2,
@@ -2568,7 +2565,7 @@ function FanQiePlugin:showReaderUI(path, chapter)
     end
     _state.current_document_path = path
     _state.document_opened = true
-    
+
     if _state.current_book then
         UIManager:scheduleIn(1.0, function()
             if _state.current_book then
@@ -2583,25 +2580,25 @@ function FanQiePlugin:reloadCurrentChapter()
     local book = _state.current_book
     local chapters = _state.current_chapters
     local current_idx = _state.current_chapter_index
-    
+
     if not book or not chapters or not current_idx then
         self:showInfo(_("没有可重新获取的章节"))
         return
     end
-    
+
     local chapter = chapters[current_idx]
     if not chapter then return end
-    
+
     local item_id = tostring(chapter.itemId)
     local cached_chapters = getCachedChapters(self, book)
     local existing_path = cached_chapters[item_id]
-    
+
     -- Delete cached file if exists
     if existing_path and H.file_exists(existing_path) then
         os.remove(existing_path)
         if Log then Log.info("deleted cached chapter:", item_id) end
     end
-    
+
     -- Also try to delete from expected location
     local expected_path = Content.book_cache_dir(self.settings, book.book_id) .. "/chapter_" .. item_id .. ".html"
     if H.file_exists(expected_path) then
@@ -2620,7 +2617,7 @@ function FanQiePlugin:reloadCurrentChapter()
     -- Clear cache index entry
     cached_chapters[item_id] = nil
     Content.save_cache_index(self.settings, book.book_id, cached_chapters)
-    
+
     -- Re-download
     self:navigateToChapter(book, chapters, current_idx, {
         error_message = "重新获取章节失败:\n%1",
@@ -2743,7 +2740,7 @@ function FanQiePlugin:syncCurrentProgress()
     local item_id = chapter.itemId
     local chapter_idx = idx - 1
     local client = self.client
-    local start_time = os.clock()
+    local start_time = now_sec()
 
     Async.run(function()
         -- 在子进程中执行阻塞 HTTP POST
@@ -2751,7 +2748,7 @@ function FanQiePlugin:syncCurrentProgress()
         return true
     end, function(ok, _result, err)
         Log.info("syncCurrentProgress completed in",
-            string.format("%.3f", os.clock() - start_time), "seconds")
+            string.format("%.3f", now_sec() - start_time), "seconds")
         if ok then
             _state.setLastProgressReport(item_id, progress)
             _state.removePendingProgress(book_id, item_id)
@@ -2768,7 +2765,7 @@ function FanQiePlugin:retryPendingProgress()
     local book_id = _state.current_book and _state.current_book.book_id
     if not book_id then return end
 
-    local start_time = os.clock()
+    local start_time = now_sec()
     UIManager:scheduleIn(0.5, function()
         local pending = _state.getPendingProgress()
         -- 收集本书的待上传条目为顺序列表
@@ -2785,7 +2782,7 @@ function FanQiePlugin:retryPendingProgress()
         local function process_next(i)
             if i > total then
                 Log.info("retryPendingProgress completed", total,
-                    "items in", string.format("%.3f", os.clock() - start_time), "seconds")
+                    "items in", string.format("%.3f", now_sec() - start_time), "seconds")
                 return
             end
             local item = queue[i]
@@ -2945,7 +2942,7 @@ function FanQiePlugin:onEndOfBook()
     if not _state.current_book or not _state.current_chapters then
         return false
     end
-    
+
     local is_fanqie = self:isCurrentDocFanqie()
     if not is_fanqie then
         return false

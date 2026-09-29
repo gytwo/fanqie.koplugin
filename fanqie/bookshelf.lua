@@ -297,7 +297,7 @@ end
 function Bookshelf:get_shelf(force_refresh)
     if Log then Log.debug("fetching shelf from API" .. (force_refresh and " (force refresh)" or "")) end
     local result = self.client:fetch_shelf_detail(force_refresh)
-    
+
     local books = {}
     local shelf = nil
     if result and type(result.data) == "table" then
