@@ -16,6 +16,6 @@ return {
 }
 -- 上游原版v2.2.1 https://github.com/hesan1232/fanqie.koplugin 
 -- 上游分支改版v2.2.0-fixed.4 https://github.com/seaneasysaid/fanqie.koplugin-fixed
--- 主要修改点：书山聚合 + 知秋段评 + 书架UI
+-- 主要修改点（VS上游原版）：书山聚合 + 知秋段评 + 书架UI
 -- 本版本v2.2.1-b https://github.com/gytwo/fanqie.koplugin
--- 主要修改点：为本地书籍拉取段评 + 搜索书籍（非番茄书架书籍会按书源搜索）
+-- 主要修改点（VS上游分支改版）：为本地书籍拉取段评 + 搜索书籍（非番茄书架书籍会按书源搜索）
