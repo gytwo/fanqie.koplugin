@@ -121,7 +121,7 @@ end
 -- Overlay
 -- ============================================================================
 local BUBBLE_FONT_SIZE = 18
-local BUBBLE_COLOR = Blitbuffer.COLOR_DARK_GRAY
+local BUBBLE_COLOR = Blitbuffer.COLOR_GRAY_2
 local BUBBLE_GAP = Screen:scaleBySize(3)
 
 local Overlay = InputContainer:extend{
