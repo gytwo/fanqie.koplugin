@@ -1,5 +1,6 @@
 local LOG_MODULE = "[FanQie]"
 
+
 local function safe_require(module_name, required)
     local ok, result = pcall(require, module_name)
     if not ok then
@@ -73,11 +74,15 @@ local Patches = safe_require("patches.core")
 local Bookshelf = safe_require("fanqie.bookshelf")
 local ReaderNavigation = safe_require("fanqie.reader_navigation")
 
+-- 阅读统计合并：番茄"一章一文件"在 KOReader 统计里按书合并成一条记录
+local Stats = safe_require("fanqie.stats")
+
 -- 插件元信息（版本号、关于文案）：集中管理，避免多处维护不同步
 local Info = safe_require("fanqie.info")
 
 -- 异步子进程模块：把进度上传 / 预下载等阻塞网络操作移出 UI 线程，消除卡顿。
 local Async = safe_require("fanqie.async")
+local LocalReview = safe_require("fanqie.local_review")
 
 local unpack_args = unpack or table.unpack
 
@@ -194,6 +199,8 @@ function FanQiePlugin:init()
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
+    self._reader_session = 0
+    self._thought_open = false
     Log.info("plugin initialized:", "version=", self.version)
 end
 
@@ -235,9 +242,98 @@ function FanQiePlugin:ensurePatchesInstalled()
     end
 end
 
+-- 文档就绪：把本章的阅读统计并入"整本书"那一条记录。
+-- 番茄每章一个 .html，KOReader 统计默认会把每章当成一本；这里在 statistics
+-- 实例上换成按 book_id 的固定身份，界面标题不受影响。
+function FanQiePlugin:onReaderReady(config)
+    -- 统计合并（仅番茄章节有意义，但跑一下无害）
+    if Stats then
+        local ok, res = pcall(Stats.sync, self.ui, self.settings)
+        if not ok then
+            if Log and Log.warn then Log.warn("stats merge failed:", log_error(res)) end
+        elseif res then
+            Log.info("[FanQie] 阅读统计按书合并:", tostring(res.title), "/", tostring(res.book_id))
+        end
+    end
 
+    -- 从文件管理器直接打开番茄章节时，_state 是空的，从文档路径补全
+    if self:isCurrentDocFanqie() then
+        if not (_state.current_book and _state.current_chapters) then
+            local doc_path = self.ui and self.ui.document
+                and (self.ui.document.file or self.ui.document.path)
+            if doc_path then
+                self:_restoreStateFromDocPath(doc_path)
+            end
+        end
+    end
+
+    -- 无条件注册本地段评 overlay（服务的是任意本地文档，不限于 /fanqie/ 路径）
+    if LocalReview then LocalReview.on_reader_ready(self) end
+end
+
+-- 从文档路径反推 book_id / item_id，补全 _state
+-- 目录名规则：<title>-<id> 或 <id>，取最后一段作为 book_id
+function FanQiePlugin:_restoreStateFromDocPath(doc_path)
+    local folder, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
+    if not folder then return end
+    local book_id = folder:match("([^%-]+)$") or folder
+
+    -- 目录缓存
+    local chapters = Content.load_catalog_cache(self.settings, book_id)
+    if not chapters or #chapters == 0 then
+        if Log then Log.warn("[FanQie] _restoreStateFromDocPath: 无目录缓存 book_id=" .. tostring(book_id)) end
+        return
+    end
+
+    -- 从书架缓存补书名/作者
+    local title, author = nil, nil
+    local shelf_cache_path = self.settings:get_download_dir() .. "/shelf_cache.lua"
+    if H.file_exists(shelf_cache_path) then
+        local ok_shelf, shelf = pcall(dofile, shelf_cache_path)
+        if ok_shelf and type(shelf) == "table" then
+            for _, b in ipairs(shelf) do
+                if tostring(b.book_id) == tostring(book_id) then
+                    title = b.title
+                    author = b.author
+                    break
+                end
+            end
+        end
+    end
+
+    _state.current_book = {
+        book_id = book_id,
+        title = title or _("番茄小说"),
+        author = author or "",
+    }
+    _state.current_chapters = chapters
+    _state.current_document_path = doc_path
+
+    -- 找当前章节索引
+    for i, ch in ipairs(chapters) do
+        if tostring(ch.itemId) == tostring(item_id) then
+            _state.current_chapter_index = i
+            break
+        end
+    end
+
+    -- 加载段评数据
+    if _state.isReviewEnabled() then
+        local reviews = Content.load_para_reviews_index(self.settings, book_id, item_id)
+        _state.setCurrentParaReviews(reviews)
+    end
+
+    if Log then
+        Log.info("[FanQie] _restoreStateFromDocPath: book_id=" .. tostring(book_id)
+            .. " item_id=" .. tostring(item_id)
+            .. " index=" .. tostring(_state.current_chapter_index)
+            .. " title=" .. tostring(title))
+    end
+end
 
 function FanQiePlugin:onDispatcherRegisterActions()
+    -- 参考内置插件模式：用 general=true，让动作在 FileManager 和 Reader
+    -- 的手势管理「General」分类下都可绑定、可触发（不局限于某个上下文）。
     Dispatcher:registerAction("fanqie_search_books", {
         category = "none",
         event = "FanQieSearchBooks",
@@ -247,13 +343,13 @@ function FanQiePlugin:onDispatcherRegisterActions()
     Dispatcher:registerAction("show_fanqie_bookshelf", {
         category = "none",
         event = "ShowFanQieBookshelf",
-        title = _("番茄-书架"),
-        filemanager = true,
+        title = _("番茄书架"),
+        general = true,
     })
     Dispatcher:registerAction("return_fanqie_toc", {
         category = "none",
         event = "ShowFanQieToc",
-        title = _("番茄-目录"),
+        title = _("返回番茄目录"),
         reader = true,
     })
     Dispatcher:registerAction("fanqie_shelf_or_toc", {
@@ -261,6 +357,12 @@ function FanQiePlugin:onDispatcherRegisterActions()
         event = "ShowFanQieShelfOrToc",
         title = _("番茄-书架/目录"),
         general = true,
+    })
+    Dispatcher:registerAction("fanqie_fetch_local_review", {
+        category = "none",
+        event = "FanQieFetchLocalReview",
+        title = _("番茄-拉取段评"),
+        reader = true,
     })
 end
 
@@ -427,6 +529,9 @@ function FanQiePlugin:showParaReviewDetail(index)
     local book_id = _state.current_book and _state.current_book.book_id or ""
     local review_index = index
     local total_reviews = #reviews
+    -- 气泡上的 count = 服务端该段评论总数（章节缓存 index 提供）。
+    -- 书山 /idea_comment 响应无 common_list_info，总数只能以此为权威来源。
+    local bubble_count = tonumber(pr.count) or 0
 
     -- 将段评获取（阻塞 HTTP）移到子进程，UI 线程仅轮询，不阻塞用户操作。
     -- 子进程不可用时 Async.run 内部自动降级为延后同步。
@@ -435,56 +540,156 @@ function FanQiePlugin:showParaReviewDetail(index)
         Async.run(function()
             local c = Client:new(self_ref.settings)
             local ident_str = tostring(ident)
-            local is_dahuilang = ident_str:find("czyl.cf", 1, true)
-            local is_qingtian = ident_str:find("gyks.cf", 1, true)
+            local is_zhiqiu    = ident_str:find("zhiqiu:", 1, true)
+            local is_shushan   = ident_str:find("shushan:", 1, true)
 
             if Log then
                 Log.info("[段评] showParaReviewDetail(异步): idx=" .. tostring(review_index)
-                    .. " is_dahuilang=" .. tostring(is_dahuilang)
-                    .. " is_qingtian=" .. tostring(is_qingtian)
+                    .. " is_zhiqiu=" .. tostring(is_zhiqiu)
+                    .. " is_shushan=" .. tostring(is_shushan)
                     .. " ident=" .. ident_str:sub(1, 80))
             end
 
             local ok, result
-            if is_dahuilang and not is_qingtian then
-                ok, result = pcall(function() return c:dahuilang_get_para_review(ident) end)
-            elseif is_qingtian and not is_dahuilang then
-                ok, result = pcall(function() return c:qingtian_get_para_review(ident) end)
-            else
-                ok, result = pcall(function() return c:qingtian_get_para_review(ident) end)
-                if not ok or not result then
-                    ok, result = pcall(function() return c:dahuilang_get_para_review(ident) end)
+            if is_shushan then
+                -- 书山自有段落级段评 JSON 通道（GET /idea_comment?api=1，2026-09-13 实测可用），
+                -- 不再依赖知秋。ident 格式 shushan:<bid>:<cid>:<pid>，返回番茄原生结构，
+                -- 与 _displayParaReviewDetail 解析器兼容。
+                ok, result = pcall(function() return c:shushan_get_para_review(ident, { count = 30, page_max = 1 }) end)
+                if not ok then
+                    error("书山段评获取失败：" .. tostring(result or "")
+                        .. "（请确认书山账号已登录、Android ID 为真实设备）")
                 end
+            elseif is_zhiqiu then
+                ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 }) end)
+            else
+                -- 无法识别的 ident（多为旧缓存中已移除书源的历史段评）
+                error("无法识别段评来源: " .. ident_str:sub(1, 60))
             end
             if not ok then error(result or "段评获取失败") end
             return result
         end, function(ok, result, err)
-            self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, err)
+            self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, err, bubble_count)
         end, { poll_interval = 0.125, timeout = 60 })
     else
         -- 降级：Async 模块未加载（极端情况），同步执行
         local c = self_ref.client or Client:new(self_ref.settings)
         local ident_str = tostring(ident)
-        local is_dahuilang = ident_str:find("czyl.cf", 1, true)
-        local is_qingtian = ident_str:find("gyks.cf", 1, true)
+        local is_zhiqiu    = ident_str:find("zhiqiu:", 1, true)
+        local is_shushan   = ident_str:find("shushan:", 1, true)
         local ok, result
-        if is_dahuilang and not is_qingtian then
-            ok, result = pcall(function() return c:dahuilang_get_para_review(ident) end)
-        elseif is_qingtian and not is_dahuilang then
-            ok, result = pcall(function() return c:qingtian_get_para_review(ident) end)
-        else
-            ok, result = pcall(function() return c:qingtian_get_para_review(ident) end)
-            if not ok or not result then
-                ok, result = pcall(function() return c:dahuilang_get_para_review(ident) end)
+        if is_shushan then
+            -- 书山自有段评通道（不依赖知秋）
+            ok, result = pcall(function() return c:shushan_get_para_review(ident, { page_max = 2 }) end)
+            if not ok then
+                error("书山段评获取失败：" .. tostring(result or "")
+                    .. "（请确认书山账号已登录、Android ID 为真实设备）")
             end
+        elseif is_zhiqiu then
+            ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 }) end)
+        else
+            -- 无法识别的 ident（多为旧缓存中已移除书源的历史段评）
+            ok, result = false, "无法识别段评来源: " .. ident_str:sub(1, 60)
         end
-        self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, nil)
+        self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, nil, bubble_count)
     end
 end
 
+-- 书山段评懒加载状态（同一时间只有一个段评弹窗）：
+-- { ident, index, total_reviews, rich_items, total, cursor, has_more, busy, ui_opts }
+local _para_more_state = nil
+
+-- 解析段评返回（支持新格式 data_list 与旧格式 comments），并提取书山分页信息
+-- （common_list_info 的 total / has_more / cursor）
+local function _parseParaReviewResult(result)
+    local comments = nil
+    local total = 0
+    local cursor, has_more = nil, nil
+    if type(result) == "table" and type(result.data) == "table" then
+        -- 新格式: data.data_list[].comment.{common,stat}
+        --         data.common_list_info.{total,has_more,cursor}
+        local data_list = result.data.data_list
+        local clinfo = result.data.common_list_info
+        if type(clinfo) == "table" then
+            cursor = clinfo.cursor
+            if clinfo.has_more ~= nil then has_more = clinfo.has_more end
+        end
+        if type(data_list) == "table" and #data_list > 0 then
+            comments = {}
+            total = (clinfo and clinfo.total) or #data_list
+            for _, item in ipairs(data_list) do
+                local c = item.comment or item
+                local common = c.common or {}
+                local content = common.content or {}
+                local user_info = common.user_info or {}
+                local base_info = user_info.base_info or user_info
+                local stat = c.stat or {}
+
+                table.insert(comments, {
+                    username = base_info.user_name or common.user_name or "匿名",
+                    text = content.text or common.text or "",
+                    like_count = stat.digg_count or 0,
+                    reply_count = stat.reply_count or 0,
+                    create_time = common.create_timestamp or common.create_time,
+                    para_src = (c.expand and c.expand.para_src_content) or "",
+                })
+            end
+        else
+            -- 旧格式兼容: data.comments[]
+            local c = result.data.comments
+            if type(c) == "table" then
+                comments = c
+                total = result.data.total or #c
+            end
+        end
+    elseif type(result) == "table" then
+        -- 旧格式兼容: result.comments[]
+        comments = result.comments
+        total = result.total or 0
+    end
+    if type(comments) ~= "table" then comments = {} end
+    if total == 0 then total = #comments end
+    return comments, total, cursor, has_more
+end
+
+-- 归一化为富排版 items：{ abstract, author, content, likes_count }（过滤空正文）
+local function _normParaRichItems(comments, abstract)
+    local rich_items = {}
+    for _, comment in ipairs(comments or {}) do
+        local username = tostring(comment.username or comment.user_name
+            or (comment.user and comment.user.user_name)
+            or (comment.user and comment.user.nick_name)
+            or comment.nick_name or comment.nickname or "匿名")
+        local content_text = tostring(comment.text or comment.content or "")
+        local like_count = tonumber(comment.like_count or comment.likeCount
+            or comment.digg_count) or 0
+        if content_text ~= "" then
+            table.insert(rich_items, {
+                abstract = abstract,
+                author = username,
+                content = content_text,
+                likes_count = like_count,
+            })
+        end
+    end
+    return rich_items
+end
+
 -- 显示段评详情弹窗（纯 UI 渲染，不做网络请求）
-function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result, err)
+function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result, err, bubble_count)
     local self = self
+    -- 续拉需要原始 ident（shushan:<bid>:<cid>:<pid>），从章节缓存按 index 取回
+    local reviews = _state.getCurrentParaReviews()
+    local pr0 = reviews and reviews[index]
+    local ident = pr0 and pr0.ident or nil
+    -- 懒加载富排版段评弹框（含 freetype/xtext 渲染管线），仅在本弹框真正要展示时拉取
+    local ok_reviewpopup, ReviewPopup = pcall(require, "fanqie.review_popup")
+    if not ok_reviewpopup or not ReviewPopup then
+        if Log then Log.error("[段评] review_popup 加载失败:", tostring(ReviewPopup)) end
+        self:closeBusy()
+        self:showInfo(_("段评富排版组件加载失败，请检查 fanqie/review_popup 模块"))
+        return
+    end
     -- 章节切换中：异步段评获取完成时可能已进入新章节，丢弃过期的段评弹窗
     if _state.isChapterNavigating() then
         if Log then Log.debug("[段评] _displayParaReviewDetail: 章节切换中，丢弃段评弹窗") end
@@ -525,123 +730,192 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             .. " total=" .. tostring(total_val))
     end
 
-    -- 解析评论列表（支持新格式 data_list 和旧格式 comments）
-    local comments = nil
-    local total = 0
-
-    if type(result) == "table" and type(result.data) == "table" then
-        -- 新格式: /api/fanqie/comment/paragraph/list
-        -- data.data_list[].comment.{common,stat}
-        -- data.common_list_info.{total,has_more,cursor}
-        local data_list = result.data.data_list
-        if type(data_list) == "table" and #data_list > 0 then
-            comments = {}
-            total = (result.data.common_list_info and result.data.common_list_info.total) or #data_list
-            for _, item in ipairs(data_list) do
-                local c = item.comment or item
-                local common = c.common or {}
-                local content = common.content or {}
-                local user_info = common.user_info or {}
-                local base_info = user_info.base_info or user_info
-                local stat = c.stat or {}
-
-                table.insert(comments, {
-                    username = base_info.user_name or common.user_name or "匿名",
-                    text = content.text or common.text or "",
-                    like_count = stat.digg_count or 0,
-                    reply_count = stat.reply_count or 0,
-                    create_time = common.create_timestamp or common.create_time,
-                    para_src = (c.expand and c.expand.para_src_content) or "",
-                })
-            end
-        else
-            -- 旧格式兼容: data.comments[]
-            local c = result.data.comments
-            if type(c) == "table" then
-                comments = c
-                total = result.data.total or #c
-            end
-        end
-    elseif type(result) == "table" then
-        -- 旧格式兼容: result.comments[]
-        comments = result.comments
-        total = result.total or 0
-    end
-
-    if type(comments) ~= "table" then comments = {} end
-    if total == 0 then total = #comments end
+    -- 解析评论列表（支持新格式 data_list 和旧格式 comments），并取书山分页游标
+    local comments, total, more_cursor, more_has_more = _parseParaReviewResult(result)
+    -- 书山 /idea_comment 不返回 total（无 common_list_info），
+    -- 气泡 count 才是该段评论总数 → 用它驱动「还剩 N 条」与按钮显隐
+    local bubble_total = tonumber(bubble_count) or 0
+    if bubble_total > total then total = bubble_total end
 
     self:closeBusy()
 
     if #comments > 0 then
-        local text_parts = {}
-        for i, comment in ipairs(comments) do
-            local username = tostring(comment.username or comment.user_name
-                or (comment.user and comment.user.user_name)
-                or (comment.user and comment.user.nick_name)
-                or comment.nick_name or comment.nickname or "匿名")
-            local content_text = tostring(comment.text or comment.content or "")
-            local like_count = tonumber(comment.like_count or comment.likeCount or comment.digg_count) or 0
-            local reply_count = tonumber(comment.reply_count or comment.replyCount) or 0
-            local raw_time = comment.create_time or comment.create_at or comment.time or comment.create_timestamp
-            local time_str = ""
-            if type(raw_time) == "number" then
-                -- create_timestamp 是秒级时间戳
-                time_str = os.date("%Y-%m-%d %H:%M", raw_time)
-            elseif raw_time then
-                time_str = tostring(raw_time)
-            end
-
-            local header = string.format("%d. %s (赞%d 回复%d)", i, username, like_count, reply_count)
-            if time_str ~= "" then
-                header = header .. "  " .. time_str
-            end
-            table.insert(text_parts, header .. "\n" .. content_text)
+        -- ================================================================
+        -- B 档：把段评弹框从纯 TextViewer 换成微信读书「想法」式富排版弹框
+        -- （移植自 weread.koplugin 的 thought_popup 渲染管线，见 fanqie/review_popup/）
+        -- ================================================================
+        -- 归一再展示: 取第一条非空 para_src 作为整段引文(abstract)，没有则不显示引文
+        local abstract = ""
+        for _, c0 in ipairs(comments) do
+            local src = tostring(c0.para_src or c0.abstract or "")
+            if src ~= "" then abstract = src break end
         end
 
-        local review_text = table.concat(text_parts, "\n\n")
+        -- 归一化 items: { abstract, author, content, likes_count }
+        local rich_items = _normParaRichItems(comments, abstract)
 
-        local buttons_table = {}
-        local nav_row = {}
-        if index > 1 then
-            table.insert(nav_row, {
-                text = _("上一段"),
-                callback = function()
-                    UIManager:close(self._para_viewer)
-                    self:showParaReviewDetail(index - 1)
-                end,
-            })
+        if #rich_items == 0 then
+            self:showInfo(T(_("本条段评共 %1 条评论，暂无显示数据"), tostring(total)))
+            return
         end
-        if index < total_reviews then
-            table.insert(nav_row, {
-                text = _("下一段"),
-                callback = function()
-                    UIManager:close(self._para_viewer)
-                    self:showParaReviewDetail(index + 1)
-                end,
-            })
-        end
-        if #nav_row > 0 then
-            table.insert(buttons_table, nav_row)
-        end
-        table.insert(buttons_table, {
-            {
-                text = _("关闭"),
-                callback = function()
-                    UIManager:close(self._para_viewer)
-                end,
-            },
-        })
 
-        self._para_viewer = TextViewer:new{
-            title = T(_("段评 %1/%2 (共%3条)"), tostring(index),
-                tostring(total_reviews), tostring(total)),
-            text = review_text,
-            text_type = "book_info",
-            justified = false,
-            buttons_table = buttons_table,
+        -- 段落 上一段/下一段：横向滑动切换（在弹框内仍可上下滚动/翻页查看全部评论）
+        local function navigate_para(delta)
+            local target = index + delta
+            if target < 1 or target > total_reviews then return end
+            ReviewPopup.closeVisible()
+            -- 延迟一帧，等旧弹框从 UIManager 出栈后再打开下一段
+            UIManager:nextTick(function()
+                self:showParaReviewDetail(target)
+            end)
+        end
+
+        local opts = {
+            pages = rich_items,
+            position = "bottom",
+            height_ratio = 0.7,
+            contrast = 7,
+            tap_to_page = true,
+            para_nav = function(dir)
+                if dir == "prev" then navigate_para(-1)
+                else navigate_para(1) end
+            end,
+            doc_font_name = nil,
+            doc_font_size = nil,
+            doc_margins = nil,
         }
-        UIManager:show(self._para_viewer)
+        -- 从当前阅读器 ui 读取正文字体/字号/边距（带降级，读不到就交给弹框默认）
+        if self.ui then
+            local ok_dev, Device = pcall(require, "device")
+            local Screen = ok_dev and Device and Device.screen
+            local font_face
+            if self.ui.font and self.ui.font.font_face then
+                font_face = self.ui.font.font_face
+            elseif G_reader_settings then
+                font_face = G_reader_settings:readSetting("cre_font")
+            end
+            opts.doc_font_name = font_face
+            local doc = self.ui.document
+            local doc_font_size = (doc and doc.configurable and doc.configurable.font_size) or 18
+            if Screen and Screen.scaleBySize then
+                -- 弹框字号比正文小一号（KOReader 每档 = 整数值 ±1，见 readerfont）
+                opts.doc_font_size = Screen:scaleBySize(math.max(doc_font_size - 1, 10))
+            end
+            if doc and doc.getPageMargins then
+                local okm, margins = pcall(function() return doc:getPageMargins() end)
+                if okm and margins then opts.doc_margins = margins end
+            end
+        end
+
+        -- ================================================================
+        -- 书山段评懒加载：首屏只展示已拉到的 1 页（20 条），
+        -- 底部「继续加载（还剩 N 条）」按钮续拉下一页。
+        -- ================================================================
+        _para_more_state = {
+            ident = tostring(ident),
+            index = index,
+            total_reviews = total_reviews,
+            rich_items = rich_items,
+            total = total,
+            cursor = more_cursor,
+            has_more = more_has_more,
+            busy = false,
+            ui_opts = nil,
+            restoring = false,   -- 续拉重开时置 true，弹窗恢复滚动位置；新段落打开时必须为 false
+        }
+
+        -- ⚠️ 前置声明：refresh_popup 体内引用 load_more，若在其 local 定义之前
+        -- 引用会解析为同名全局变量(nil)，导致「继续加载」按钮 on_more=nil 不显示
+        local load_more
+        local function refresh_popup()
+            local st = _para_more_state
+            if not st then return end
+            local o = {}
+            for k, v in pairs(st.ui_opts or {}) do o[k] = v end
+            o.pages = st.rich_items
+            o.para_nav = function(dir)
+                if dir == "prev" then navigate_para(-1)
+                else navigate_para(1) end
+            end
+            -- 还有余量就一定有按钮；总数已知 →「还剩 N 条」，
+            -- 总数未知（气泡 count 缺失）→「继续加载更多评论」
+            -- WARN 级落盘：不开 developer_logs 也能诊断按钮为何不出现
+            if st.has_more then
+                local remaining = (tonumber(st.total) or 0) - #st.rich_items
+                if remaining > 0 then
+                    o.more_text = string.format("继续加载（还剩 %d 条）", remaining)
+                else
+                    o.more_text = "继续加载更多评论"
+                end
+                o.on_more = load_more
+            else
+                o.more_text = nil
+                o.on_more = nil
+            end
+            -- 续拉重开恢复滚动位置；点新段落打开时不恢复（从第一页看起）
+            o.restore_scroll = st.restoring or nil
+            st.restoring = false
+            ReviewPopup.show(o)
+        end
+
+        load_more = function()
+            local st = _para_more_state
+            if not st or not st.has_more or st.busy then return end
+            st.busy = true
+            st.restoring = true   -- 续拉成功重开时恢复滚动位置
+            Async.run(function()
+                local c = Client:new(self.settings)
+                local is_zhiqiu = st.ident:find("zhiqiu:", 1, true)
+                if is_zhiqiu then
+                    return c:zhiqiu_get_para_review(st.ident,
+                        { page = tonumber(st.cursor) or 2, size = 30, page_max = 1 })
+                else
+                    return c:shushan_get_para_review(st.ident,
+                        { cursor = st.cursor, count = 30, page_max = 1 })
+                end
+            end, function(ok2, result2, err2)
+                st.busy = false
+                if ok2 and type(result2) == "table" then
+                    local comments2, total2, cursor2, has_more2 =
+                        _parseParaReviewResult(result2)
+                    -- 续拉页的引文与首屏相同：优先取本页 para_src，否则沿用首屏
+                    local abstract2 = ""
+                    for _, c0 in ipairs(comments2) do
+                        local src = tostring(c0.para_src or "")
+                        if src ~= "" then abstract2 = src break end
+                    end
+                    if abstract2 == "" and st.rich_items[1] then
+                        abstract2 = st.rich_items[1].abstract or ""
+                    end
+                    local new_items = _normParaRichItems(comments2, abstract2)
+                    for _, it in ipairs(new_items) do
+                        table.insert(st.rich_items, it)
+                    end
+                    if (tonumber(total2) or 0) > (tonumber(st.total) or 0) then
+                        st.total = total2
+                    end
+                    st.cursor = cursor2
+                    if has_more2 ~= nil then st.has_more = has_more2 end
+                else
+                    if Log then
+                        Log.error("[段评] 继续加载失败:", tostring(err2 or result2))
+                    end
+                    self:showInfo(_("继续加载失败，请稍后重试"))
+                end
+                refresh_popup()
+            end, { poll_interval = 0.125, timeout = 45 })
+        end
+
+        _para_more_state.ui_opts = {
+            position = "bottom",
+            height_ratio = opts.height_ratio,
+            contrast = opts.contrast,
+            tap_to_page = opts.tap_to_page,
+            doc_font_name = opts.doc_font_name,
+            doc_font_size = opts.doc_font_size,
+            doc_margins = opts.doc_margins,
+        }
+        refresh_popup()
     else
         self:showInfo(T(_("本条段评共 %1 条评论，暂无显示数据"), tostring(total)))
     end
@@ -667,30 +941,6 @@ function FanQiePlugin:onFanQieParaReview(idx)
         if Log then Log.debug("[段评] onFanQieParaReview: 章节切换中，跳过 idx=" .. tostring(idx)) end
         return true
     end
-
-    -- 从文件管理器/历史记录直接打开缓存章节时，插件没走过 navigateToChapter，
-    -- _state.current_para_reviews 是空的。点气泡时从文档路径反推 book_id/item_id，
-    -- 现场加载段评数据，避免误报"段评数据无效"。
-    local reviews = _state.getCurrentParaReviews()
-    if not reviews or #reviews == 0 then
-        local doc_path = self.ui and self.ui.document
-            and (self.ui.document.file or self.ui.document.path)
-        if doc_path then
-            local folder, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
-            local book_id = folder and (folder:find("%-") and folder:match("([^%-]+)$") or folder)
-            if book_id and item_id then
-                local loaded = Content.load_para_reviews_index(self.settings, book_id, item_id)
-                if loaded and #loaded > 0 then
-                    _state.setCurrentParaReviews(loaded)
-                    if Log then
-                        Log.info("[段评] onFanQieParaReview: 兜底加载段评成功, item_id="
-                            .. tostring(item_id) .. " count=" .. tostring(#loaded))
-                    end
-                end
-            end
-        end
-    end
-
     if Log then Log.info("[段评] onFanQieParaReview: idx=" .. tostring(idx)) end
     self:showParaReviewDetail(idx)
     return true
@@ -709,6 +959,30 @@ function FanQiePlugin:getMainMenuItems()
             callback = self:safeCallback(_("搜索书籍"), function()
                 self:onSearchBooks()
             end),
+        },
+        {
+            text = _("本地书籍-拉取段评"),
+            callback = self:safeCallback(_("本地书-籍拉取段评"), function()
+                require("fanqie.local_review").match_book(self)
+            end),
+        },
+        {
+            text = _("本地书籍-重新绑定段源"),
+            callback = self:safeCallback(_("本地书籍-重新绑定段源"), function()
+                require("fanqie.local_review").rebind(self)
+            end),
+        },
+        {
+            text = _("本地书籍-打开时预取段评"),
+            checked_func = function()
+                return self.settings:get("auto_prefetch_review", false) == true
+            end,
+            keep_menu_open = true,
+            callback = function()
+            local v = not (self.settings:get("auto_prefetch_review", false) == true)
+            self.settings:set("auto_prefetch_review", v)
+            self.settings:flush()
+        end,
         },
         {
             text = _("下载管理"),
@@ -927,137 +1201,228 @@ function FanQiePlugin:getSourceDetailMenuItems(source_id)
         })
     end
 
-    -- Qingtian-specific: server / account / password + auto-login + login status
-    if source_id == "qingtian" then
+    -- ZhiQiu (知秋) branch: configure the three credentials (源作者/官方反馈群/
+    -- 临时Token口令) that mint the shared token, or paste a token directly.
+    if source_id == "zhiqiu" then
         table.insert(items, {
-            text = _("服务器/账号设置"),
+            text = _("服务器/Token设置"),
             keep_menu_open = true,
             callback = function(touchmenu_instance)
-                self:showQingtianConfigDialog(touchmenu_instance)
-            end,
-        })
-        table.insert(items, {
-            text = _("检测可用线路"),
-            keep_menu_open = true,
-            callback = function(touchmenu_instance)
-                self:showServerDetectionDialog("qingtian", touchmenu_instance)
+                self:showZhiQiuConfigDialog(touchmenu_instance)
             end,
         })
         table.insert(items, {
             text_func = function()
-                local c = self.settings:get_source(source_id)
-                return c.auto_login ~= false and _("自动登录: 开") or _("自动登录: 关")
-            end,
-            keep_menu_open = true,
-            callback = function(touchmenu_instance)
-                local c = self.settings:get_source(source_id)
-                self.settings:set_source_field(source_id, "auto_login", c.auto_login == false)
-                if touchmenu_instance then touchmenu_instance:updateItems() end
-            end,
-        })
-        table.insert(items, {
-            text_func = function()
-                local c = self.settings:get_source(source_id)
-                local token = c.token or ""
-                if token ~= "" then
-                    return _("已登录 (点击退出)")
-                else
-                    return _("未登录")
+                local c = self.settings:get_source("zhiqiu")
+                local tok = H.trim(c.token or "")
+                if tok ~= "" then return _("共享Token: 已配置") end
+                -- No token stored yet → can self-mint from the three credentials.
+                local a = H.trim(c.source_author or "")
+                local g = H.trim(c.group_id or "")
+                local p = H.trim(c.temp_token_pass or "")
+                if a ~= "" and g ~= "" and p ~= "" then
+                    return _("共享Token: 自动获取(三件套已填)")
                 end
-            end,
-            enabled_func = function()
-                local c = self.settings:get_source(source_id)
-                return (c.token or "") ~= ""
+                return _("共享Token: 未配置")
             end,
             keep_menu_open = true,
-            callback = function()
-                UIManager:show(ConfirmBox:new{
-                    text = _("确定退出晴天登录？\n将清除已保存的 token 和设备ID。"),
-                    ok_text = _("退出登录"),
-                    cancel_text = _("取消"),
-                    ok_callback = function()
-                        self.settings:clear_qingtian_token()
-                        local SM = require("fanqie.sources")
-                        SM.rate_limit_reset("qingtian")
+        })
+        table.insert(items, {
+            text = _("获取共享Token（无/已过期时自动铸造）"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:showBusy(_("正在检查/获取共享Token..."))
+                local settings = self.settings
+                Async.run(function()
+                    local c = Client:new(settings)
+                    local ZhiQiu = require("fanqie.zhiqiu")
+                    -- 知秋服务限制：同一设备仅在无token或token过期后可重新申请
+                    --（有效期内重复申请会返回"用户已存在"）。故此处不强制刷新。
+                    local tok = ZhiQiu.ensure_token(c, settings, false)
+                    return tok
+                end, function(ok, tok, err)
+                    self:closeBusy()
+                    if ok and tok and tok ~= "" then
                         UIManager:show(InfoMessage:new{
-                            text = _("已退出晴天登录"), timeout = 2,
+                            text = _("✅ 共享Token已就绪（3天有效，自动续期）"), timeout = 3,
                         })
-                    end,
+                    elseif ok then
+                        UIManager:show(InfoMessage:new{
+                            text = _("✅ Token有效期内，无需重新获取"), timeout = 3,
+                        })
+                    else
+                        UIManager:show(InfoMessage:new{
+                            text = _("获取失败: ") .. tostring(err), timeout = 4,
+                        })
+                    end
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end)
+            end,
+        })
+        table.insert(items, {
+            text = _("查询Token剩余额度"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:showBusy(_("正在查询..."))
+                local settings = self.settings
+                Async.run(function()
+                    local c = Client:new(settings)
+                    local ZhiQiu = require("fanqie.zhiqiu")
+                    return ZhiQiu.query_token(c, settings)
+                end, function(ok, info, err)
+                    self:closeBusy()
+                    if ok and info then
+                        UIManager:show(InfoMessage:new{
+                            text = _("日剩余: ") .. tostring(info.left)
+                                .. _("  到期: ") .. tostring(info.ddlTime or ""), timeout = 4,
+                        })
+                    else
+                        UIManager:show(InfoMessage:new{
+                            text = _("查询失败: ") .. tostring(err or "无Token"), timeout = 4,
+                        })
+                    end
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end)
+            end,
+        })
+        table.insert(items, {
+            text = _("清除共享Token"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self.settings:set_source_field("zhiqiu", "token", "")
+                self.settings:set_source_field("zhiqiu", "token_minted_at", "")
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+                UIManager:show(InfoMessage:new{
+                    text = _("已清除共享Token，下次获取时自动重新铸造"), timeout = 3,
                 })
             end,
         })
     end
 
-    -- DahuiLang-specific: config + login + logout
-    if source_id == "dahuilang" then
+    -- ShuShan (书山) branch: email/password + REAL Android id → api_key.
+    -- 书山聚合：一个账号聚合非番茄源，并可用番茄源付费解锁。读正文必须提供
+    -- 已用阅读 app 登录书山的那台安卓设备的真实 Android ID（16hex）。插件
+    -- 不自动生成 id（伪造曾致封号），仅在正文请求时校验。
+    if source_id == "shushan" then
         table.insert(items, {
-            text = _("服务器/账号设置"),
+            text = _("账号/设备设置"),
             keep_menu_open = true,
             callback = function(touchmenu_instance)
-                self:showDahuilangConfigDialog(touchmenu_instance)
-            end,
-        })
-        table.insert(items, {
-            text = _("检测可用线路"),
-            keep_menu_open = true,
-            callback = function(touchmenu_instance)
-                self:showServerDetectionDialog("dahuilang", touchmenu_instance)
+                self:showShuShanConfigDialog(touchmenu_instance)
             end,
         })
         table.insert(items, {
             text_func = function()
-                local c = self.settings:get_source(source_id)
-                local token = c.token or ""
-                if token ~= "" then
-                    return _("已登录 (点击退出)")
-                else
-                    return _("未登录 (点击立即登录)")
+                local c = self.settings:get_source("shushan")
+                local key = H.trim(c.api_key or "")
+                local aid = H.trim(c.android_id or "")
+                if key ~= "" then
+                    return _("登录: 已获取api_key")
                 end
+                local e = H.trim(c.email or "")
+                local p = H.trim(c.password or "")
+                if e ~= "" and p ~= "" then
+                    return _("登录: 已配置凭据(待登录)")
+                end
+                return _("登录: 未配置")
             end,
             keep_menu_open = true,
+        })
+        table.insert(items, {
+            text = _("登录测试（邮箱+密码 → 获取/刷新api_key）"),
+            keep_menu_open = true,
             callback = function(touchmenu_instance)
-                local c = self.settings:get_source(source_id)
-                local token = c.token or ""
-                if token ~= "" then
-                    -- 退出登录
-                    UIManager:show(ConfirmBox:new{
-                        text = _("确定退出大灰狼登录？\n将清除已保存的 token 和设备ID。"),
-                        ok_text = _("退出登录"),
-                        cancel_text = _("取消"),
-                        ok_callback = function()
-                            self.settings:clear_dahuilang_token()
-                            local SM = require("fanqie.sources")
-                            SM.rate_limit_reset("dahuilang")
-                            UIManager:show(InfoMessage:new{
-                                text = _("已退出大灰狼登录"), timeout = 2,
-                            })
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                    })
-                else
-                    -- 立即登录（子进程执行 HTTP 登录，不阻塞 UI 线程）
-                    if Client then
-                        self:showBusy(_("正在登录..."))
-                        local settings = self.settings
-                        Async.run(function()
-                            local c = Client:new(settings)
-                            c:dahuilang_login()
-                            return true
-                        end, function(ok_login, _result, err)
-                            self:closeBusy()
-                            if ok_login then
-                                UIManager:show(InfoMessage:new{
-                                    text = _("大灰狼登录成功！"), timeout = 2,
-                                })
-                            else
-                                UIManager:show(InfoMessage:new{
-                                    text = _("登录失败: ") .. tostring(err), timeout = 3,
-                                })
-                            end
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end, { delay = 0.1, poll_interval = 0.2, timeout = 30 })
+                self:showBusy(_("正在登录书山..."))
+                local settings = self.settings
+                Async.run(function()
+                    local c = Client:new(settings)
+                    return c:shushan_login()
+                end, function(ok, api_key, err)
+                    self:closeBusy()
+                    if ok and api_key and api_key ~= "" then
+                        UIManager:show(InfoMessage:new{
+                            text = _("✅ 书山登录成功！api_key 已保存"), timeout = 3,
+                        })
+                    else
+                        UIManager:show(InfoMessage:new{
+                            text = _("登录失败: ") .. tostring(err), timeout = 4,
+                        })
                     end
-                end
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end)
+            end,
+        })
+        table.insert(items, {
+            text = _("服务器测速（自动切换到最快线路）"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:showBusy(_("正在测速所有线路..."))
+                local settings = self.settings
+                Async.run(function()
+                    local c = Client:new(settings)
+                    return c:shushan_select_fastest()
+                end, function(ok, data, err)
+                    self:closeBusy()
+                    if ok and data and data.best then
+                        -- 可达节点排前并按延迟升序，不可达的列在后面
+                        local sorted = {}
+                        for _, r in ipairs(data.results or {}) do
+                            sorted[#sorted + 1] = r
+                        end
+                        table.sort(sorted, function(a, b)
+                            if a.ok ~= b.ok then return a.ok end
+                            return (a.ms or 0) < (b.ms or 0)
+                        end)
+                        local lines = {}
+                        for _, r in ipairs(sorted) do
+                            local host = tostring(r.base):gsub("^https?://", "")
+                            if r.ok then
+                                lines[#lines + 1] = string.format("%s  %dms%s",
+                                    host, r.ms,
+                                    (r.base == data.best) and "  <- 已选用" or "")
+                            else
+                                lines[#lines + 1] = string.format("%s  不可达（%s）",
+                                    host, tostring(r.note or "无响应"))
+                            end
+                        end
+                        local best_host = tostring(data.best):gsub("^https?://", "")
+                        local detail = table.concat(lines, "\n")
+                        local msg = "已切换到最快线路: " .. best_host .. "\n----------\n" .. detail
+                        if T then
+                            msg = T(_("已切换到最快线路: %1\n----------\n%2"), best_host, detail)
+                        end
+                        UIManager:show(InfoMessage:new{
+                            text = "✅ " .. msg, timeout = 8,
+                        })
+                    else
+                        UIManager:show(InfoMessage:new{
+                            text = _("测速失败: ") .. tostring((data and data.err) or err),
+                            timeout = 4,
+                        })
+                    end
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end)
+            end,
+        })
+        table.insert(items, {
+            text = _("退出登录（清除api_key）"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                UIManager:show(ConfirmBox:new{
+                    text = _("确定退出书山登录？\n将清除已保存的 api_key（保留邮箱/密码/设备ID）。"),
+                    ok_text = _("退出"),
+                    cancel_text = _("取消"),
+                    ok_callback = function()
+                        self.settings:set_source_field("shushan", "api_key", "")
+                        self.settings:set_source_field("shushan", "api_key_at", "")
+                        local SM = require("fanqie.sources")
+                        SM.rate_limit_reset("shushan")
+                        UIManager:show(InfoMessage:new{
+                            text = _("已退出书山登录"), timeout = 2,
+                        })
+                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                    end,
+                })
             end,
         })
     end
@@ -1120,30 +1485,40 @@ function FanQiePlugin:getSourceDetailMenuItems(source_id)
     return items
 end
 
-function FanQiePlugin:showQingtianConfigDialog(touchmenu_instance)
+function FanQiePlugin:showZhiQiuConfigDialog(touchmenu_instance)
     if not MultiInputDialog then
         self:showInfo(_("系统不支持多输入对话框"))
         return
     end
-    local cfg = self.settings:get_source("qingtian")
+    local cfg = self.settings:get_source("zhiqiu")
     local dialog
     dialog = MultiInputDialog:new{
-        title = _("晴天聚合设置"),
+        title = _("知秋四合一设置"),
         fields = {
             {
                 description = _("服务器地址"),
                 text = cfg.server_url or "",
-                hint = "https://v1.gyks.cf/",
+                hint = "https://fq.vv9v.cn",
             },
             {
-                description = _("账号（邮箱）"),
-                text = cfg.username or "",
-                hint = _("邮箱"),
+                description = _("共享Token(可选，填了三件套可自动获取)"),
+                text = cfg.token or "",
+                hint = _("留空自动获取"),
             },
             {
-                description = _("密码"),
-                text = cfg.password or "",
-                hint = _("密码"),
+                description = _("源作者 (pw1)"),
+                text = cfg.source_author or "",
+                hint = _("知秋"),
+            },
+            {
+                description = _("官方反馈群 (pw2)"),
+                text = cfg.group_id or "",
+                hint = "755947375",
+            },
+            {
+                description = _("临时Token口令 (pw3)"),
+                text = cfg.temp_token_pass or "",
+                hint = _("天一团队是倒狗(...)整串"),
             },
         },
         buttons = {
@@ -1159,32 +1534,35 @@ function FanQiePlugin:showQingtianConfigDialog(touchmenu_instance)
                         local fields = dialog:getFields()
                         UIManager:close(dialog)
                         local server = H.trim(fields[1] or "")
-                        local user = H.trim(fields[2] or "")
-                        local pass = (fields[3] or "")
+                        local token  = H.trim(fields[2] or "")
+                        local pw1 = H.trim(fields[3] or "")
+                        local pw2 = H.trim(fields[4] or "")
+                        local pw3 = (fields[5] or "")
                         if server == "" then
                             self:showInfo(_("服务器地址不能为空"))
                             return
                         end
-                        local new_cfg = self.settings:get_source("qingtian")
-                        new_cfg.server_url = server
-                        new_cfg.username = user
-                        new_cfg.password = pass
-                        -- 清除服务器检测缓存
-                        new_cfg._detected_url = nil
-                        new_cfg._detected_at = nil
-                        -- Server/account changed -> clear token to force re-login
-                        if new_cfg.token and new_cfg.token ~= "" then
-                            new_cfg.token = ""
-                            new_cfg.device_id = ""
-                            local SM = require("fanqie.sources")
-                            SM.rate_limit_reset("qingtian")
+                        if token == "" and (pw1 == "" or pw2 == "" or pw3 == "") then
+                            self:showInfo(_("请填共享Token，或填齐 源作者/官方反馈群/临时Token口令 以便自动获取"))
+                            return
                         end
-                        self.settings:set_source("qingtian", new_cfg)
+                        local new_cfg = self.settings:get_source("zhiqiu")
+                        new_cfg.server_url = server
+                        new_cfg.source_author = pw1
+                        new_cfg.group_id = pw2
+                        new_cfg.temp_token_pass = pw3
+                        -- 仅当用户手动填了 token 才覆盖；留空则沿用（由 ensure_token 按3天有效期自动续期）
+                        if token ~= "" then
+                            new_cfg.token = token
+                            new_cfg.token_minted_at = tostring(os.time())
+                        end
+                        self.settings:set_source("zhiqiu", new_cfg)
                         if touchmenu_instance then
                             touchmenu_instance:updateItems()
                         end
                         UIManager:show(InfoMessage:new{
-                            text = _("已保存，下次获取时自动登录"), timeout = 2,
+                            text = _("已保存。若未填Token，请在书源菜单点『立即获取/续期共享Token』"),
+                            timeout = 3,
                         })
                     end,
                 },
@@ -1195,40 +1573,40 @@ function FanQiePlugin:showQingtianConfigDialog(touchmenu_instance)
     dialog:onShowKeyboard()
 end
 
-function FanQiePlugin:showDahuilangConfigDialog(touchmenu_instance)
+function FanQiePlugin:showShuShanConfigDialog(touchmenu_instance)
     if not MultiInputDialog then
         self:showInfo(_("系统不支持多输入对话框"))
         return
     end
-    local cfg = self.settings:get_source("dahuilang")
+    local cfg = self.settings:get_source("shushan")
     local dialog
     dialog = MultiInputDialog:new{
-        title = _("大灰狼聚合设置"),
+        title = _("书山账号设置"),
         fields = {
             {
                 description = _("服务器地址"),
                 text = cfg.server_url or "",
-                hint = "https://legado.gyks.cf/",
+                hint = "https://v2.vossc.com",
             },
             {
-                description = _("邮箱"),
-                text = cfg.username or "",
-                hint = _("账号密码登录（与密钥二选一）"),
+                description = _("书山账号邮箱"),
+                text = cfg.email or "",
+                hint = "xxx@qq.com",
             },
             {
-                description = _("密码"),
+                description = _("书山账号密码"),
                 text = cfg.password or "",
-                hint = _("密码"),
+                hint = _("用于登录获取 api_key"),
             },
             {
-                description = _("密钥 (可选)"),
-                text = cfg.key or "",
-                hint = _("密钥登录（优先于账号密码）"),
+                description = _("真实 Android ID (16/32位hex，读正文必填)"),
+                text = cfg.android_id or "",
+                hint = _("你已用阅读app登录书山的那台安卓设备"),
             },
             {
-                description = _("原始书源"),
-                text = cfg.source or "番茄",
-                hint = _("番茄/七猫/塔读等"),
+                description = _("正文版本号 (默认12)"),
+                text = cfg.content_version or "",
+                hint = "12",
             },
         },
         buttons = {
@@ -1238,80 +1616,50 @@ function FanQiePlugin:showDahuilangConfigDialog(touchmenu_instance)
                     callback = function() UIManager:close(dialog) end,
                 },
                 {
-                    text = _("保存并登录"),
+                    text = _("保存"),
                     is_enter_default = true,
                     callback = function()
                         local fields = dialog:getFields()
                         UIManager:close(dialog)
                         local server = H.trim(fields[1] or "")
-                        local user = H.trim(fields[2] or "")
-                        local pass = H.trim(fields[3] or "")
-                        local key = H.trim(fields[4] or "")
-                        local source = H.trim(fields[5] or "")
-
+                        local email = H.trim(fields[2] or "")
+                        local password = H.trim(fields[3] or "")
+                        local android_id = H.trim(fields[4] or "")
+                        local ver = H.trim(fields[5] or "")
                         if server == "" then
                             self:showInfo(_("服务器地址不能为空"))
                             return
                         end
-
-                        local new_cfg = self.settings:get_source("dahuilang")
-                        local need_relogin = false
-
-                        new_cfg.server_url = server
-                        new_cfg.username = user
-                        new_cfg.password = pass
-                        new_cfg.key = key
-                        new_cfg.source = source ~= "" and source or "番茄"
-                        -- 清除服务器检测缓存
-                        new_cfg._detected_url = nil
-                        new_cfg._detected_at = nil
-
-                        -- If login credentials changed, force re-login
-                        if new_cfg.token and new_cfg.token ~= "" then
-                            local old_token = new_cfg.token
-                            -- Check if credentials changed
-                            if user ~= (cfg.username or "") or pass ~= (cfg.password or "") or key ~= (cfg.key or "") or server ~= (cfg.server_url or "") then
-                                new_cfg.token = ""
-                                new_cfg.device_id = ""
-                                need_relogin = true
-                            end
+                        if email == "" or password == "" then
+                            self:showInfo(_("请填写书山账号邮箱和密码"))
+                            return
                         end
-
-                        self.settings:set_source("dahuilang", new_cfg)
-                        local SM = require("fanqie.sources")
-                        SM.rate_limit_reset("dahuilang")
+                        -- Android ID 合法性提示（非强制，正文时才需要；但给出明显警告）
+                        -- if android_id ~= "" and not android_id:match("^%x+$") then
+                            -- self:showInfo(_("Android ID 应为十六进制字符(0-9a-f)。请确认填写的是设备Android ID而非其他编号。"))
+                            -- return
+                        -- end
+                        if android_id ~= "" and #android_id ~= 16 and #android_id ~= 32 then
+                            self:showInfo(_("Android ID 长度应为16或32位。你填的是 ") .. tostring(#android_id) .. " 位")
+                            return
+                        end
+                        local new_cfg = self.settings:get_source("shushan")
+                        new_cfg.server_url = server
+                        new_cfg.email = email
+                        new_cfg.password = password
+                        if android_id ~= "" then new_cfg.android_id = android_id end
+                        if ver ~= "" then new_cfg.content_version = ver end
+                        -- 若换了邮箱/密码，旧 api_key 可能失效，清除以触发重新登录
+                        new_cfg.api_key = ""
+                        new_cfg.api_key_at = ""
+                        self.settings:set_source("shushan", new_cfg)
                         if touchmenu_instance then
                             touchmenu_instance:updateItems()
                         end
-
-                        if need_relogin or new_cfg.token == "" then
-                            -- 立即登录（子进程执行 HTTP 登录，不阻塞 UI 线程）
-                            if Client then
-                                self:showBusy(_("正在登录..."))
-                                local settings = self.settings
-                                Async.run(function()
-                                    local c = Client:new(settings)
-                                    c:dahuilang_login()
-                                    return true
-                                end, function(ok_login, _result, err)
-                                    self:closeBusy()
-                                    if ok_login then
-                                        UIManager:show(InfoMessage:new{
-                                            text = _("大灰狼登录成功！"), timeout = 2,
-                                        })
-                                    else
-                                        UIManager:show(InfoMessage:new{
-                                            text = _("登录失败: ") .. tostring(err), timeout = 3,
-                                        })
-                                    end
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                                end, { delay = 0.1, poll_interval = 0.2, timeout = 30 })
-                            end
-                        else
-                            UIManager:show(InfoMessage:new{
-                                text = _("大灰狼配置已保存"), timeout = 2,
-                            })
-                        end
+                        UIManager:show(InfoMessage:new{
+                            text = _("已保存。请点『登录测试』获取 api_key 后即可使用。读正文还需有效 Android ID。"),
+                            timeout = 4,
+                        })
                     end,
                 },
             },
@@ -1382,136 +1730,6 @@ function FanQiePlugin:showSourceRateLimitDialog(source_id, touchmenu_instance)
     }
     UIManager:show(dialog)
     dialog:onShowKeyboard()
-end
-
-function FanQiePlugin:showServerDetectionDialog(source_id, touchmenu_instance)
-    local cfg = self.settings:get_source(source_id)
-    local servers = cfg.servers or {}
-    local source_name = source_id == "dahuilang" and _("大灰狼") or _("晴天")
-    
-    if #servers == 0 then
-        self:showInfo(source_name .. _("服务器列表为空，请先在配置中添加服务器地址"))
-        return
-    end
-
-    -- 持久 busy：检测期间 UI 保持响应（之前 InfoMessage timeout=1 会消失且 scheduleIn 仍阻塞 UI 线程）
-    self:showBusy(source_name .. _("正在检测服务器..."))
-
-    -- 检测放到子进程：每条线路最多 10s 超时，N 条线路顺序探测原本会阻塞 UI 线程 N×10s
-    local client = self.client
-    local servers_copy = servers  -- 闭包捕获，子进程 fork 继承
-    Async.run(function()
-        local results = {}
-        local available_count = 0
-        for _, url in ipairs(servers_copy) do
-            local ok, available, code = pcall(function()
-                return client:check_single_server(url)
-            end)
-            if ok and available then
-                table.insert(results, { url = url, available = true, code = code })
-                available_count = available_count + 1
-            else
-                table.insert(results, { url = url, available = false, code = code or 0 })
-            end
-        end
-        return { results = results, available_count = available_count, total = #servers_copy }
-    end, function(ok, result, err)
-        self:closeBusy()
-        if not ok or type(result) ~= "table" then
-            self:showError(T(_("检测失败:\n%1"), display_error(err or result)))
-            return
-        end
-
-        local results = result.results or {}
-        local available_count = result.available_count or 0
-        local total = result.total or #servers
-
-        -- Build result text
-        local result_lines = {}
-        table.insert(result_lines, string.format(_("检测完成: %d/%d 可用"), available_count, total))
-        table.insert(result_lines, "")
-
-        for i, r in ipairs(results) do
-            local status = r.available and "✓" or "✗"
-            local short_url = r.url:gsub("^https?://", "")
-            table.insert(result_lines, string.format("%s %s [%s]", status, short_url, r.available and _("可用") or _("不可用")))
-        end
-
-        local result_text = table.concat(result_lines, "\n")
-
-        -- Show results with selection
-        local MultiInputDialog = require("ui/widget/multiinputdialog")
-        if not MultiInputDialog then
-            -- Simple info dialog
-            self:showInfo(result_text)
-            return
-        end
-
-        local dialog
-        dialog = MultiInputDialog:new{
-            title = source_name .. _("线路检测结果"),
-            fields = {
-                {
-                    description = _("检测结果"),
-                    text = result_text,
-                    readonly = true,
-                    text_type = "multi-line",
-                },
-                {
-                    description = _("选择可用服务器 (输入序号)"),
-                    text = available_count > 0 and "1" or "",
-                    hint = _("填入要使用的服务器序号 (1, 2, 3...)"),
-                },
-            },
-            buttons = {
-                {
-                    {
-                        text = _("关闭"),
-                        callback = function() UIManager:close(dialog) end,
-                    },
-                    {
-                        text = _("使用选中线路"),
-                        is_enter_default = true,
-                        enabled_func = function() return available_count > 0 end,
-                        callback = function()
-                            local fields = dialog:getFields()
-                            UIManager:close(dialog)
-                            local idx = tonumber(H.trim(fields[2] or ""))
-                            if idx and idx >= 1 and idx <= #results and results[idx].available then
-                                local new_cfg = self.settings:get_source(source_id)
-                                new_cfg.server_url = results[idx].url
-                                -- Clear token since server changed
-                                new_cfg.token = ""
-                                new_cfg.device_id = ""
-                                -- Clear cached detection
-                                new_cfg._detected_url = nil
-                                new_cfg._detected_at = nil
-                                self.settings:set_source(source_id, new_cfg)
-                                self.settings:flush()
-                                local SM = require("fanqie.sources")
-                                SM.rate_limit_reset(source_id)
-                                if touchmenu_instance then
-                                    touchmenu_instance:updateItems()
-                                end
-                                local short = results[idx].url:gsub("^https?://", "")
-                                UIManager:show(InfoMessage:new{
-                                    text = string.format(_("已切换到: %s"), short),
-                                    timeout = 2,
-                                })
-                            else
-                                UIManager:show(InfoMessage:new{
-                                    text = _("无效的序号或该线路不可用"),
-                                    timeout = 2,
-                                })
-                            end
-                        end,
-                    },
-                },
-            },
-        }
-        UIManager:show(dialog)
-        dialog:onShowKeyboard()
-    end, { poll_interval = 0.3, timeout = 120 })
 end
 
 function FanQiePlugin:getLogMenuItems()
@@ -1693,57 +1911,46 @@ function FanQiePlugin:checkNetwork()
     return true
 end
 
-
-
 function FanQiePlugin:showBookList(books, opts)
     opts = opts or {}
-    -- 先关闭旧的书架菜单，避免后台刷新后两个书架 UI 叠在一起
     if self.book_list_menu then
         self:_cancelCoverLoading()
         UIManager:close(self.book_list_menu)
         self.book_list_menu = nil
     end
-
     local cover_cache_dir = self.settings:get_download_dir() .. "/covers"
     if H then H.make_dir(cover_cache_dir) end
-
-    for _, book in ipairs(books) do
+    for _i, book in ipairs(books) do
         if book.cover then
             local cover_filename = string.gsub(book.title, "[/\\:%*%?\"<>|]", "_") .. ".jpg"
             local cover_path = cover_cache_dir .. "/" .. cover_filename
-            if H.file_exists(cover_path) then
-                book.cover_path = cover_path
-            end
+            if H.file_exists(cover_path) then book.cover_path = cover_path end
         end
     end
-
+    local on_select = opts.on_select_override or function(book)
+        self:_cancelCoverLoading()
+        self:showBookDetail(book)
+    end
     local ShelfView = require("fanqie.shelf_view")
     self.book_list_menu = ShelfView.show{
-         title = opts.title or _("番茄书架"), 
+        title = opts.title or _("番茄书架"),
         books = books,
         show_covers = true,
-        on_select = function(book)
-            self:_cancelCoverLoading()  -- 进入书籍时停止封面预下载，释放带宽给章节预下载
-            self:showBookDetail(book)
-        end,
+        on_select = on_select,
         on_close = function()
             self:_cancelCoverLoading()
             self.book_list_menu = nil
             _state.active_menu = nil
         end,
-        on_refresh = function()
-            self:showBookshelf({ force_refresh = true })
-        end,
-        on_search = function()
-            self:onSearchBooks()
+        on_search = function() self:onSearchBooks() end,
+        on_silent_refresh = function()
+            self:showBookshelf({ force_refresh = true, silent = true })
         end,
         on_page_changed = function(page, first, last, current)
             self:_onShelfPage(books, current, page, first, last)
         end,
     }
     _state.active_menu = self.book_list_menu
-
-    -- 后台批量预下载所有未缓存的封面（串行，避免阻塞 UI）
     self:_preloadAllCovers(books)
 end
 
@@ -1768,27 +1975,35 @@ function FanQiePlugin:onSearchBooks()
     dialog:onShowKeyboard()
 end
 
-function FanQiePlugin:_doSearch(keyword)
-    -- 1. 先搜番茄书架（读本地 shelf_cache.lua）
+-- 读本地书架缓存用于搜索（shelf_cache.lua）
+function FanQiePlugin:_loadShelfForSearch()
+    local path = self.settings:get_download_dir() .. "/shelf_cache.lua"
+    if not H.file_exists(path) then return {} end
+    local ok, data = pcall(dofile, path)
+    if ok and type(data) == "table" then return data end
+    return {}
+end
+
+function FanQiePlugin:_doSearch(keyword, opts)
+    opts = opts or {}
     local shelf = self:_loadShelfForSearch()
     local hits = {}
-    for _, b in ipairs(shelf or {}) do
+    for _i, b in ipairs(shelf or {}) do
         if b.title and b.title:find(keyword, 1, true) then
             table.insert(hits, b)
         end
     end
     if #hits > 0 then
-        if Log then Log.info("_doSearch: 书架命中 " .. #hits .. " 本") end
-        self:showBookList(hits, { title = _("番茄书架") })
+        self:showBookList(hits, {
+            title = _("番茄书架"),
+            on_select_override = opts.on_select_override,
+        })
         return
     end
-
-    -- 2. 书架没有 → 搜大灰狼
-    if Log then Log.info("_doSearch: 书架无命中，转搜大灰狼 keyword=" .. tostring(keyword)) end
     self:showBusy(_("正在搜索..."))
     local client = self.client
     Async.run(function()
-        return client:dahuilang_search(keyword)
+        return client:search_with_fallback(keyword)
     end, function(ok, books, err)
         self:closeBusy()
         if not ok or type(books) ~= "table" then
@@ -1799,17 +2014,16 @@ function FanQiePlugin:_doSearch(keyword)
             self:showInfo(_("没有找到相关书籍"))
             return
         end
-        self:showBookList(books, { title = T(_("搜索: %1"), keyword) })
-    end, { poll_interval = 0.3, timeout = 60 })
-end
-
--- 读本地书架缓存用于搜索（shelf_cache.lua）
-function FanQiePlugin:_loadShelfForSearch()
-    local path = self.settings:get_download_dir() .. "/shelf_cache.lua"
-    if not H.file_exists(path) then return {} end
-    local ok, data = pcall(dofile, path)
-    if ok and type(data) == "table" then return data end
-    return {}
+        local src_label = books[1] and books[1]._search_source or nil
+        local title_text
+        if src_label == "shushan" then title_text = "书山：" .. keyword
+        elseif src_label == "zhiqiu" then title_text = "知秋：" .. keyword
+        else title_text = T(_("搜索: %1"), keyword) end
+        self:showBookList(books, {
+            title = title_text,
+            on_select_override = opts.on_select_override,
+        })
+    end, { poll_interval = 0.3, timeout = 90 })
 end
 
 function FanQiePlugin:_cancelCoverLoading()
@@ -2463,7 +2677,7 @@ function FanQiePlugin:navigateToChapter(book, chapters, chapter_index, opts)
     _state.is_downloading = true
     self:showBusy(T(_("正在下载: %1"), chapter.title or ""))
 
-    local b = { book_id = book.book_id, title = book.title, author = book.author, cover = book.cover }
+    local b = { book_id = book.book_id, title = book.title, author = book.author }
     local client = self.client
     local settings = self.settings
     -- 段评获取与章节正文下载一起在子进程执行，UI 线程仅轮询，不再卡顿
@@ -2644,7 +2858,7 @@ function FanQiePlugin:preDownloadChapters(book, chapters, current_index)
         end
 
         Log.info("pre-download: starting download for chapter", target_idx)
-        local b = { book_id = book.book_id, title = book.title, author = book.author, cover = book.cover }
+        local b = { book_id = book.book_id, title = book.title, author = book.author }
         -- 置 is_downloading：让 onEndOfBook/navigateToChapter 感知预下载进行中，
         -- 避免与它们重复下载同一章；on_done 中先清零再调度下一章。
         _state.is_downloading = true
@@ -2696,10 +2910,6 @@ end
 -- 不再阻塞界面（消除章节开始 / 每 10 页时的几秒卡顿）。
 function FanQiePlugin:syncCurrentProgress()
     if not _state.current_book or not _state.current_chapters then return end
-    -- 只有番茄书架的书才同步进度到番茄官方；搜索来的书/直接打开的章节不同步
-    if not _state.current_book._fanqie_sync then
-        return
-    end
     local idx = _state.current_chapter_index
     if not idx or idx < 1 then return end
     local chapter = _state.current_chapters[idx]
@@ -2781,14 +2991,17 @@ function FanQiePlugin:retryPendingProgress()
     end)
 end
 
+-- 翻页：本地段评无条件通知；番茄章节再走预下载 / 进度同步
 function FanQiePlugin:onPageUpdate(pageno)
+    -- 无条件通知本地段评（刷新当前章段评）
+    if LocalReview then LocalReview.on_page_update(self) end
+
     if not _state.current_book or not _state.current_chapters then
         return
     end
     if not self:isCurrentDocFanqie() then
         return
     end
-
     if not self.ui or not self.ui.document then return end
 
     local doc = self.ui.document
@@ -2797,8 +3010,7 @@ function FanQiePlugin:onPageUpdate(pageno)
 
     _state.last_page_number = pageno
 
-    -- Only trigger pre-download after user has read past 50% of the chapter
-    -- This avoids triggering immediately on chapter open for short chapters
+    -- 用户读到 50% 以后才触发预下载
     local progress = pageno / total_pages
     if progress > 0.5 and not _state.pre_download_triggered then
         _state.pre_download_triggered = true
@@ -2810,7 +3022,7 @@ function FanQiePlugin:onPageUpdate(pageno)
     if pageno % 10 == 0 then
         self:syncCurrentProgress()
     end
-end
+end 
 
 -- Handle "previous chapter" signal from patched ReaderPaging.
 -- Triggered only when user presses "previous page" while on page 1.
@@ -2885,7 +3097,7 @@ function FanQiePlugin:onFanQiePrevChapter()
             path = found_path
         else
             self:showBusy(T(_("正在下载: %1"), prev_chapter.title or ""))
-            local b = { book_id = book.book_id, title = book.title, author = book.author, cover = book.cover }
+            local b = { book_id = book.book_id, title = book.title, author = book.author }
             local client = self.client
             local settings = self.settings
             Async.run(function()
@@ -3027,7 +3239,7 @@ function FanQiePlugin:onEndOfBook()
     -- 2) 异步下载路径：标记重入，避免末页重复触发下载同一章
     _state.end_of_book_jumping = true
 
-    local b = { book_id = book.book_id, title = book.title, author = book.author, cover = book.cover }
+    local b = { book_id = book.book_id, title = book.title, author = book.author }
     local client = self.client
     local settings = self.settings
 
@@ -3103,7 +3315,11 @@ function FanQiePlugin:onEndOfBook()
     return true  -- 事件已处理，文档保持打开，异步完成后跳章
 end
 
+-- 关文档：无条件清理本地段评；番茄章节再上传进度、清 state
 function FanQiePlugin:onCloseDocument()
+    -- 无条件清理本地段评（移除 view module + touch zone）
+    if LocalReview then LocalReview.on_close_document(self) end
+
     if not self:isCurrentDocFanqie() then
         return
     end
@@ -3137,67 +3353,6 @@ function FanQiePlugin:onCloseWidget()
 end
 
 function FanQiePlugin:onShowFanQieToc()
-    -- 状态为空时，从当前文档路径反推 book_id，补全 _state
-    if not (_state.current_book and _state.current_chapters) then
-        local doc_path = self.ui and self.ui.document
-            and (self.ui.document.file or self.ui.document.path)
-            if doc_path then
-                local folder, item_id = doc_path:match("/fanqie/([^/]+)/chapter_(%d+)")
-                if folder then
-                    -- 文件夹名可能是 <title>-<id> 或纯 <id>，取最后一段当 book_id
-                    local book_id
-                    if folder:find("%-") then
-                        book_id = folder:match("([^%-]+)$")
-                    else
-                        book_id = folder
-                    end
-                local chapters = Content.load_catalog_cache(self.settings, book_id)
-                if chapters and #chapters > 0 then
-                    -- 从书架缓存补书名/作者，避免标题显示成一串数字
-                    local title, author = nil, nil
-                    local shelf_cache_path = self.settings:get_download_dir() .. "/shelf_cache.lua"
-                    if H.file_exists(shelf_cache_path) then
-                        local ok_shelf, shelf = pcall(dofile, shelf_cache_path)
-                        if ok_shelf and type(shelf) == "table" then
-                            for _, b in ipairs(shelf) do
-                                if tostring(b.book_id) == tostring(book_id) then
-                                    title = b.title
-                                    author = b.author
-                                    break
-                                end
-                            end
-                        end
-                    end
-
-                    _state.current_book = {
-                        book_id = book_id,
-                        title = title or _("番茄小说"),
-                        author = author or "",
-                    }
-                    _state.current_chapters = chapters
-                    for i, ch in ipairs(chapters) do
-                        if tostring(ch.itemId) == tostring(item_id) then
-                            _state.current_chapter_index = i
-                            break
-                        end
-                    end
-                    if Log then
-                        Log.info("[FanQie] onShowFanQieToc: 从路径恢复 _state, book_id="
-                            .. tostring(book_id) .. " item_id=" .. tostring(item_id)
-                            .. " index=" .. tostring(_state.current_chapter_index)
-                            .. " title=" .. tostring(title))
-                    end
-                else
-                    if Log then
-                        Log.warn("[FanQie] onShowFanQieToc: 无目录缓存 book_id=" .. tostring(book_id))
-                    end
-                    self:showInfo(_("未找到本书目录缓存，请先从番茄书架打开一次"))
-                    return true
-                end
-            end
-        end
-    end
-
     if not (_state.current_book and _state.current_chapters) then
         return false
     end
@@ -3210,14 +3365,16 @@ function FanQiePlugin:onShowFanQieToc()
     end
 
     self:syncCurrentProgress()
+    -- Reuse showChapterListing so the reader-side TOC also gets the
+    -- persistent catalog cache and the refresh button.
     self:showChapterListing(_state.current_book)
     return true
 end
 
 function FanQiePlugin:onShowFanQieBookshelf()
-    if not (self.ui and self.ui.document) then
-        self:showBookshelf()
-    end
+    -- 手势「番茄书架」：任何上下文（FileManager / Reader）都直接打开书架。
+    -- 书架 widget 压栈显示，底层阅读器仍在，选择书目后自行导航，不会破坏进度。
+    self:showBookshelf()
     return true
 end
 
@@ -3244,6 +3401,16 @@ end
 
 function FanQiePlugin:onFanQieSearchBooks()
     self:onSearchBooks()
+    return true
+end
+
+function FanQiePlugin:onFanQieFetchLocalReview()
+    local LocalReview = require("fanqie.local_review")
+    if not LocalReview then
+        self:showInfo(_("本地段评模块加载失败"))
+        return true
+    end
+    LocalReview.run(self)
     return true
 end
 
@@ -3649,15 +3816,60 @@ function FanQiePlugin:openBook(book)
     local pull_progress = settings:get("sync", {}).pull_on_open ~= false
 
     Async.run(function()
-        -- 子进程：始终拉取最新目录（有缓存也刷新，获取新章节）；按设置拉取阅读进度
-        local b = { book_id = book_id }
-        local fetched = Content.fetch_catalog(client, b)
+        -- 根据来源选 catalog：搜索结果走对应源，书架书走官方
+        local fetched
+        if book._search_source and book._search_source ~= "official" then
+            fetched = client:get_catalog_for(book)
+        else
+            local b = { book_id = book_id }
+            fetched = Content.fetch_catalog(client, b)
+        end
+
+        -- 书山 catalog 归一化：解 leko://shushan/chapter?d=<base64>
+        if book._search_source == "shushan" and type(fetched) == "table" then
+            local ShuShan = require("fanqie.shushan")
+            local normalized = {}
+            for i, ch in ipairs(fetched) do
+                if type(ch) == "table" then
+                    local title = ch.title or ch.name or ("Chapter " .. tostring(i))
+                    local url = ch.url or ""
+                    local b64 = url:match("[?&]d=([^&]+)")
+                    local cid, bookid, item_id = "", "", ""
+                    if b64 then
+                        local ok_d, decoded = pcall(function() return ShuShan.base64_decode(b64) end)
+                        if ok_d and decoded then
+                            local lines = {}
+                            for line in (decoded .. "\n"):gmatch("(.-)\n") do
+                                table.insert(lines, line)
+                            end
+                            -- CHAPTER_FIELDS = { source, cid, bookid, itemid, url, name, title, chapterid, curl }
+                            cid     = lines[2] or ""
+                            bookid  = lines[3] or ""
+                            item_id = lines[4] or ""
+                        end
+                    end
+                    if item_id == "" then
+                        item_id = url:match("item_id=(%d+)") or url:match("itemId=(%d+)") or ""
+                    end
+                    if item_id ~= "" then
+                        table.insert(normalized, {
+                            itemId = item_id,
+                            title = tostring(title),
+                            cid = cid,
+                            bookid = bookid,
+                        })
+                    end
+                end
+            end
+            if #normalized > 0 then fetched = normalized end
+        end
+
         local progress = nil
-        if pull_progress then
+        -- 搜索结果的书不同步番茄官方进度（没有 _fanqie_sync）
+        if pull_progress and book._fanqie_sync then
             local ok_p, p = pcall(function() return client:fetch_read_progress() end)
             if ok_p then progress = p end
         end
-        -- 多值打包成 table（Async.run work_func 只能返回单值）
         return { chapters = fetched, progress = progress }
     end, function(ok, result, err)
         self:closeBusy()
@@ -3755,6 +3967,14 @@ end
 
 function FanQiePlugin:showInfo(text)
     UIManager:show(InfoMessage:new{ text = text })
+end
+
+function FanQiePlugin:showTransientInfo(text, timeout)
+    local Notification = require("ui/widget/notification")
+    UIManager:show(Notification:new{
+        text = tostring(text or ""),
+        timeout = timeout or 2,
+    })
 end
 
 function FanQiePlugin:showError(text)
