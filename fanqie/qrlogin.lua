@@ -1,554 +1,564 @@
--- fanqie/qrlogin.lua
--- 番茄小说扫码登录模块
---
--- 流程参考 kindle-forge/backend/fanqie/qrlogin.py:
---   1. GET 登录页预热 cookie (passport_csrf_token)
---   2. GET /passport/web/get_qrcode/ 获取二维码 token + qrcode_index_url
---   3. 轮询 GET /passport/web/check_qrconnect/?token=... 直到 jar 出现 sessionid
---
--- UI 参考 miuread-koreader/miuread/auth.lua:
---   generation 防旧回调 + QRMessage 显示二维码 + UIManager:scheduleIn 轮询
---
--- 网络请求通过 fanqie/async.lua 在子进程执行，避免阻塞 UI 线程；
--- 子进程只做 HTTP + JSON 解析，不写 settings（fork 继承的 settings 对象
--- 在子进程的写不影响父进程），登录成功后在 UI 线程回调里持久化 cookie。
-
-local Device = require("device")
-local UIManager = require("ui/uimanager")
-local QRMessage = require("ui/widget/qrmessage")
-local ButtonDialog = require("ui/widget/buttondialog")
-local InfoMessage = require("ui/widget/infomessage")
-
-local Async = require("fanqie.async")
-local Cookie = require("fanqie.cookie")
-local H = require("fanqie.helper")
-local Log = require("fanqie.logger")
-
-local ok_json, json = pcall(require, "json")
-if not ok_json then
-    ok_json, json = pcall(require, "rapidjson")
-end
-
 local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(text) return text end
+local T = _
 
---- 从跨进程结果重建 jar。
---- async.lua 用 JSON 把子进程结果序列化传回父进程，但 rapidjson/dkjson 对
---- 纯字符串 key 的 hash table 编码时会丢成空 {}，导致 result.jar 跨进程后变空
---- （表现为 has_sessionid=true 但 self.jar 是空 table）。
---- 解决：work_func 返回时额外带 jar_str（Cookie header 字符串，序列化可靠），
---- 父进程优先用 jar_str 解析回 table，回退到 jar 字段。
-local function rebuild_jar(result)
-    if type(result) ~= "table" then
-        Log.debug("[FanQieQR] rebuild_jar: result非table=" .. type(result))
-        return {}
+local ok_UIManager, UIManager = pcall(require, "ui/uimanager")
+local ok_InfoMessage, InfoMessage = pcall(require, "ui/widget/infomessage")
+
+local ok_H, H = pcall(require, "fanqie.helper")
+local ok_Log, Log = pcall(require, "fanqie.logger")
+local ok_Content, Content = pcall(require, "fanqie.content")
+local ok_state, _state = pcall(require, "fanqie.state")
+local ok_Async, Async = pcall(require, "fanqie.async")
+local ok_SM, SM = pcall(require, "fanqie.sources")
+
+local ReaderNavigation = {}
+
+function ReaderNavigation:navigateToChapter(book, chapters, chapter_index, opts)
+    opts = opts or {}
+    local chapter = chapters[chapter_index]
+    if not chapter then
+        self:showInfo(_("章节不存在"))
+        return false
     end
-    local jar_str = result.jar_str
-    Log.debug("[FanQieQR] rebuild_jar: jar_str_len=" .. tostring(jar_str and #jar_str or "nil")
-        .. " jar_type=" .. tostring(type(result.jar))
-        .. " has_sessionid=" .. tostring(result.has_sessionid))
-    if jar_str and jar_str ~= "" then
-        local parsed = Cookie.parse_cookie_header(jar_str)
-        local cnt = 0
-        for _ in pairs(parsed) do cnt = cnt + 1 end
-        Log.debug("[FanQieQR] rebuild_jar: parse得到" .. cnt .. "个cookie, jar_str前80=" .. tostring(jar_str):sub(1, 80))
-        return parsed
+
+    -- 标记章节切换中：防止段评异步回调在切章后弹窗闪现
+    _state.setChapterNavigating(true)
+
+    -- 中断预下载（后台预下载不应阻塞用户阅读）
+    -- 预下载的 on_done 会检查 pre_download_triggered，若为 false 则停止调度
+    if _state.pre_download_triggered then
+        _state.pre_download_triggered = false
+        if Log then Log.info("navigateToChapter: aborting pre-download for user navigation") end
     end
-    Log.debug("[FanQieQR] rebuild_jar: jar_str为空，回退result.jar")
-    return result.jar or {}
-end
 
-local QRLogin = {}
-QRLogin.__index = QRLogin
-
-local LOGIN_PAGE = "https://fanqienovel.com/main/writer/login"
-local GET_QRCODE_URL = "https://fanqienovel.com/passport/web/get_qrcode/"
-local CHECK_QR_URL = "https://fanqienovel.com/passport/web/check_qrconnect/"
-local FANQIE_LOGIN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    .. "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
-
-local POLL_INTERVAL = 2     -- 轮询间隔（秒）
-local QR_TIMEOUT = 300      -- 二维码整体超时（秒），对应 qrlogin.py 的 expire
-
-local COMMON_PARAMS = {
-    passport_jssdk_version = "3.0.16",
-    passport_jssdk_type = "normal",
-    aid = "2503",
-    language = "zh",
-    account_sdk_source = "web",
-}
-
---- 大小写无关地取响应头（LuaSocket 返回的 header 键是小写的，但兼容一下）
-local function header_value(headers, name)
-    if not headers then return nil end
-    local target = name:lower()
-    for k, v in pairs(headers) do
-        if tostring(k):lower() == target then return v end
+    if _state.is_downloading then
+        -- 用户主动下载进行中：给用户明确提示
+        _state.setChapterNavigating(false)
+        self:showInfo(_("正在下载中，请稍候再试"))
+        return false
     end
-    return nil
-end
 
-local function json_decode(text)
-    if not ok_json or not json or not text then return nil end
-    local ok, v = pcall(function()
-        if json.decode then return json.decode(text) end
-        return json:decode(text)
-    end)
-    if ok then return v end
-    return nil
-end
+    _state.current_book = book
+    _state.current_chapters = chapters
 
---- 把 params table 拼成 query string（H.url_encode 只能编码单个字符串）
-local function build_query(params)
-    local parts = {}
-    for k, v in pairs(params) do
-        table.insert(parts, tostring(k) .. "=" .. H.url_encode(tostring(v)))
-    end
-    table.sort(parts)
-    return table.concat(parts, "&")
-end
+    -- 从全局状态获取段评开关
+    local review_enabled = _state.isReviewEnabled()
+    local fetch_opts = { skip_cache_index = true }
+    if review_enabled then fetch_opts.review = true end
 
---- 从 cookie jar 提取 passport_csrf_token
-local function extract_csrf(jar)
-    if not jar then return "" end
-    local v = jar["passport_csrf_token"]
-    if v and v ~= "" then return v end
-    return ""
-end
+    local item_id = tostring(chapter.itemId)
+    local existing_path = nil
 
---- 底层 GET 请求（手动管理 cookie，不走 client 的自动 cookie 注入）。
---- 在子进程中调用。返回 text, resp_headers 或抛错（由 Async 的 pcall 捕获）。
---- opts.redirect = false 可禁用自动重定向（用于手动处理重定向以保留中间 Set-Cookie）
-local function http_get(client, url, jar, csrf, opts)
-    local headers = {
-        ["User-Agent"] = FANQIE_LOGIN_UA,
-        ["Accept"] = "application/json, text/javascript, text/html, */*",
-        ["Accept-Language"] = "zh-CN,zh;q=0.9",
-        ["Referer"] = LOGIN_PAGE,
-        ["sec-fetch-dest"] = "empty",
-        ["sec-fetch-mode"] = "cors",
-        ["sec-fetch-site"] = "same-origin",
-    }
-    if jar and next(jar) ~= nil then
-        headers["Cookie"] = Cookie.to_header(jar)
-    end
-    if csrf and csrf ~= "" then
-        headers["x-tt-passport-csrf-token"] = csrf
-    end
-    local req_opts = {
-        url = url,
-        method = "GET",
-        headers = headers,
-        timeout = 15,
-    }
-    if opts and opts.redirect ~= nil then
-        req_opts.redirect = opts.redirect
-    end
-    local text, code, resp_headers = client:request(req_opts)
-    -- 禁用重定向时 3xx 也是正常响应，不禁用时只有 2xx
-    if not code then
-        error("HTTP 无响应码")
-    end
-    if opts and opts.redirect == false then
-        -- 禁用重定向模式：2xx 和 3xx 都返回
-        if code < 200 or code >= 400 then
-            error("HTTP " .. tostring(code))
-        end
+    if book.cached_chapters then
+        existing_path = book.cached_chapters[item_id]
     else
-        if code < 200 or code >= 300 then
-            error("HTTP " .. tostring(code))
+        -- 确保 book.cached_chapters 与内存缓存是同一引用，
+        -- 否则后续文件系统回退 save_cache_index 会用不完整的 {} 覆盖内存缓存
+        book.cached_chapters = Content and Content.load_cache_index(self.settings, book.book_id) or {}
+        existing_path = book.cached_chapters[item_id]
+    end
+
+    -- 已缓存正文直接使用：段评数据缺失不触发重下（有些章节本就无段评）。
+    -- 想要段评的用户可通过「重新获取本章节」手动重下（按当前段评开关决定是否带段评）。
+
+    -- If not found in cache index, try to find file directly from filesystem
+    if not existing_path or not (H and H.file_exists(existing_path)) then
+        local found_path = Content and Content.find_chapter_file(self.settings, book.book_id, item_id)
+        if found_path then
+            -- 更新缓存索引：确保使用内存缓存引用，避免用不完整的 table 覆盖
+            book.cached_chapters = book.cached_chapters or (Content and Content.load_cache_index(self.settings, book.book_id)) or {}
+            book.cached_chapters[item_id] = found_path
+            if Content and Content.save_cache_index then
+                Content.save_cache_index(self.settings, book.book_id, book.cached_chapters)
+            end
+            existing_path = found_path
+            if Log then Log.info("found cached chapter in filesystem:", item_id) end
         end
     end
-    return text, resp_headers or {}
-end
 
---- @param client  fanqie.client 实例（提供 :request）
---- @param settings fanqie.settings 实例（提供 :set/:flush/:is_cookie_configured）
---- @param plugin   FanQiePlugin 实例（提供 showBusy/closeBusy）
-function QRLogin:new(client, settings, plugin)
-    local self = setmetatable({}, QRLogin)
-    self.client = client
-    self.settings = settings
-    self.plugin = plugin
-    self.generation = 0   -- 版本号，防止旧回调干扰当前登录状态
-    self.jar = {}         -- 扫码期间的临时 cookie jar
-    self.dialog = nil     -- QRMessage 对话框
-    self.retry_dialog = nil
-    self.started = 0      -- 开始时间（超时检测）
-    self.poll_failures = 0
-    self.login_completed = false  -- 登录已完成标志，防止 dismiss_callback 误清空 jar
-    return self
-end
-
-function QRLogin:toast(text)
-    UIManager:show(InfoMessage:new{ text = tostring(text) })
-end
-
-function QRLogin:_close_dialog()
-    if self.dialog then
-        local d = self.dialog
-        self.dialog = nil
-        UIManager:close(d)
-    end
-end
-
-function QRLogin:_close_retry_dialog()
-    if self.retry_dialog then
-        local d = self.retry_dialog
-        self.retry_dialog = nil
-        UIManager:close(d)
-    end
-end
-
---- 取消登录：generation+1 使所有旧回调失效，关闭对话框，清空临时 jar
-function QRLogin:cancel()
-    self.generation = self.generation + 1
-    self.login_completed = false
-    self:_close_dialog()
-    self:_close_retry_dialog()
-    self.jar = {}
-    self.started = 0
-    self.poll_failures = 0
-    self.plugin:closeBusy()
-end
-
---- 启动扫码登录（外部入口）
-function QRLogin:start()
-    self:_begin()
-end
-
---- 获取二维码并显示
-function QRLogin:_begin()
-    self:cancel()  -- 清理旧状态并 generation+1
-    local gen = self.generation
-    self.started = os.time()
-    self.plugin:showBusy(_("获取二维码中..."))
-    Log.info("[FanQieQR] 开始获取二维码")
-
-    Async.run(function()
-        -- 步骤1: 访问登录页预热 cookie（passport_csrf_token 等）
-        local _, login_headers = http_get(self.client, LOGIN_PAGE, nil, nil)
-        local jar = Cookie.merge_set_cookie({}, header_value(login_headers, "set-cookie"))
-        local csrf = extract_csrf(jar)
-
-        -- 步骤2: 请求 get_qrcode
-        local params = {}
-        for k, v in pairs(COMMON_PARAMS) do params[k] = v end
-        params["need_logo"] = "true"
-        params["next"] = LOGIN_PAGE
-        local qr_url = GET_QRCODE_URL .. "?" .. build_query(params)
-        local qr_text, qr_headers = http_get(self.client, qr_url, jar, csrf)
-        jar = Cookie.merge_set_cookie(jar, header_value(qr_headers, "set-cookie"))
-        csrf = extract_csrf(jar)  -- get_qrcode 可能刷新了 csrf
-
-        local data = json_decode(qr_text)
-        if type(data) ~= "table" then error("二维码响应非 JSON") end
-        if data.message ~= "success" then
-            error("接口返回: " .. tostring(data.message))
+    if existing_path and H and H.file_exists(existing_path) then
+        _state.current_chapter_index = chapter_index
+        _state.pre_download_triggered = false
+        -- 加载段评数据
+        if review_enabled then
+            local reviews = Content and Content.load_para_reviews_index(self.settings, book.book_id, item_id) or {}
+            _state.setCurrentParaReviews(reviews)
         end
-        local d = data.data or {}
-        local token = d.token or ""
-        local qr_index_url = d.qrcode_index_url or ""
-        if token == "" or qr_index_url == "" then
-            error("二维码数据不完整")
+        self:showReaderUI(existing_path, chapter)
+        if opts.after_navigate then
+            UIManager:scheduleIn(1.0, opts.after_navigate)
         end
-        return {
-            token = token,
-            qr_url = qr_index_url,
-            jar = jar,
-            jar_str = Cookie.to_header(jar),
-            csrf = csrf,
-            expire_time = tonumber(d.expire_time) or 0,
-        }
-    end, function(ok, result, err)
-        self.plugin:closeBusy()
-        if not ok or gen ~= self.generation then return end
-        if err then
-            Log.warn("[FanQieQR] 获取二维码失败:", err)
-            self:show_retry(_("获取二维码失败:") .. "\n" .. tostring(err))
+        return true
+    end
+
+    _state.is_downloading = true
+    self:showBusy(T(_("正在下载: %s"), chapter.title or ""))
+
+    local self_ref = self
+    local b = { book_id = book.book_id, title = book.title, author = book.author }
+    local client = self.client
+    local settings = self.settings
+
+    local work_fn = function()
+        local path, ch, para_reviews, rate_info = Content and Content.fetch_chapter_html(
+            client, settings, b, chapter, fetch_opts
+        )
+        return { path = path, para_reviews = para_reviews, rate_info = rate_info }
+    end
+
+    local function on_done(ok, result, err)
+        self_ref:closeBusy()
+
+        if not ok or type(result) ~= "table" or not result.path then
+            if Log then Log.error("navigateToChapter download failed:", tostring(err or result)) end
+            _state.is_downloading = false
+            _state.setChapterNavigating(false)
+            self_ref:showError(T(_(opts.error_message or "下载章节失败:\n%1"),
+                self_ref:displayError(err or result)))
             return
         end
-        self.jar = rebuild_jar(result)
 
-        -- 显示二维码（KOReader 内置 QRMessage 把 URL 生成二维码图片）
-        local size = math.floor(math.min(Device.screen:getWidth(), Device.screen:getHeight()) * 0.72)
-        local dialog
-        dialog = QRMessage:new{
-            text = result.qr_url,
-            width = size,
-            height = size,
-            scale_factor = 0.9,
-            dismiss_callback = function()
-                Log.debug("[FanQieQR] dismiss_callback: gen=" .. tostring(gen) .. " generation=" .. tostring(self.generation) .. " dialog_match=" .. tostring(self.dialog == dialog) .. " login_completed=" .. tostring(self.login_completed))
-                if self.dialog == dialog then self.dialog = nil end
-                -- 登录已完成时不再触发 cancel（_finish_login_success 关对话框会同步触发此回调，
-                -- 仅靠 generation 判断不可靠——UIManager:close 的 dismiss_callback 时机早于
-                -- generation+1 生效，会导致 jar 被清空）
-                if gen == self.generation and not self.login_completed then
-                    self:cancel()
-                    self:toast(_("已取消登录"))
+        -- 合并子进程限流时间戳（子进程会随退出丢失）
+        if result.rate_info and ok_SM and SM and SM.merge_rate_limit_timestamps then
+            SM.merge_rate_limit_timestamps(result.rate_info)
+        end
+
+        local path = result.path
+        local para_reviews = result.para_reviews
+
+        -- 确保 book.cached_chapters 与内存缓存是同一引用：
+        -- 之前 book.cached_chapters = {} 和 cc = load_cache_index() 是两个不同 table，
+        -- 预下载后续用 book.cached_chapters（只有当前章节）覆盖内存缓存，
+        -- 导致之前下载的章节在目录中丢失 ✓ 对号。
+        if Content and Content.load_cache_index and Content.save_cache_index then
+            local cc = Content.load_cache_index(settings, book.book_id) or {}
+            -- 合并 book.cached_chapters 中已有条目到 cc（内存缓存）
+            if book.cached_chapters then
+                for k, v in pairs(book.cached_chapters) do
+                    cc[k] = v
                 end
-            end,
-        }
-        self.dialog = dialog
-        UIManager:show(dialog)
-        Log.info("[FanQieQR] 二维码已显示，开始轮询 token=", tostring(result.token):sub(1, 12))
-        self:_schedule(gen, result.token, result.csrf, result.expire_time)
-    end, { timeout = 20 })
+            end
+            cc[item_id] = path
+            -- 让 book.cached_chapters 指向内存缓存，后续预下载追加到此同一 table
+            book.cached_chapters = cc
+            Content.save_cache_index(settings, book.book_id, cc)
+        else
+            book.cached_chapters = book.cached_chapters or {}
+            book.cached_chapters[item_id] = path
+        end
+
+        -- 存储段评数据到全局状态
+        if review_enabled and para_reviews then
+            _state.setCurrentParaReviews(para_reviews)
+        end
+
+        _state.current_chapter_index = chapter_index
+        _state.pre_download_triggered = false
+        _state.is_downloading = false
+        self_ref:showReaderUI(path, chapter)
+
+        if opts.after_navigate then
+            UIManager:scheduleIn(1.0, opts.after_navigate)
+        end
+    end
+
+    if ok_Async and Async and Async.run then
+        Async.run(work_fn, on_done, { poll_interval = 0.125, timeout = 120 })
+    else
+        -- 降级：同步执行
+        local ok_sync, res = pcall(work_fn)
+        on_done(ok_sync, res, ok_sync and nil or res)
+    end
+
+    return true
 end
 
---- 轮询扫码状态
-function QRLogin:_schedule(gen, token, csrf, expire_time)
-    if gen ~= self.generation then return end
-    -- 超时检测
-    if os.time() - self.started > QR_TIMEOUT then
-        self:show_retry(_("二维码已过期"))
+function ReaderNavigation:openChapter(book, chapters, chapter_index)
+    return self:navigateToChapter(book, chapters, chapter_index, {
+        error_message = "下载章节失败:\n%1",
+    })
+end
+
+function ReaderNavigation:showReaderUI(path, chapter)
+    _state.current_document_path = path
+    -- 章节切换已完成（新文档即将加载），清除导航标志
+    _state.setChapterNavigating(false)
+    local ReaderUI = require("apps/reader/readerui")
+    -- 不用 switchDocument（其内部先 onClose 再 showReader，中间 forceRePaint 会闪现书架）
+    -- 直接用 showReader：doShowReader 在 nextTick 中关闭旧实例并打开新实例，无闪现
+    if not ReaderUI.instance then
+        UIManager:broadcastEvent(Event:new("SetupShowReader"))
+    end
+    ReaderUI:showReader(path, nil, true)  -- seamless=true 隐藏"打开文件"提示
+end
+
+function ReaderNavigation:preDownloadChapters(book, chapters, current_index)
+    if _state.pre_download_triggered then return end
+    _state.pre_download_triggered = true
+
+    local cache = self.settings:get("cache", {})
+    local pre_download_count = cache.pre_download_chapters or 3
+    local start_idx = current_index + 1
+    local end_idx = math.min(current_index + pre_download_count, #chapters)
+
+    if start_idx > end_idx then
+        _state.pre_download_triggered = false
         return
     end
-    if expire_time and expire_time > 0 and os.time() > expire_time then
-        self:show_retry(_("二维码已过期"))
-        return
-    end
 
-    Async.run(function()
-        local params = {}
-        for k, v in pairs(COMMON_PARAMS) do params[k] = v end
-        params["token"] = token
-        params["next"] = "/"
-        local url = CHECK_QR_URL .. "?" .. build_query(params)
-        -- 关键：禁用自动重定向！check_qrconnect 确认后返回 302 + Set-Cookie(sessionid)，
-        -- socket.http 默认 redirect=true 会跟随重定向并丢弃 302 的 Set-Cookie，导致 sessionid 丢失。
-        -- 对应 Python 后端的 allow_redirects=False。
-        local text, resp_headers = http_get(self.client, url, self.jar, csrf, { redirect = false })
-        local raw_set_cookie = header_value(resp_headers, "set-cookie") or ""
-        local new_jar = Cookie.merge_set_cookie(self.jar, raw_set_cookie)
-        local has_sessionid = new_jar.sessionid and new_jar.sessionid ~= ""
+    local review_enabled = _state.isReviewEnabled()
+    local fetch_opts = review_enabled and { review = true, skip_cache_index = true } or { skip_cache_index = true }
+    local self_ref = self
+    local client = self.client
+    local settings = self.settings
+    local b = { book_id = book.book_id, title = book.title, author = book.author }
 
-        -- 调试日志：打印 Set-Cookie 原始值和 jar 状态（截断防刷屏）
-        Log.debug("[FanQieQR] 轮询响应 Set-Cookie(前300): " .. tostring(raw_set_cookie):sub(1, 300))
-        Log.debug("[FanQieQR] has_sessionid=" .. tostring(has_sessionid) .. " jar_keys=" .. (function()
-            local keys = {}
-            for k, _ in pairs(new_jar) do table.insert(keys, k) end
-            table.sort(keys)
-            return table.concat(keys, ",")
-        end)())
-
-        -- 如果响应已带回 sessionid，直接成功（不需要解析 JSON）
-        if has_sessionid then
-            return { status = "success", jar = new_jar, jar_str = Cookie.to_header(new_jar), has_sessionid = true, redirect_url = "" }
-        end
-
-        -- 尝试解析 JSON（3xx 重定向时 body 可能为空，pcall 防止解析失败崩溃）
-        local data
-        if text and #text > 0 then
-            local ok, parsed = pcall(json_decode, text)
-            if ok and type(parsed) == "table" then
-                data = parsed
-            end
-        end
-
-        if not data then
-            -- 3xx 重定向但无 sessionid：可能是中间跳转，记录 location 继续轮询
-            local location = header_value(resp_headers, "location") or ""
-            Log.debug("[FanQieQR] 非JSON响应, location=" .. tostring(location):sub(1, 100))
-            return { status = "redirect", jar = new_jar, jar_str = Cookie.to_header(new_jar), has_sessionid = false, redirect_url = location }
-        end
-
-        local d = data.data or {}
-        local status = d.status or ""
-        -- confirmed/success 状态时打印完整 data 便于排查
-        if status == "confirmed" or status == "success" then
-            Log.info("[FanQieQR] 确认状态 data=" .. text:sub(1, 500))
-        end
-        return {
-            status = status,
-            error_code = d.error_code,
-            jar = new_jar,
-            jar_str = Cookie.to_header(new_jar),
-            has_sessionid = has_sessionid,
-            redirect_url = d.redirect_url or "",
-        }
-    end, function(ok, result, err)
-        if not ok or gen ~= self.generation then return end
-        if err then
-            self.poll_failures = (self.poll_failures or 0) + 1
-            if self.poll_failures == 1 or self.poll_failures % 5 == 0 then
-                Log.warn("[FanQieQR] 轮询失败 #" .. self.poll_failures .. ":", err)
-            end
-            -- 网络错误：稍后重试，不立即判定失败
-            UIManager:scheduleIn(POLL_INTERVAL, function()
-                self:_schedule(gen, token, csrf, expire_time)
-            end)
-            return
-        end
-        self.poll_failures = 0
-        self.jar = rebuild_jar(result)
-
-        if result.has_sessionid then
-            -- sessionid 已在 cookie 中（确认后 302 响应的 Set-Cookie 中带回）
-            self:_finish_login_success(gen)
+    -- 递归异步下载：每次下载一章 -> 检查取消/限流 -> 下载下一章
+    local function download_one(idx)
+        if idx > end_idx then
+            _state.pre_download_triggered = false
+            _state.pre_downloading = false
             return
         end
 
-        local status = result.status or ""
-        if status == "success" or status == "confirmed" then
-            -- 用户已确认，但 sessionid 不在 302 响应中（可能在 redirect_url 后续跳转中）
-            Log.info("[FanQieQR] 用户已确认 status=" .. status .. ", 访问 redirect_url 获取 sessionid")
-            if result.redirect_url and result.redirect_url ~= "" then
-                self:_finish_with_redirect(gen, result.redirect_url, csrf)
+        -- 如果被用户操作中断（navigateToChapter 设置 pre_download_triggered=false），停止
+        if not _state.pre_download_triggered then
+            _state.pre_downloading = false
+            if Log then Log.info("pre-download: aborted by user navigation") end
+            return
+        end
+
+        -- 如果用户主动下载（手动下载/跳章下载），中断预下载，让用户操作优先
+        if _state.is_downloading then
+            _state.pre_download_triggered = false
+            _state.pre_downloading = false
+            if Log then Log.info("pre-download: aborted, user download in progress") end
+            return
+        end
+
+        local chapter = chapters[idx]
+        local item_id = tostring(chapter.itemId)
+
+        -- 检查是否已缓存
+        local cached_chapters = book.cached_chapters or Content.load_cache_index(settings, book.book_id) or {}
+        local existing_path = cached_chapters[item_id]
+
+        -- 已缓存正文直接跳过：段评数据缺失不触发重下
+
+        if existing_path and H and H.file_exists(existing_path) then
+            -- 已缓存，跳过
+            if Log then Log.info("pre-download: skipping cached chapter", idx) end
+            UIManager:scheduleIn(0, function() download_one(idx + 1) end)
+            return
+        end
+
+        -- 限流预检：检查所有活跃源是否可用
+        if ok_SM and SM then
+            local sources = SM.get_active_sources(settings)
+            if #sources > 0 then
+                local any_ok = false
+                local max_wait = 0
+                for _, src in ipairs(sources) do
+                    local rl = src.config.rate_limit or {}
+                    local rl_ok, wait = SM.rate_limit_peek(src.id, rl.max_requests, rl.window_seconds)
+                    if rl_ok then any_ok = true; break end
+                    if wait and wait > max_wait then max_wait = wait end
+                end
+                if not any_ok and max_wait > 0 then
+                    -- 所有源都被限流，等待后重试
+                    if Log then Log.info("pre-download: rate limited, waiting", max_wait, "s") end
+                    UIManager:scheduleIn(max_wait, function() download_one(idx) end)
+                    return
+                end
+            end
+        end
+
+        -- 设置预下载标志（独立于 is_downloading，不阻塞用户阅读）
+        _state.pre_downloading = true
+
+        if Log then Log.info("pre-download: downloading chapter", idx) end
+
+        -- 异步下载（子进程执行 HTTP + IO）
+        local work_fn = function()
+            local path, ch, para_reviews, rate_info = Content.fetch_chapter_html(
+                client, settings, b, chapter, fetch_opts
+            )
+            return { path = path, item_id = item_id, rate_info = rate_info }
+        end
+
+        local function on_done(ok, result, err)
+            _state.pre_downloading = false
+
+            -- 如果已被中断，不继续调度
+            if not _state.pre_download_triggered then
+                if Log then Log.info("pre-download: interrupted, stop scheduling") end
+                return
+            end
+
+            if not ok or type(result) ~= "table" or not result.path then
+                if Log then Log.warn("pre-download: failed chapter", idx, tostring(err or result)) end
             else
-                -- 没有 redirect_url，尝试直接用已有 jar 保存
-                Log.warn("[FanQieQR] " .. status .. " 但无 redirect_url")
-                self:_finish_login_success(gen)
-            end
-        elseif status == "expired" then
-            self:show_retry(_("二维码已过期"))
-        elseif status == "scanned" or status == "confirming" or status == "confirm" then
-            Log.info("[FanQieQR] 用户已扫码/确认中 status=", status)
-            UIManager:scheduleIn(POLL_INTERVAL, function()
-                self:_schedule(gen, token, csrf, expire_time)
-            end)
-        else
-            -- new / redirect / 其他非终态：继续轮询
-            Log.debug("[FanQieQR] 轮询中 status=", status)
-            UIManager:scheduleIn(POLL_INTERVAL, function()
-                self:_schedule(gen, token, csrf, expire_time)
-            end)
-        end
-    end, { timeout = 15 })
-end
-
---- 用户确认后访问 redirect_url 获取 sessionid（字节跳动 passport 标准流程）
--- check_qrconnect 返回 status=success + redirect_url，但 sessionid 不会直接下发，
--- 必须带上扫码期间的 cookie jar 访问 redirect_url，服务器才会在 Set-Cookie 中返回 sessionid。
--- 注意：socket.http 自动重定向不传递 Cookie 也不合并中间 Set-Cookie，必须手动跟随。
-function QRLogin:_finish_with_redirect(gen, redirect_url, csrf)
-    if gen ~= self.generation then return end
-    self.plugin:showBusy(_("正在完成登录..."))
-    Log.info("[FanQieQR] 访问 redirect_url:", tostring(redirect_url):sub(1, 80))
-
-    Async.run(function()
-        local url = redirect_url
-        local jar = self.jar
-        local max_redirects = 5
-
-        for i = 1, max_redirects + 1 do
-            -- 禁用自动重定向，手动处理以保留每一跳的 Set-Cookie
-            local _, resp_headers = http_get(self.client, url, jar, csrf, { redirect = false })
-            -- 合并这一跳的 Set-Cookie（sessionid 可能在任意一跳中返回）
-            jar = Cookie.merge_set_cookie(jar, header_value(resp_headers, "set-cookie"))
-
-            -- 检查是否拿到 sessionid
-            if jar.sessionid and jar.sessionid ~= "" then
-                Log.info("[FanQieQR] 第" .. i .. "跳获取到 sessionid")
-                return { jar = jar, jar_str = Cookie.to_header(jar), has_sessionid = true }
-            end
-
-            -- 检查是否需要继续重定向
-            local location = header_value(resp_headers, "location")
-            if not location or location == "" then
-                -- 不再重定向，检查最终 jar
-                local has_sid = jar.sessionid and jar.sessionid ~= ""
-                return { jar = jar, jar_str = Cookie.to_header(jar), has_sessionid = has_sid }
-            end
-
-            -- 处理相对路径的 location
-            if not location:match("^https?://") then
-                local scheme, host = url:match("^(https?)://([^/]+)")
-                if scheme then
-                    if location:sub(1, 1) == "/" then
-                        location = scheme .. "://" .. host .. location
-                    else
-                        local prefix = url:match("^(https?://.*/)") or (scheme .. "://" .. host .. "/")
-                        location = prefix .. location
-                    end
+                -- 更新缓存索引
+                cached_chapters[result.item_id] = result.path
+                book.cached_chapters = cached_chapters
+                if Content and Content.save_cache_index then
+                    Content.save_cache_index(settings, book.book_id, cached_chapters)
                 end
+
+                -- 合并子进程限流时间戳
+                if result.rate_info and ok_SM and SM and SM.merge_rate_limit_timestamps then
+                    SM.merge_rate_limit_timestamps(result.rate_info)
+                end
+
+                if Log then Log.info("pre-download: completed chapter", idx) end
             end
-            Log.debug("[FanQieQR] 重定向第" .. i .. "跳 -> " .. tostring(location):sub(1, 80))
-            url = location
+
+            -- 继续下一章
+            UIManager:scheduleIn(0.5, function() download_one(idx + 1) end)
         end
-        error("重定向次数超限(" .. max_redirects .. ")，未获取到 sessionid")
-    end, function(ok, result, err)
-        self.plugin:closeBusy()
-        if not ok or gen ~= self.generation then return end
-        if err then
-            Log.warn("[FanQieQR] 访问 redirect_url 失败:", err)
-            self:show_retry(_("完成登录失败:") .. "\n" .. tostring(err))
-            return
-        end
-        self.jar = rebuild_jar(result)
-        if result.has_sessionid then
-            self:_finish_login_success(gen)
+
+        if ok_Async and Async and Async.run then
+            Async.run(work_fn, on_done, { poll_interval = 0.125, timeout = 90 })
         else
-            -- redirect 后仍然没有 sessionid，记录 jar 内容便于排查
-            local keys = {}
-            for k, _ in pairs(self.jar) do table.insert(keys, k) end
-            Log.warn("[FanQieQR] redirect 后仍无 sessionid, jar keys=" .. table.concat(keys, ","))
-            self:show_retry(_("登录失败：未获取到 sessionid"))
+            -- 降级：同步执行
+            local ok_sync, res = pcall(work_fn)
+            on_done(ok_sync, res, ok_sync and nil or res)
         end
-    end, { timeout = 20 })
-end
-
---- 登录成功：持久化 cookie 并关闭对话框
--- 直接用扫码获取的 jar 覆盖（不再合并 config.lua 中的旧 cookie，以后只走扫码登录）
-function QRLogin:_finish_login_success(gen)
-    Log.debug("[FanQieQR] _finish_login_success: gen=" .. tostring(gen) .. " generation=" .. tostring(self.generation) .. " dialog=" .. tostring(self.dialog ~= nil))
-    if gen ~= self.generation then return end
-    -- 先把 jar 复制到局部变量：_close_dialog 触发的 dismiss_callback 可能执行 cancel()
-    -- 清空 self.jar，用局部副本保证 cookie 不丢失。
-    local jar = {}
-    for k, v in pairs(self.jar) do jar[k] = v end
-    -- 标记登录已完成，dismiss_callback 据此跳过 cancel()
-    self.login_completed = true
-    self.generation = self.generation + 1
-    self:_close_dialog()
-    -- 用局部 jar 统计和持久化（self.jar 可能已被 dismiss_callback→cancel() 清空）
-    local keys = {}
-    local count = 0
-    for k, v in pairs(jar) do
-        table.insert(keys, k)
-        count = count + 1
     end
-    table.sort(keys)
-    Log.info("[FanQieQR] 登录成功，扫码获取到 " .. count .. " 个 cookie: " .. table.concat(keys, ", "))
-    Log.info("[FanQieQR] cookie header: " .. Cookie.to_header(jar))
-    self.settings:set("cookies", jar)
-    self.settings:flush()
-    self.jar = jar  -- 恢复 self.jar（dismiss_callback 可能已清空）
-    self:toast(_("登录成功"))
+
+    -- 延迟启动，给UI线程让出时间
+    UIManager:scheduleIn(1.0, function() download_one(start_idx) end)
 end
 
---- 显示重试对话框（generation+1 使旧回调失效，等待用户选择）
-function QRLogin:show_retry(msg)
-    self.generation = self.generation + 1
-    self:_close_dialog()
-    local dialog
-    dialog = ButtonDialog:new{
-        title = tostring(msg),
-        title_align = "center",
-        buttons = {
-            {
-                {
-                    text = _("重新获取"),
-                    callback = function()
-                        if self.retry_dialog == dialog then self.retry_dialog = nil end
-                        UIManager:close(dialog)
-                        self:_begin()
-                    end,
-                },
-                {
-                    text = _("取消"),
-                    callback = function()
-                        if self.retry_dialog == dialog then self.retry_dialog = nil end
-                        UIManager:close(dialog)
-                        self:cancel()
-                    end,
-                },
-            },
-        },
-    }
-    self.retry_dialog = dialog
-    UIManager:show(dialog)
+function ReaderNavigation:getCurrentPageProgress()
+    if not self.ui or not self.ui.document then return 0 end
+    local doc = self.ui.document
+    local current_page = self.ui.view.state.page
+    local total_pages = doc:getPageCount()
+    if total_pages <= 0 then return 0 end
+    return current_page / total_pages
 end
 
-return QRLogin
+function ReaderNavigation:syncCurrentProgress()
+    if not _state.current_book or not _state.current_chapters then return end
+    local book = _state.current_book
+    local chapters = _state.current_chapters
+    local current_idx = _state.current_chapter_index or 0
+
+    if current_idx <= 0 or current_idx > #chapters then return end
+
+    local chapter = chapters[current_idx]
+    if not chapter or not chapter.itemId then return end
+
+    local page_progress = self:getCurrentPageProgress()
+    local chapter_progress = (current_idx - 1 + page_progress) / #chapters
+
+    local last_report = _state.getLastProgressReport(chapter.itemId)
+    if last_report and last_report.progress >= page_progress then
+        return
+    end
+
+    local book_id = book.book_id
+    local item_id = chapter.itemId
+    local idx = current_idx
+
+    UIManager:scheduleIn(1.0, function()
+        local ok, err = pcall(function()
+            self.client:update_read_progress(book_id, item_id, idx - 1, page_progress)
+        end)
+        if ok then
+            _state.setLastProgressReport(item_id, page_progress)
+            _state.removePendingProgress(book_id, item_id)
+        else
+            _state.addPendingProgress(book_id, item_id, idx - 1, page_progress)
+        end
+    end)
+end
+
+function ReaderNavigation:retryPendingProgress()
+    local pending = _state.getPendingProgressList()
+    if not pending or #pending == 0 then return end
+
+    for _, item in ipairs(pending) do
+        local ok, err = pcall(function()
+            self.client:update_read_progress(item.book_id, item.item_id, item.chapter_index, item.progress)
+        end)
+        if ok then
+            _state.setLastProgressReport(item.item_id, item.progress)
+            _state.removePendingProgress(item.book_id, item.item_id)
+        end
+    end
+end
+
+function ReaderNavigation:onPageUpdate(pageno)
+    if not self:isCurrentDocFanqie() then return end
+    if pageno % 10 == 0 then
+        self:syncCurrentProgress()
+    end
+end
+
+function ReaderNavigation:onStartOfBook()
+    if Log then Log.info("fanqie onStartOfBook called") end
+    
+    if not _state.current_book or not _state.current_chapters then
+        if Log then Log.info("fanqie onStartOfBook: current_book or current_chapters is nil") end
+        return false
+    end
+    
+    local is_fanqie = self:isCurrentDocFanqie()
+    if Log then Log.info("fanqie onStartOfBook: is_fanqie=", is_fanqie) end
+    
+    if not is_fanqie then
+        return false
+    end
+
+    local current_idx = _state.current_chapter_index or 0
+    local chapters = _state.current_chapters
+    local book = _state.current_book
+
+    if Log then Log.info("fanqie onStartOfBook: current_idx=", current_idx, "total_chapters=", #chapters) end
+
+    if current_idx <= 1 then
+        UIManager:show(InfoMessage:new{
+            text = _("已经是第一章了"),
+            timeout = 3,
+        })
+        return true
+    end
+
+    local prev_idx = current_idx - 1
+    local prev_chapter = chapters[prev_idx]
+    if not prev_chapter then
+        return true
+    end
+
+    self:navigateToChapter(book, chapters, prev_idx, {
+        error_message = "加载上一章失败:\n%1",
+        after_navigate = function()
+            self:syncCurrentProgress()
+            self:preDownloadChapters(book, chapters, prev_idx)
+            self:retryPendingProgress()
+        end,
+    })
+
+    return true
+end
+
+function ReaderNavigation:onEndOfBook()
+    if Log then Log.info("fanqie onEndOfBook called") end
+    
+    if not _state.current_book or not _state.current_chapters then
+        if Log then Log.info("fanqie onEndOfBook: current_book or current_chapters is nil") end
+        return false
+    end
+    
+    local is_fanqie = self:isCurrentDocFanqie()
+    if Log then Log.info("fanqie onEndOfBook: is_fanqie=", is_fanqie) end
+    
+    if not is_fanqie then
+        return false
+    end
+
+    local current_idx = _state.current_chapter_index or 0
+    local chapters = _state.current_chapters
+    local book = _state.current_book
+    if Log then Log.info("fanqie onEndOfBook triggered: current_idx=", current_idx, "total_chapters=", #chapters) end
+
+    if book.book_id and current_idx > 0 then
+        local chapter = chapters[current_idx]
+        if chapter and chapter.itemId then
+            local last_report = _state.getLastProgressReport(chapter.itemId)
+            if not last_report or last_report.progress < 1.0 then
+                local book_id = book.book_id
+                local item_id = chapter.itemId
+                local idx = current_idx
+                UIManager:scheduleIn(0.1, function()
+                    local ok, err = pcall(function()
+                        self.client:update_read_progress(book_id, item_id, idx - 1, 1.0)
+                    end)
+                    if ok then
+                        _state.setLastProgressReport(item_id, 1.0)
+                        _state.removePendingProgress(book_id, item_id)
+                    else
+                        _state.addPendingProgress(book_id, item_id, idx - 1, 1.0)
+                    end
+                end)
+            end
+        end
+    end
+
+    local next_idx = current_idx + 1
+
+    if next_idx > #chapters then
+        UIManager:show(InfoMessage:new{
+            text = _("已经是最后一章了"),
+            timeout = 3,
+        })
+        return true
+    end
+
+    local next_chapter = chapters[next_idx]
+    if not next_chapter then
+        return true
+    end
+
+    self:navigateToChapter(book, chapters, next_idx, {
+        error_message = "加载下一章失败:\n%1",
+        after_navigate = function()
+            self:preDownloadChapters(book, chapters, next_idx)
+            self:retryPendingProgress()
+        end,
+    })
+
+    return true
+end
+
+function ReaderNavigation:onCloseDocument()
+    if not self:isCurrentDocFanqie() then return end
+    if Log then Log.info("fanqie onCloseDocument called") end
+    self:syncCurrentProgress()
+end
+
+function ReaderNavigation:onClose()
+    if Log then Log.info("fanqie onClose called") end
+    if self:isCurrentDocFanqie() then
+        self:syncCurrentProgress()
+    end
+end
+
+function ReaderNavigation:onCloseWidget()
+    if Log then Log.info("fanqie onCloseWidget called") end
+    if self:isCurrentDocFanqie() then
+        self:syncCurrentProgress()
+    end
+end
+
+function ReaderNavigation:onShowFanQieToc()
+    if not _state.current_book then return end
+    self:showChapterListing(_state.current_book)
+end
+
+function ReaderNavigation:onShowFanQieBookshelf()
+    self:showBookshelf()
+end
+
+function ReaderNavigation:openBook(book)
+    local ok, chapters = pcall(function()
+        return self:get_chapters(book.book_id)
+    end)
+    if not ok then
+        if Log then Log.error("fetch chapters failed:", tostring(chapters)) end
+        self:showError(T(_("获取目录失败:\n%1"), self:displayError(chapters)))
+        return
+    end
+
+    local start_idx = 1
+    if book.read_chapters and book.read_chapters > 0 then
+        start_idx = math.min(book.read_chapters + 1, #chapters)
+    end
+
+    self:openChapter(book, chapters, start_idx)
+end
+
+return ReaderNavigation
