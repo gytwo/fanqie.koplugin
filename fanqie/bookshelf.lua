@@ -162,6 +162,8 @@ end
 function Bookshelf:showBookshelf(opts)
     opts = opts or {}
     local force_refresh = opts.force_refresh == true
+    -- 打开书架的后台刷新默认静默；只有显式 silent=false 才弹提示
+    local silent = opts.silent ~= false
 
     if not self.patches_ok then
         local Patches = require("patches.core")
@@ -207,7 +209,6 @@ function Bookshelf:showBookshelf(opts)
             self:showBookList(cached_shelf)
             -- 后台异步刷新
             if self:checkNetwork() then
-                self:showBusy(_("正在刷新书架..."))
                 local plugin = self
                 if ok_Async and Async then
                     Async.run(function()
@@ -237,7 +238,9 @@ function Bookshelf:showBookshelf(opts)
         return
     end
 
-    self:showBusy(force_refresh and _("正在刷新书架...") or _("正在获取书架..."))
+    if not silent then
+        self:showBusy(force_refresh and _("正在刷新书架...") or _("正在获取书架..."))
+    end
     local plugin = self
     if ok_Async and Async then
         Async.run(function()
@@ -321,7 +324,15 @@ function Bookshelf:get_shelf(force_refresh)
                 progress = tonumber(item.read_progress) / 10000
             end
             local book = {
-                book_id = item.book_id or item.bookId or item.id,
+                book_id = (function()
+                    local v = item.book_id or item.bookId or item.id
+                    if type(v) == "number" then
+                        -- 检查精度
+                        local s = string.format("%.0f", v)
+                        return s
+                    end
+                    return tostring(v or "")
+                end)(),
                 title = item.book_name or item.title or item.name or "未知",
                 author = item.author_name or item.author or "",
                 cover = item.thumb_url or item.coverUrl or item.cover or item.cover_url,
@@ -330,7 +341,7 @@ function Bookshelf:get_shelf(force_refresh)
                 item_id = item.item_id or item.itemId,
                 total_chapters = total_chapters,
                 read_chapters = read_chapters,
-                _fanqie_sync = true,   -- 番茄书架的书，进度可同步到番茄官方
+                _fanqie_sync = true,
             }
             if book.book_id then
                 table.insert(books, book)
@@ -662,6 +673,47 @@ function Bookshelf:downloadBook(book)
     end
     -- 书架下载：不传 current_index（无"当前阅读后N章"/"剩余全部"选项）
     require("fanqie.download").showOptionsDialog(self, book, chapters)
+end
+
+-- 按 book_id 查一本书的标题/作者（仅供阅读统计合并使用）
+-- 只读：书架内存缓存 → shelf_cache.lua 文件缓存，不触发任何网络请求。
+function Bookshelf.find_book_meta(book_id, settings)
+    if not book_id then return nil end
+    book_id = tostring(book_id)
+
+    local function pick(books)
+        if type(books) ~= "table" then return nil end
+        for _, b in ipairs(books) do
+            if type(b) == "table" and tostring(b.book_id or b.bookId or "") == book_id then
+                return {
+                    book_id = book_id,
+                    title = b.title or b.book_name or b.name or "",
+                    author = b.author or b.author_name or "",
+                }
+            end
+        end
+        return nil
+    end
+
+    local found = pick(SHELF_MEM_CACHE)
+    if found then return found end
+
+    if ok_H and H and H.file_exists and settings then
+        local cache_path = get_shelf_cache_path(settings)
+        if H.file_exists(cache_path) then
+            local ok, data = pcall(function()
+                local chunk = loadfile(cache_path)
+                return chunk and chunk() or nil
+            end)
+            if ok and type(data) == "table" then
+                if Log and Log.info then
+                    Log.info("stats: book meta from shelf cache " .. cache_path)
+                end
+                return pick(data)
+            end
+        end
+    end
+    return nil
 end
 
 return Bookshelf

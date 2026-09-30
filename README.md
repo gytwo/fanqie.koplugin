@@ -1,12 +1,18 @@
 # fanqie.koplugin
 
-KOReader 插件，用于在电纸书设备上阅读番茄小说。
+> [上游原版v2.2.1](https://github.com/hesan1232/fanqie.koplugin)
+>
+> [上游分支改版v2.2.0-fixed.4](https://github.com/seaneasysaid/fanqie.koplugin-fixed)
+>主要修改点（VS [上游原版v2.2.1](https://github.com/hesan1232/fanqie.koplugin)）：书山聚合 + 知秋段评 + 书架UI
+>
+> [本版本v2.2.1-b](https://github.com/gytwo/fanqie.koplugin)
+> 主要修改点（VS[上游分支改版v2.2.0-fixed.4](https://github.com/seaneasysaid/fanqie.koplugin-fixed)）：为本地书籍拉取段评 + 搜索书籍（非番茄书架书籍会按书源搜索）
 
-自改版本:
+[本版本v2.2.1-b](https://github.com/gytwo/fanqie.koplugin):
+- 拉取段评：为本地书籍拉取段评
 - 搜索功能：可搜索非番茄书架的书籍并直接阅读(但无法加入番茄书架、同步进度）
-- 取消patch历史记录：阅读的番茄书籍章节也会出现在历史记录中，可通过继续阅读直接打开已缓存的章节 
 - 绕过番茄书架打开目录、加载段评：通过文件管理器或历史记录直接打开已缓存书籍章节也能直接打开目录，正常加载段评 
-- 快捷手势：添加注册[番茄-书架/目录]、[番茄-搜索书籍]两个系统动作（常规类）
+- 快捷手势：添加注册[番茄-书架/目录]、[番茄-搜索书籍]（常规类）及 [番茄-拉取段评]（阅读类）
 - 缓存文件夹封面：缓存某书籍章节时自动下载书籍封面并命名为cover.jpg放至该文件夹内，方便其他美化插件识别为文件夹封面
 - 缓存文件夹名称：缓存某书籍章节新建文件夹时自动按title-id命名
 
