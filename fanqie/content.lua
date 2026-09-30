@@ -1,5 +1,4 @@
 local util = require("util")
-
 local function rshift(n, k)
     return math.floor(n / (2 ^ k))
 end
@@ -181,39 +180,51 @@ local function basename_safe(value)
     if value == "" then
         value = "fanqie"
     end
-    -- 最多 10 个字符
-    local chars = util.splitToChars(value)
+    -- 截断到 10 个字符（UTF-8 安全）
+    local chars = require("util").splitToChars(value)
     if #chars > 10 then
         value = table.concat(chars, "", 1, 10)
     end
     return value
 end
 
--- book_id 专用：只清非法字符，不截断
+-- book_id 专用：只清非法字符，不截断（大整数 ID 不能被截）
 local function id_safe(value)
     value = tostring(value or ""):gsub("[/\\:%*%?\"<>|]", "_")
     if value == "" then value = "fanqie" end
     return value
 end
 
+-- book_id -> 目录路径（进程内缓存，避免每次扫目录）
+local _book_dir_cache = {}
+
 function Content.book_cache_dir(settings, book_id)
     local base = settings.cache_dir
-    local id = id_safe(book_id) 
+    local id = id_safe(book_id)
 
-    -- 扫 base 下所有文件夹，按"最后一段 id"匹配（兼容纯 id 和 <title>-<id>）
+    -- 1. 进程内缓存命中
+    if _book_dir_cache[id] then
+        return _book_dir_cache[id]
+    end
+
+    -- 2. 扫目录，兼容「纯 id」和「<title>-<id>」两种命名
     local lfs = require("libs/libkoreader-lfs")
     if lfs.attributes(base, "mode") == "directory" then
         for entry in lfs.dir(base) do
             if entry ~= "." and entry ~= ".." then
                 if entry == id or entry:sub(-(#id + 1)) == "-" .. id then
-                    return base .. "/" .. entry
+                    local dir = base .. "/" .. entry
+                    _book_dir_cache[id] = dir
+                    return dir
                 end
             end
         end
     end
 
-    -- 没找到（首次建目录前）：返回纯 id 路径，由调用方决定怎么建
-    return base .. "/" .. id
+    -- 3. 没找到（首次建目录前）：返回纯 id 路径
+    local dir = base .. "/" .. id
+    _book_dir_cache[id] = dir
+    return dir
 end
 
 -- Cache index: persists item_id → file path mapping across restarts
@@ -282,26 +293,34 @@ end
 
 -- Catalog (chapter directory) persistence: saves the full chapter list
 -- so we don't have to re-fetch it from the server every time.
+-- save_catalog_cache 支持额外的 title/cover 参数：
+--   首次建目录时用 <title>-<id> 命名，并下载封面到 cover.jpg
 function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
-    local base = settings.cache_dir
-    local id = id_safe(book_id) 
-
-    -- 第一次建目录：用 <title>-<id>（拿不到 title 时退回纯 id）
+    local id = id_safe(book_id)
     local dir = Content.book_cache_dir(settings, book_id)
+
+    -- 首次建目录：用 <title>-<id>
     local lfs = require("libs/libkoreader-lfs")
     if lfs.attributes(dir, "mode") ~= "directory" and title and title ~= "" then
-        dir = base .. "/" .. basename_safe(title) .. "-" .. id
+        dir = settings.cache_dir .. "/" .. basename_safe(title) .. "-" .. id
     end
     H.make_dir(dir)
+    _book_dir_cache[id] = dir   -- 更新缓存
 
-    -- 第一次建目录时写入 cover.jpg
-    local cover_path = dir .. "/cover.jpg"
-    if not H.file_exists(cover_path) and cover and cover ~= "" then
-        local ok, data = pcall(function()
-            return require("fanqie.client"):new(settings):get_binary(cover)
-        end)
-        if ok and data and #data > 0 then
-            H.write_file(cover_path, data)
+    -- 首次建目录时写入 cover.jpg
+    if cover and cover ~= "" then
+        local cover_path = dir .. "/cover.jpg"
+        if not H.file_exists(cover_path) then
+            local ok, data = pcall(function()
+                return require("fanqie.client"):new(settings):get_binary(cover)
+            end)
+            if ok and data and #data > 0 then
+                -- 按真实格式决定扩展名
+                local ext = Content.detect_image_type(data) or ".jpg"
+                H.write_file(dir .. "/cover" .. ext, data)
+            else
+                if logger then logger.warn("cover download failed:", cover) end
+            end
         end
     end
 
@@ -582,7 +601,7 @@ function Content.clean_chapter_content(raw_content, title)
 
     local content = raw_content
 
-    -- 移除不可见字符（零宽空格、BOM、软连字符、双向控制符等，晴天/大灰狼广告中大量掺杂）
+    -- 移除不可见字符（零宽空格、BOM、软连字符、双向控制符等，聚合源广告中大量掺杂）
     -- U+200B-200F, U+2028-202E, U+FEFF, U+00AD
     content = content:gsub("\226\128[\139\140\141\142\143]", "")  -- U+200B-200F 零宽空格/方向标记
     content = content:gsub("\226\128[\168\169\170\171\172\173\174]", "")  -- U+2028-202E 行/段分隔符与双向控制符
@@ -601,7 +620,7 @@ function Content.clean_chapter_content(raw_content, title)
         content = body_match
     end
 
-    -- 移除末尾广告：晴天广告以 📣 开头，大灰狼以 "本书源" 开头
+    -- 移除末尾广告：部分聚合源广告以 📣 或 "本书源" 开头
     -- 广告可能跨多行，从起始标志到内容结尾全部删除
     -- 📣 = U+1F4E3 = F0 9F 93 A3
     local ad_start = nil
@@ -637,9 +656,12 @@ function Content.clean_chapter_content(raw_content, title)
         -- 用 <a href="fanqie-para:N"> 代替 <span onclick>，因为 KOReader 的 crengine
         -- 不支持 JavaScript onclick 事件，但支持 <a> 链接点击 → 触发 onGotoLink 事件
         -- href 中的 N 是段评在 para_reviews 表中的序号，插件通过 onGotoLink 拦截
+        -- 超过 99 条显示 99+，避免四位数字气泡过宽
+        local n_label = tostring(n)
+        if n > 99 then n_label = "99+" end
         comment_bubbles[idx] = string.format(
-            '<a class="para-comment" href="fanqie-para:%d">%d</a>',
-            idx, n
+            '<a class="para-comment" href="fanqie-para:%d">[%s]</a>',
+            idx, n_label
         )
         return "\001CMT" .. idx .. "\001"
     end)
@@ -651,7 +673,7 @@ function Content.clean_chapter_content(raw_content, title)
             table.insert(comment_samples, string.format('<comment ident="%s" />', ident:sub(1, 80)))
         end
         comment_bubbles[idx] = string.format(
-            '<a class="para-comment" href="fanqie-para:%d">0</a>',
+            '<a class="para-comment" href="fanqie-para:%d">[0]</a>',
             idx
         )
         return "\001CMT" .. idx .. "\001"
@@ -820,7 +842,7 @@ function Content.clean_chapter_content(raw_content, title)
             if is_img_only then
                 table.insert(paragraphs, para_content .. ph_html)
             else
-                table.insert(paragraphs, "<p>" .. para_content .. "</p>" .. ph_html)
+                            table.insert(paragraphs, "<p>" .. para_content .. "</p>" .. ph_html)
             end
         elseif ph_html ~= "" then
             table.insert(paragraphs, "<p>" .. ph_html .. "</p>")
@@ -1243,7 +1265,6 @@ function Content.fetch_catalog(client, book)
     local result = client:fetch_chapter_directory(book_id)
     local chapters = Content.readable_chapters(Content.normalize_chapters(result, book_id))
     book.chapters = chapters
-    book.total_chapters = #chapters
     return chapters
 end
 
@@ -1293,26 +1314,9 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
             "raw_content_len=" .. tostring(#content))
     end
 
-    if logger then
-        -- Debug: dump original content to see where <img> tags sit in the source.
-        -- Replace literal newlines with visible \n markers so log lines don't
-        -- get collapsed, and tag every <img> with a [IMG@N] marker.
-        local preview = content
-        -- Make <img> tags visually obvious
-        local img_count = 0
-        preview = preview:gsub("(<[iI][mM][gG][^>]*/?>)", function(tag)
-            img_count = img_count + 1
-            return "\n[[IMG" .. img_count .. "]]" .. tag .. "[[/IMG" .. img_count .. "]]\n"
-        end)
-        if #preview > 4000 then preview = preview:sub(1, 4000) .. "...[truncated]" end
-        logger.debug(LOG_MODULE, "[debug] raw content before clean, len=" .. tostring(#content) .. " img_count=" .. img_count .. ":\n" .. preview)
-    end
     local cleaned = Content.clean_chapter_content(content, title)
     local clean_elapsed = now_ms() - t_clean
     if logger then
-        local preview2 = cleaned
-        if #preview2 > 4000 then preview2 = preview2:sub(1, 4000) .. "...[truncated]" end
-        logger.debug(LOG_MODULE, "[debug] cleaned content, len=" .. tostring(#cleaned) .. ":\n" .. preview2)
         -- 验证清洗后的正文是否含气泡
         local bubble_count = 0
         for _ in cleaned:gmatch('class="para%-comment"') do
@@ -1349,14 +1353,23 @@ end
 
 function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     local book_id = book.book_id or book.bookId
-    local title = chapter.title or book.title or "FanQie"
-
     local dir = Content.book_cache_dir(settings, book_id)
     H.make_dir(dir)
-
     local images_dir = dir .. "/images"
     local item_id = tostring(chapter.itemId)
     local path = dir .. "/" .. "chapter_" .. item_id .. ".html"
+    local title = chapter.title or book.title or "FanQie"
+
+    -- 章节号与标题名分两行：把"第X章/卷/节/回/部/篇"前缀拆出，插 <br/>
+    -- 不匹配（序章/后记/无"第X章"格式）则原样返回，不影响其他标题
+    local function split_title_for_display(raw_title)
+        local t = tostring(raw_title or "")
+        local num, rest = t:match("^(第[一二三四五六七八九十百千零〇%d]+[章卷节回部篇])%s*(.+)$")
+        if num and rest and rest ~= "" then
+            return '<span class="chap-num">' .. xml_escape(num) .. "</span><br/>" .. xml_escape(rest)
+        end
+        return xml_escape(t)
+    end
 
     -- 1. Write downloaded image assets to actual files on disk (relative-path fallback for crengine)
     --    href in assets is "images/img_001.png"; relative to dir this resolves correctly.
@@ -1472,12 +1485,52 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
 </style>
 </head>
 <body>
-<h1>]] .. xml_escape(title) .. [[</h1>
+<h1>]] .. split_title_for_display(title) .. [[</h1>
 ]] .. body .. [[
 </body>
 </html>]]
     H.write_file(path, html)
     return path
+end
+
+-- 按 book._search_source 锁定源取正文（不做多源 fallback）。
+function Content.fetch_chapter_content_locked(client, settings, book, chapter, opts)
+    opts = opts or {}
+    local src = book._search_source or "official"
+    local item_id = tostring(chapter.itemId or chapter.item_id or "")
+
+    local result
+    if src == "shushan" then
+        local ShuShan = require("fanqie.shushan")
+        result = ShuShan.get_content(client, settings,
+            tostring(chapter.bookid or book.book_id or ""),
+            item_id, {
+            review = opts.review,
+            cid = chapter.cid,
+            source = book.source,
+        })
+    else
+        result = client:official_get_content(tostring(book.book_id or ""), item_id)
+    end
+
+    if not result or not result.content then
+        error("锁定源取正文失败: source=" .. src .. " itemId=" .. item_id)
+    end
+
+    local content = result.content
+    local title = result.title or chapter.title or ""
+
+    if content:find("\238", 1, true) then
+        content = Content.decode_pua_content(content)
+    end
+    local cleaned = Content.clean_chapter_content(content, title)
+
+    return '<?xml version="1.0" encoding="utf-8"?>\n'
+        .. '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>'
+        .. xml_escape(title) .. '</title></head>\n'
+        .. '<body>\n' .. cleaned .. '\n</body></html>',
+        result.para_reviews or {},
+        nil
 end
 
 function Content.fetch_chapter_html(client, settings, book, chapter, opts)
@@ -1487,13 +1540,21 @@ function Content.fetch_chapter_html(client, settings, book, chapter, opts)
     local item_id = tostring(chapter.itemId)
 
     local t_fetch = now_ms()
-    local ok_fetch, xhtml, para_reviews, rate_info = pcall(Content.fetch_chapter_content, client, settings, book, chapter, opts)
+    local is_locked = book._search_source and book._search_source ~= "official"
+    local ok_fetch, xhtml, para_reviews, rate_info
+    if is_locked then
+        ok_fetch, xhtml, para_reviews, rate_info = pcall(
+            Content.fetch_chapter_content_locked, client, settings, book, chapter, opts)
+    else
+        ok_fetch, xhtml, para_reviews, rate_info = pcall(
+            Content.fetch_chapter_content, client, settings, book, chapter, opts)
+    end
     local fetch_elapsed = now_ms() - t_fetch
     if not ok_fetch then
         error("fetch_chapter_content failed: " .. tostring(xhtml))
     end
 
-    -- 段评气泡 CSS（简洁上标数字，墨水屏黑白兼容，无动画无倾斜）
+    -- 段评标记 CSS（[数字] 方括号形式，墨水屏黑白兼容，纯文本可靠渲染）
     local css = [[
 body { font-size: 1em; }
 p{
@@ -1508,13 +1569,16 @@ img {
   height: auto;
 }
 
-/* 段评数字：上标小号数字，点击触发 onGotoLink */
+/* 段评标记：[数字] 方括号形式，点击触发 onGotoLink
+   纯文本字符实现，任何 crengine 版本都可靠渲染（不依赖圆角/背景） */
 a.para-comment {
-  font-size: 0.5em !important;
-  vertical-align: super;
+  font-size: 0.8em !important;
   text-decoration: none;
-  margin-left: 2px;
+  font-weight: bold;
+  margin-left: 1px;
+  margin-right: 1px;
 }
+
 ]]
     local assets = {}
     local cache = settings:get("cache", {})
