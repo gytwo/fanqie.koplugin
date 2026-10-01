@@ -750,6 +750,10 @@ end
 -- 生命周期
 -- ============================================================================
 function LocalReview.on_reader_ready(plugin)
+    local doc = plugin.ui and plugin.ui.document
+    if not doc or not doc.getCurrentPos then
+        return
+    end
     plugin._local_review_cache = plugin._local_review_cache or {}
     plugin._local_review_prefetching = plugin._local_review_prefetching or {}
     plugin._local_review_bindings = plugin._local_review_bindings or load_bindings(plugin)
