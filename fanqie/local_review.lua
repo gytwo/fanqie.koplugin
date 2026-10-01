@@ -229,6 +229,11 @@ end
 
 function Overlay:paintTo(bb, x, y)
     if not self.enabled then self._visible = {}; return end
+    local document = self.ui and self.ui.document
+    if not document or not document.getCurrentPos then
+        self._visible = {}
+        return
+    end
     self._visible = self:_computeVisible()
     for _ei, entry in ipairs(self._visible) do
         local r = entry.rect
