@@ -91,6 +91,50 @@ local Async = safe_require("fanqie.async")
 
 local unpack_args = unpack or table.unpack
 
+-- 菜单入口排序：番茄书架默认排在「工具」菜单第二位（微信读书之后）。
+-- KOReader 的 MenuSorter 对不在默认顺序表里的项，会按 sorting_hint 追加到
+-- 菜单末尾，无法保证位置；weread 插件的做法是改写 KOReader 默认顺序表，
+-- 这里沿用同一方式。
+--
+-- 插件按 path 字母序加载（PluginLoader:loadPlugins），fanqie 先于 weread，
+-- 所以本插件插入之后 weread 还会 table.insert(..., 1, "weread") 抢第一位，
+-- 把番茄挤到第三位。因此除了在模块加载时插入，还要在插件 init 时（此时
+-- weread 必然已加载）再校正一次，让番茄始终紧跟在 weread 后面。
+-- 用户手动调整过菜单顺序的话，KOReader 的用户排序表优先级更高，不受影响。
+local MENU_ID = "fanqie"
+local MENU_ANCHOR_ID = "weread"
+
+local function menu_slot(tools)
+    local mine, anchor
+    for i, id in ipairs(tools) do
+        if id == MENU_ID then mine = i end
+        if id == MENU_ANCHOR_ID then anchor = i end
+    end
+    return mine, anchor
+end
+
+-- 把 fanqie 摆到紧跟 weread 之后（weread 缺席则第 2 位）；已在正确位置则不动。
+local function ensure_menu_position()
+    for _, module in ipairs({
+        "ui/elements/filemanager_menu_order",
+        "ui/elements/reader_menu_order",
+    }) do
+        local ok_order, order = pcall(require, module)
+        if ok_order and type(order) == "table" and type(order.tools) == "table" then
+            local tools = order.tools
+            local mine, anchor = menu_slot(tools)
+            -- 目标位置：weread 之后紧挨着；weread 缺席则第 2 位。
+            local want = anchor and (anchor + 1) or 2
+            if mine ~= want then
+                if mine then table.remove(tools, mine) end
+                table.insert(tools, want, MENU_ID)
+            end
+        end
+    end
+end
+
+ensure_menu_position()
+
 local function log_error(err)
     local text = tostring(err):gsub("[%c]+", " ")
     if #text > 500 then
@@ -201,6 +245,9 @@ function FanQiePlugin:init()
     end
     self:onDispatcherRegisterActions()
     self:loadConfigFile(true)
+    -- 插件按字母序加载，本插件早于 weread；此刻 weread 已就位，
+    -- 重新校正一次菜单顺序，保证番茄入口紧跟微信读书（工具菜单第二位）。
+    ensure_menu_position()
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end

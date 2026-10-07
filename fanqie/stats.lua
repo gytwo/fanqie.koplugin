@@ -27,7 +27,7 @@
 --   阅读时长会丢失。因此映射只做在落库层，内存里仍按真实页累计时长。
 
 local M = {
-    _mark = "_fanqie_stats_patch_v2",
+    _mark = "_fanqie_stats_patch_v3",
 }
 
 -- 每章预留的虚拟页槽位。只影响页号空间，不影响计数：
@@ -68,35 +68,104 @@ local function item_id_from_path(file_path)
     return item_id
 end
 
+-- 诊断日志：只在异常时记一次，避免翻页刷屏（WARN 级确保落盘）
+local _diag_seen = {}
+local function diag(key, msg)
+    if _diag_seen[key] then return end
+    _diag_seen[key] = true
+    local ok, L = pcall(require, "fanqie.logger")
+    if ok and type(L) == "table" and L.warn then
+        pcall(L.warn, "[stats] " .. tostring(msg))
+    end
+end
+
 -- 目录信息进程内缓存：目录文件可能几十 KB，别每次翻页都读
 local _cat_cache = {}
 
--- 返回 { idx = { [item_id] = 章序号 }, total = 全书章数 }；拿不到返回 nil
-local function catalog_info(settings, book_id)
-    if not book_id then return nil end
-    book_id = tostring(book_id)
-    local hit = _cat_cache[book_id]
-    if hit ~= nil then return hit end
-
+-- 直接读目录文件（权威且完整）。刻意绕开 Content.load_catalog_cache 的
+-- _state 内存缓存：那个缓存有 24h TTL，且可能是"部分目录"，会让章序号解析
+-- 失败，统计随之退化成"只统计一章页数"。
+local function read_catalog_file(settings, book_id)
     local ok_content, Content = pcall(require, "fanqie.content")
-    if not ok_content or type(Content) ~= "table" or not Content.load_catalog_cache then
+    if not ok_content or type(Content) ~= "table" or not Content.book_cache_dir then
         return nil
     end
-    local ok, catalog = pcall(Content.load_catalog_cache, settings, book_id)
-    if not ok or type(catalog) ~= "table" or #catalog == 0 then
-        return nil
-    end
+    if not (H and H.join_path and H.file_exists) then return nil end
+    local ok_dir, dir = pcall(Content.book_cache_dir, settings, book_id)
+    if not ok_dir or not is_str(dir) then return nil end
+    local path = H.join_path(dir, "catalog_cache.lua")
+    if not H.file_exists(path) then return nil end
+    local ok, catalog = pcall(dofile, path)
+    if not ok or type(catalog) ~= "table" or #catalog == 0 then return nil end
+    return catalog
+end
 
-    local idx = {}
+local function build_catalog_info(catalog)
+    local idx, by_title = {}, {}
     for i, ch in ipairs(catalog) do
         if type(ch) == "table" then
             local iid = tostring(ch.itemId or ch.item_id or "")
             if iid ~= "" and idx[iid] == nil then idx[iid] = i end
+            local t = ch.title
+            if is_str(t) and t ~= "" and by_title[t] == nil then by_title[t] = i end
         end
     end
-    local info = { idx = idx, total = #catalog }
+    return { idx = idx, by_title = by_title, total = #catalog }
+end
+
+-- 返回 { idx = { [item_id] = 章序号 }, by_title, total }；拿不到返回 nil。
+-- 传入 item_id 时若缓存里查不到，会强制重读目录文件（目录可能已被刷新）。
+local function catalog_info(settings, book_id, item_id)
+    if not book_id then return nil end
+    book_id = tostring(book_id)
+    local hit = _cat_cache[book_id]
+    if hit and (not item_id or hit.idx[item_id]) then return hit end
+
+    local catalog = read_catalog_file(settings, book_id)
+    if not catalog then
+        -- 文件读不到时退回 Content 的缓存（内存/文件）
+        local ok_content, Content = pcall(require, "fanqie.content")
+        if ok_content and type(Content) == "table" and Content.load_catalog_cache then
+            local ok, c2 = pcall(Content.load_catalog_cache, settings, book_id)
+            if ok and type(c2) == "table" and #c2 > 0 then catalog = c2 end
+        end
+    end
+    if not catalog then return hit end
+
+    local info = build_catalog_info(catalog)
     _cat_cache[book_id] = info
     return info
+end
+
+-- 章节文件标题缓存：chapter_<item_id>.html 头部有 <title>第N章 …</title>
+local _title_cache = {}
+
+local function read_html_title(file_path)
+    if not is_str(file_path) then return nil end
+    local cached = _title_cache[file_path]
+    if cached ~= nil then return cached or nil end
+    local title = nil
+    local f = io and io.open and io.open(file_path, "r") or nil
+    if f then
+        local head = f:read(2048) or ""
+        f:close()
+        title = head:match("<title>%s*(.-)%s*</title>")
+    end
+    _title_cache[file_path] = title or false
+    return title
+end
+
+-- 目录里匹配不到 item_id 时的兜底（目录刷新换了 ID / 章节已下架）：
+-- 优先用章节标题在目录里按 title 反查章序号，再退化为解析"第N章"的 N。
+function M.chapter_index_fallback(file_path, cat)
+    local title = read_html_title(file_path)
+    if not title or title == "" then return nil end
+    if cat and cat.by_title and cat.by_title[title] then
+        return cat.by_title[title]
+    end
+    local n = tonumber(title:match("第%s*(%d+)%s*[章回节]"))
+    if n and n >= 1 then return n end
+    return nil
 end
 
 -- 当前会话正在读的书（最可靠，含未落缓存的书）
@@ -127,9 +196,15 @@ end
 function M.resolve(file_path, settings)
     if not is_fanqie_path(file_path) then return nil end
     local book_id = book_id_from_path(file_path)
-    if not book_id then return nil end
+    if not book_id then
+        diag("nbid", "无法从路径解析 book_id: " .. tostring(file_path))
+        return nil
+    end
     local book = current_session_book(book_id) or shelf_book(book_id, settings)
-    if not book then return nil end
+    if not book then
+        diag("nbook:" .. book_id, "找不到书名元数据，统计不合并: " .. book_id)
+        return nil
+    end
 
     local identity = {
         book_id = book_id,
@@ -138,11 +213,23 @@ function M.resolve(file_path, settings)
         md5 = "fanqie-" .. book_id,
     }
 
-    local cat = catalog_info(settings, book_id)
+    local item_id = item_id_from_path(file_path)
+    local cat = catalog_info(settings, book_id, item_id)
     if cat then
         identity.total_chapters = cat.total
-        local item_id = item_id_from_path(file_path)
         identity.chapter_index = item_id and cat.idx[item_id] or nil
+        if not identity.chapter_index then
+            -- 目录里没有该 item_id：用章节标题兜底解析章序号，
+            -- 避免退化成"不介入"而把 book.pages 写成本章页数。
+            identity.chapter_index = M.chapter_index_fallback(file_path, cat)
+            if not identity.chapter_index then
+                diag("nidx:" .. book_id .. ":" .. tostring(item_id),
+                    string.format("章序号未解析（目录 %d 条，item=%s）",
+                        cat.total, tostring(item_id)))
+            end
+        end
+    else
+        diag("ncat:" .. book_id, "目录缓存不可用，页数统计不介入: " .. book_id)
     end
     return identity
 end
@@ -246,6 +333,21 @@ local function align_total_pages(id_book, v)
     end)
 end
 
+-- 读取库里当前记录的全书页数（降级时保底用，绝不让它被本章页数覆盖）
+function M.current_book_pages(id_book)
+    if not id_book then return nil end
+    return with_db(function(db)
+        local ok, row = pcall(function()
+            return db:rowexec(string.format(
+                "SELECT pages FROM book WHERE id = %d;", tonumber(id_book)))
+        end)
+        if not ok or type(row) ~= "table" then return nil end
+        local v = tonumber(row[1])
+        if v and v > 0 then return v end
+        return nil
+    end)
+end
+
 local function chapter_page_count(s)
     local doc = s and s.ui and s.ui.document
     if type(doc) == "table" and type(doc.getPageCount) == "function" then
@@ -290,7 +392,9 @@ function M.sync(ui, settings)
 
     -- 计算并把身份/页数应用到一个 statistics 实例上（initData 与 insertDB 共用）
     local function apply(s, idn)
-        if not idn or not idn.chapter_index or not idn.total_chapters then return nil end
+        -- 页数只依赖"全书章数"：章数可得就能恢复全书页数，
+        -- 不再要求 chapter_index（它只用于页号 remap）。
+        if not idn or not idn.total_chapters then return nil end
         local v = M.estimate_total_pages(s.id_curr_book, idn.total_chapters, chapter_page_count(s))
         if not v then return nil end
         if type(s.data) == "table" then s.data.pages = v end
@@ -330,6 +434,16 @@ function M.sync(ui, settings)
             local f = s.ui and s.ui.document and (s.ui.document.file or s.ui.document.path)
             local idn = M.resolve(f, settings)
             if not idn or not idn.chapter_index then
+                -- 拿不到章序号时不能直接交给原生逻辑：它会把 book.pages 覆盖成
+                -- "本章页数"，与历史 total_pages 不一致，page_stat 视图会按
+                -- pages/total_pages 缩放页号，已读页数被压成一章的量。
+                -- 这里保留库里已有的全书页数。
+                local keep = M.current_book_pages(s.id_curr_book)
+                if keep then
+                    if type(s.data) == "table" then s.data.pages = keep end
+                    align_total_pages(s.id_curr_book, keep)
+                    return orig_insertDB(s, keep)
+                end
                 return orig_insertDB(s, updated_pagecount)
             end
 
