@@ -97,9 +97,33 @@ function FaceFactory:findEmojiFont()
         local fp = dir .. "NotoEmoji-Regular.ttf"
         if ok_lfs and lfs.attributes(fp, "mode") == "file" then
             self.emoji_path = fp
+            logger.info("thought popup emoji font:", fp)
             return self.emoji_path
         end
     end
+
+    -- 最后兜底：借用同机已装的微信读书插件自带的同一份字体（同款 NotoEmoji，
+    -- OFL 许可）。只读不写，装了就用、没装就跳过，不构成功能依赖。
+    local borrowed = {
+        "plugins/weread.koplugin/fonts/NotoEmoji-Regular.ttf",
+    }
+    if ok_ds and DataStorage and DataStorage.getDataDir then
+        local ok_dir2, dd = pcall(DataStorage.getDataDir, DataStorage)
+        if ok_dir2 and dd then
+            borrowed[#borrowed + 1] = dd .. "/plugins/weread.koplugin/fonts/NotoEmoji-Regular.ttf"
+        end
+    end
+    for _, path in ipairs(borrowed) do
+        local abs = resolve(path)
+        if abs then
+            self.emoji_path = abs
+            logger.info("thought popup emoji font (borrowed):", abs)
+            return self.emoji_path
+        end
+    end
+
+    -- 拿不到就明确记一条：此时 emoji 会显示成空白/豆腐块，正文不受影响。
+    logger.warn("thought popup emoji font not found; emoji will not render")
     return nil
 end
 
@@ -164,6 +188,11 @@ function FaceFactory:_buildFace(path, size)
         logger.warn("thought popup failed to open font:", path, ftsize)
         return nil
     end
+    -- 仿粗体的加粗强度（上游 Font:getAdjustedFace 同款）；老版本 FreeType
+    -- 包装没有这个方法，取不到就留空（xtext 会退回普通仿粗）。
+    local ok_emb, half = pcall(function()
+        return ftsize:getEmboldenHalfStrength(3 / 8)
+    end)
     local face_obj = {
         orig_font = path,
         realname = path,
@@ -172,6 +201,7 @@ function FaceFactory:_buildFace(path, size)
         ftsize = ftsize,
         hash = path .. "|" .. size,
         is_real_bold = false,
+        embolden_half_strength = (ok_emb and half) or nil,
         hb_features = { "+kern", "+liga" },
     }
     face_obj.fallbacks = {}
