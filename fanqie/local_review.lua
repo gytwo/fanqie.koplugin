@@ -54,9 +54,17 @@ local function save_bindings(plugin, bindings)
     for file, b in pairs(bindings or {}) do
         if type(b) == "table" then
             parts[#parts + 1] = string.format(
-                "  [%q] = { book_id=%q, title=%q, author=%q, _search_source=%q, book_url=%q, source=%q },",
+                "  [%q] = { book_id=%q, title=%q, author=%q, _search_source=%q, book_url=%q, source=%q,",
                 file, b.book_id or "", b.title or "", b.author or "",
                 b._search_source or "", b.book_url or "", b.source or "")
+            if type(b.chapter_map) == "table" and next(b.chapter_map) then
+                parts[#parts + 1] = "    chapter_map = {"
+                for k, v in pairs(b.chapter_map) do
+                    parts[#parts + 1] = string.format("      [%q] = %q,", tostring(k), tostring(v))
+                end
+                parts[#parts + 1] = "    },"
+            end
+            parts[#parts + 1] = "  },"
         end
     end
     parts[#parts + 1] = "}"
@@ -388,7 +396,7 @@ function LocalReview.auto_match(plugin, on_done)
                 UIManager:close(plugin.book_list_menu)
                 plugin.book_list_menu = nil
             end
-            if _state then _state.active_menu = nil end
+            _state.active_menu = nil
 
             set_binding(plugin, file, book)
             plugin._local_review_book = book
@@ -448,9 +456,36 @@ local function show_chapter_picker(plugin, book, local_title, on_pick)
     end, { poll_interval = 0.2, timeout = 60 })
 end
 
+-- 写入手动章节映射（和 set_binding 同模式：改内存 → 写盘）
+local function set_chapter_map(plugin, book, toc_idx, item_id)
+    if not book or not toc_idx or not item_id then return end
+    book.chapter_map = book.chapter_map or {}
+    book.chapter_map[tostring(toc_idx)] = tostring(item_id)
+
+    local doc = plugin.ui and plugin.ui.document
+    local file = doc and (doc.file or doc.path)
+    if not file then return end
+    plugin._local_review_bindings = plugin._local_review_bindings or load_bindings(plugin)
+    local b = plugin._local_review_bindings[file]
+    if b then
+        b.chapter_map = book.chapter_map
+        save_bindings(plugin, plugin._local_review_bindings)
+    end
+end
+
 function LocalReview.locate_chapter_by_title(plugin, book, chapter_title, chapter_start_page, on_done, opts)
     opts = opts or {}
     local notify_on_fail = opts.notify_on_fail == true
+    local toc_idx = opts.toc_idx
+
+    -- 优先查手动映射（和 binding 一样，命中直接用）
+    if toc_idx and book and type(book.chapter_map) == "table" then
+        local mapped = book.chapter_map[tostring(toc_idx)]
+        if mapped and mapped ~= "" then
+            if on_done then on_done(mapped, chapter_start_page) end
+            return
+        end
+    end
 
     local want = normalize_title(chapter_title)
     if want == "" then
@@ -488,6 +523,10 @@ function LocalReview.locate_chapter_by_title(plugin, book, chapter_title, chapte
             if notify_on_fail then
                 UIManager:nextTick(function()
                     show_chapter_picker(plugin, book, chapter_title, function(item_id)
+                        -- 把用户的选择写盘（下次直接用）
+                        if item_id and toc_idx then
+                            set_chapter_map(plugin, book, toc_idx, item_id)
+                        end
                         if on_done then on_done(item_id, chapter_start_page) end
                     end)
                 end)
@@ -518,7 +557,7 @@ function LocalReview.locate_current_chapter(plugin, book, on_done)
         function(item_id)
             if on_done then on_done(item_id, chapter_start_page, toc_idx) end
         end,
-        { notify_on_fail = true })
+        { notify_on_fail = true, toc_idx = toc_idx })
 end
 
 -- ============================================================================
@@ -741,7 +780,8 @@ function LocalReview._prefetch_next(plugin, planned, i)
                         LocalReview._prefetch_next(plugin, planned, i + 1)
                     end)
                 end)
-        end)
+        end,
+        { toc_idx = plan.toc_idx })
 end
 
 function LocalReview.trigger_prefetch(plugin, current_toc_idx)
@@ -921,7 +961,8 @@ function LocalReview.on_page_update(plugin)
             if not item_id then return end
             LocalReview.dump_current_chapter(plugin, plugin._local_review_book,
                 item_id, chapter_start_page, chapter_key, toc_idx)
-        end)
+        end,
+        { toc_idx = toc_idx })   -- 静默匹配，但手动映射优先
 end
 
 function LocalReview.on_pos_update(plugin, pos, pageno)
