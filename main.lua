@@ -3404,7 +3404,16 @@ function FanQiePlugin:onFanQieSearchBooks()
     return true
 end
 
-function FanQiePlugin:onFanQieFetchLocalReview()
+function FanQiePlugin:onFanQieFetchLocalReview(retry)
+    if not retry then
+        local NetworkMgr = require("ui/network/manager")
+        if NetworkMgr:willRerunWhenOnline(function()
+            self:onFanQieFetchLocalReview(true)
+        end) then
+            return true
+        end
+    end
+
     local LocalReview = require("fanqie.local_review")
     if not LocalReview then
         self:showInfo(_("本地段评模块加载失败"))
