@@ -8,6 +8,7 @@ local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local TextWidget = require("ui/widget/textwidget")
+local Notification = require("ui/widget/notification")
 
 local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(t) return t end
@@ -352,7 +353,6 @@ function LocalReview.auto_match(plugin, on_done)
     local file = doc.file or doc.path
 
     do
-        local Notification = require("ui/widget/notification")
         UIManager:show(Notification:new{
             text = _("正在匹配段评..."),
             timeout = 2,
@@ -712,7 +712,6 @@ function LocalReview.dump_current_chapter(plugin, book, item_id, chapter_start_p
                     UIManager:setDirty(plugin.ui, "partial")
                 end
             end
-            local Notification = require("ui/widget/notification")
             UIManager:show(Notification:new{
                 text = string.format("段评 %d 条", records and #records or 0),
                 timeout = 2,
@@ -779,7 +778,7 @@ function LocalReview.on_reader_ready(plugin)
         end,
     }})
 
-    if plugin.settings:get("auto_prefetch_review", false) then
+     if plugin.settings:get("auto_prefetch_review", false) then
         UIManager:scheduleIn(0.5, function()
             if not (plugin.ui and plugin.ui.document) then return end
             local doc = plugin.ui.document
@@ -789,15 +788,25 @@ function LocalReview.on_reader_ready(plugin)
             if not binding or not binding.book_id or binding.book_id == "" then
                 return
             end
-            plugin._local_review_book = binding
 
-            local Notification = require("ui/widget/notification")
-            UIManager:show(Notification:new{
-                text = _("正在预取段评..."),
-                timeout = 2,
-            })
+            -- 无网络时：先告知用户需要联网，再弹 WiFi 框；联网后自动重试
+            local NetworkMgr = require("ui/network/manager")
+            if NetworkMgr and NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+                UIManager:show(Notification:new{
+                    text = _("番茄-拉取段评需要联网"),
+                    timeout = 2,
+                })
+                if NetworkMgr.willRerunWhenOnline then
+                    if NetworkMgr:willRerunWhenOnline(function()
+                        LocalReview.run(plugin)
+                    end) then
+                        return
+                    end
+                end
+                return
+            end
 
-            LocalReview.on_page_update(plugin)
+            LocalReview.run(plugin)
         end)
     end
 end
