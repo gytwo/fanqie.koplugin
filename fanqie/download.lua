@@ -18,6 +18,7 @@ local ok_state, _state = pcall(require, "fanqie.state")
 local ok_DLProgress, DownloadProgress = pcall(require, "fanqie.download_progress")
 local ok_Log, Log = pcall(require, "fanqie.logger")
 local ok_Async, Async = pcall(require, "fanqie.async")
+local ok_ConfirmBox, ConfirmBox = pcall(require, "ui/widget/confirmbox")
 
 local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(text) return text end
@@ -93,7 +94,8 @@ end
 
 -- 执行下载（异步递归实现，UI 线程仅做进度刷新与调度，不阻塞）
 -- 每一章的 HTTP 请求通过 Async.run 放到子进程，父进程拿到结果后递归调度下一章。
-function Download.execute(parent, book, chapters, start_idx, end_idx)
+function Download.execute(parent, book, chapters, start_idx, end_idx, opts)
+    opts = opts or {}
     local settings = parent.settings
     local client = parent.client
     local total = end_idx - start_idx + 1
@@ -119,7 +121,7 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
     end
 
     local dialog = DownloadProgress:new{
-        title = T(_("下载 %s"), book.title or book.book_id),
+        title = T(_("下载 %1"), book.title or book.book_id),
     }
     -- 设置后台运行回调（对话框关闭但下载继续）
     -- 关键：关闭后必须确保有 widget 显示，否则 UIManager 会退出，内存状态丢失
@@ -159,6 +161,7 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
         end_idx = end_idx,
         total = total,
         review_enabled = false,
+        build_epub = opts.build_epub == true,
     }
 
     -- 预先计算段评开关（只读，跨子进程保持一致）
@@ -217,6 +220,53 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
             _state.clearDownloadTask()
         end
 
+        -- ★ 下载完成后自动合并 EPUB
+        if not cancelled and state.build_epub then
+            self_ref:showBusy(_("正在生成 EPUB..."))
+            UIManager:scheduleIn(0.2, function()
+                local EpubBuilder = require("fanqie.epub_builder")
+                local ok_b, path, count, missing = pcall(function()
+                    return EpubBuilder.build(settings, book, state.chapters, {
+                        require_all = false,
+                    })
+                end)
+                self_ref:closeBusy()
+                if not ok_b or not path then
+                    self_ref:showError(T(_("生成 EPUB 失败：\n%1"), tostring(path)))
+                    return
+                end
+                pcall(function()
+                    local ReadCollection = require("readcollection")
+                    if not ReadCollection.coll then ReadCollection:_read() end
+                    if not ReadCollection.coll["fanqie"] then
+                        ReadCollection:addCollection("fanqie")
+                    end
+                    if not ReadCollection:isFileInCollection(path, "fanqie") then
+                        ReadCollection:addItem(path, "fanqie")
+                        ReadCollection:write({ fanqie = true })
+                    end
+                end)
+                local text = T(_("已下载 %1 章并生成 EPUB：\n%2"), count, path)
+                if missing and missing > 0 then
+                    text = text .. T(_("\n（跳过未下载 %1 章）"), missing)
+                end
+                if ConfirmBox then
+                    UIManager:show(ConfirmBox:new{
+                        text = text .. _("\n\n现在打开？"),
+                        ok_text = _("打开"),
+                        cancel_text = _("关闭"),
+                        ok_callback = function()
+                            local ReaderUI = require("apps/reader/readerui")
+                            ReaderUI:showReader(path)
+                        end,
+                    })
+                else
+                    self_ref:showInfo(text)
+                end
+            end)
+            return
+        end
+        
         if cancelled and state.downloaded < state.total then
             self_ref:showInfo(T(_("已取消下载\n已保存 %1/%2 章"), state.downloaded, state.total))
         else
@@ -513,6 +563,17 @@ function Download.showOptionsDialog(parent, book, chapters, opts)
         buttons = buttons,
     }
     UIManager:show(dialog)
+end
+
+-- 一键：下载全部章节 + 生成 EPUB + 打开
+function Download.downloadAllAndBuild(parent, book, chapters)
+    if not chapters or #chapters == 0 then
+        parent:showInfo(_("没有章节目录"))
+        return
+    end
+    Download.execute(parent, book, chapters, 1, #chapters, {
+        build_epub = true,
+    })
 end
 
 return Download
