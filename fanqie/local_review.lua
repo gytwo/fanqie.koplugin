@@ -560,6 +560,47 @@ function LocalReview.locate_current_chapter(plugin, book, on_done)
         { notify_on_fail = true, toc_idx = toc_idx })
 end
 
+function LocalReview.rematch_current_chapter(plugin)
+    local doc = plugin.ui and plugin.ui.document
+    if not doc then
+        plugin:showInfo(_("没有打开文档"))
+        return
+    end
+    local toc = doc:getToc()
+    if type(toc) ~= "table" or #toc == 0 then
+        plugin:showInfo(_("无法获取目录"))
+        return
+    end
+
+    local file = doc.file or doc.path
+    local book = plugin._local_review_book or get_binding(plugin, file)
+    if not book or not book.book_id or book.book_id == "" then
+        plugin:showInfo(_("请先匹配段评来源"))
+        return
+    end
+    plugin._local_review_book = book
+
+    local toc_idx = current_toc_index(doc, toc)
+    local chapter_title = toc[toc_idx] and toc[toc_idx].title or ""
+    local chapter_start_page = tonumber(toc[toc_idx] and toc[toc_idx].page) or 1
+
+    local chapter_key = "local:" .. tostring(toc_idx) .. ":" .. tostring(chapter_start_page)
+    if plugin._local_review_cache then
+        plugin._local_review_cache[chapter_key] = nil
+    end
+    if book.chapter_map then
+        book.chapter_map[tostring(toc_idx)] = nil
+    end
+    plugin._local_review_current_key = nil
+
+    show_chapter_picker(plugin, book, chapter_title, function(item_id)
+        if not item_id then return end
+        set_chapter_map(plugin, book, toc_idx, item_id)
+        plugin._local_review_current_key = chapter_key
+        LocalReview.dump_current_chapter(plugin, book, item_id, chapter_start_page, chapter_key, toc_idx)
+    end)
+end
+
 -- ============================================================================
 -- 3. 拉段评 + 定位
 -- ============================================================================
