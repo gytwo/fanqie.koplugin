@@ -973,6 +973,12 @@ function FanQiePlugin:getMainMenuItems()
             end),
         },
         {
+            text = _("本地书籍-手动匹配当前章节"),
+            callback = self:safeCallback(_("手动匹配当前章节"), function()
+                require("fanqie.local_review").rematch_current_chapter(self)
+            end),
+        },
+        {
             text = _("本地书籍-打开时预取段评"),
             checked_func = function()
                 return self.settings:get("auto_prefetch_review", false) == true
