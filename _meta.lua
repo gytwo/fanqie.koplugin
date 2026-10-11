@@ -9,7 +9,6 @@ local description = (ok_info and info and info.description)
     or _("在 KOReader 中阅读番茄小说，支持扫码登录、多书源、段评、两层智能缓存、进度同步，适配墨水屏黑白显示。")
 
 return {
-    name = "fanqie",
     fullname = _("番茄小说"),
     description = description,
     version = version,

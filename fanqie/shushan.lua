@@ -45,6 +45,10 @@ local function log_debug(...)
     local lg = get_logger()
     if lg then lg.debug(...) end
 end
+local function log_info(...)
+    local lg = get_logger()
+    if lg then lg.info(...) end
+end
 
 -- 毫秒级墙钟计时（节点测速用）。
 -- socket.gettime() 是"真实流逝时间"，网络等待计入在内；os.clock() 只是 CPU
@@ -912,7 +916,7 @@ function ShuShan.select_fastest(client, settings, opts)
     end
 
     ShuShan.mark_node_ok(best, settings)
-    warn(string.format("[FanQie] 书山测速完成：选中 %s（%dms），共测 %d 个节点",
+    log_info(string.format("[FanQie] 书山测速完成：选中 %s（%dms），共测 %d 个节点",
         tostring(best), best_ms, #results))
     return best, results
 end

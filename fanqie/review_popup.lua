@@ -47,8 +47,8 @@ function M.show(opts)
     opts = opts or {}
     do
         local ok_log, FLog = pcall(require, "fanqie.logger")
-        if ok_log and FLog and FLog.warn then
-            FLog.warn("[段评] show入口: more_text=" .. tostring(opts.more_text)
+        if ok_log and FLog and FLog.debug then
+            FLog.debug("[段评] show入口: more_text=" .. tostring(opts.more_text)
                 .. " on_more=" .. tostring(opts.on_more ~= nil)
                 .. " position=" .. tostring(opts.position)
                 .. " pooled=" .. tostring(_pool[normalizePosition(opts.position)] ~= nil))

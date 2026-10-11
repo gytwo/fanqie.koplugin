@@ -796,9 +796,9 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             end
             -- 还有余量就一定有按钮；总数已知 →「还剩 N 条」，
             -- 总数未知（气泡 count 缺失）→「继续加载更多评论」
-            -- WARN 级落盘：不开 developer_logs 也能诊断按钮为何不出现
+            -- DEBUG 级：需开启 developer_logs 才落盘，避免每次开弹窗刷日志
             if Log then
-                Log.warn("[段评] 按钮判定: has_more=" .. tostring(st.has_more)
+                Log.debug("[段评] 按钮判定: has_more=" .. tostring(st.has_more)
                     .. " total=" .. tostring(st.total)
                     .. " loaded=" .. tostring(#st.rich_items)
                     .. " cursor=" .. tostring(st.cursor)

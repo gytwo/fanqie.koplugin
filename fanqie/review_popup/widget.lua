@@ -187,11 +187,11 @@ function ThoughtPopupWidget:_buildLayout()
         local btn_h = (ok_size and btn_size and btn_size.h) or Screen:scaleBySize(36)
         chrome = chrome + btn_h + Screen:scaleBySize(14)
     end
-    -- 渲染层诊断：无条件打（不管按钮建没建），用插件自己的 logger（写 fanqie.log）
+    -- 渲染层诊断：仅 DEBUG 级（需开启 developer_logs）
     do
         local ok_log, FLog = pcall(require, "fanqie.logger")
-        if ok_log and FLog and FLog.warn then
-            FLog.warn("[段评] 布局: has_btn=" .. tostring(more_btn ~= nil)
+        if ok_log and FLog and FLog.debug then
+            FLog.debug("[段评] 布局: has_btn=" .. tostring(more_btn ~= nil)
                 .. " more_text=" .. tostring(self.more_text)
                 .. " on_more=" .. tostring(self.on_more ~= nil)
                 .. " ratio_h=" .. tostring(ratio_h)

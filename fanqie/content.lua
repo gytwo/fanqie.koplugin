@@ -860,7 +860,7 @@ function Content.clean_chapter_content(raw_content, title)
             img_after = img_after + 1
         end
         local found_total = img_stats.before + img_stats.inner + img_stats.tail + img_stats.fallback
-        logger.warn(LOG_MODULE, "[图片] clean_chapter_content: input=" .. img_before_clean
+        logger.debug(LOG_MODULE, "[图片] clean_chapter_content: input=" .. img_before_clean
             .. " output=" .. img_after
             .. " found{before=" .. img_stats.before
             .. " inner=" .. img_stats.inner
