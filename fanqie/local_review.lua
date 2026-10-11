@@ -12,6 +12,8 @@ local Notification = require("ui/widget/notification")
 
 local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(t) return t end
+local ok_state, _state = pcall(require("fanqie.state"))
+if not ok_state then _state = {} end
 
 local Screen = Device.screen
 
@@ -401,7 +403,55 @@ end
 -- ============================================================================
 -- 2. 指定章标题 → 番茄 itemId
 -- ============================================================================
-function LocalReview.locate_chapter_by_title(plugin, book, chapter_title, chapter_start_page, on_done)
+local function show_chapter_picker(plugin, book, local_title, on_pick)
+    local Async = require("fanqie.async")
+    Async.run(function()
+        local client = plugin.client
+        local raw = client:fetch_chapter_directory(book.book_id)
+        local Content = require("fanqie.content")
+        return Content.readable_chapters(Content.normalize_chapters(raw, book.book_id))
+    end, function(ok, chapters, err)
+        if not ok or type(chapters) ~= "table" or #chapters == 0 then
+            plugin:showInfo(_("无法获取番茄章节目录"))
+            if on_pick then on_pick(nil) end
+            return
+        end
+        local Menu = require("ui/widget/menu")
+        local menu
+        local items = {}
+        for i, ch in ipairs(chapters) do
+            table.insert(items, {
+                text = string.format("%d. %s", i, ch.title or ""),
+                callback = function()
+                    menu._picked = true
+                    if _state.active_menu then
+                        UIManager:close(_state.active_menu)
+                        _state.active_menu = nil
+                    end
+                    if on_pick then on_pick(tostring(ch.itemId)) end
+                end,
+            })
+        end
+        menu = Menu:new{
+            title = string.format(_("没有匹配到对应章节，请选择「%s」对应的番茄章节"), tostring(local_title)),
+            item_table = items,
+            items_per_page = 15,
+            is_borderless = true,
+            is_popout = false,
+            close_callback = function()
+                if _state.active_menu == menu then _state.active_menu = nil end
+                if on_pick and not menu._picked then on_pick(nil) end
+            end,
+        }
+        _state.active_menu = menu
+        UIManager:show(menu)
+    end, { poll_interval = 0.2, timeout = 60 })
+end
+
+function LocalReview.locate_chapter_by_title(plugin, book, chapter_title, chapter_start_page, on_done, opts)
+    opts = opts or {}
+    local notify_on_fail = opts.notify_on_fail == true
+
     local want = normalize_title(chapter_title)
     if want == "" then
         if on_done then on_done(nil) end
@@ -433,7 +483,17 @@ function LocalReview.locate_chapter_by_title(plugin, book, chapter_title, chapte
     end, function(ok, result, err)
         if not ok or type(result) ~= "table" or not result.item_id then
             log_warn("匹配章节失败: " .. tostring(err or result))
-            if on_done then on_done(nil) end
+
+            -- 用户主动触发 → 弹手动选择器；翻页/预取 → 静默
+            if notify_on_fail then
+                UIManager:nextTick(function()
+                    show_chapter_picker(plugin, book, chapter_title, function(item_id)
+                        if on_done then on_done(item_id, chapter_start_page) end
+                    end)
+                end)
+            else
+                if on_done then on_done(nil) end
+            end
             return
         end
         if on_done then on_done(result.item_id, chapter_start_page) end
@@ -457,7 +517,8 @@ function LocalReview.locate_current_chapter(plugin, book, on_done)
     LocalReview.locate_chapter_by_title(plugin, book, chapter_title, chapter_start_page,
         function(item_id)
             if on_done then on_done(item_id, chapter_start_page, toc_idx) end
-        end)
+        end,
+        { notify_on_fail = true })
 end
 
 -- ============================================================================
