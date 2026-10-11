@@ -2243,7 +2243,16 @@ function FanQiePlugin:showBookDetail(book)
                 -- 避免 UIManager 无 widget 导致 KOReader 退出
                 self:_startBookDownload(book)
             end,
+          },
         },
+        {
+            {
+                text = _("下载全本并生成 EPUB"),
+                callback = function()
+                    UIManager:close(_state.detail_dialog)
+                    self:_downloadAllAndBuild(book)
+                end,
+            },
         },
         {
             {
@@ -2292,6 +2301,41 @@ function FanQiePlugin:showBookDetail(book)
         buttons = buttons,
     }
     UIManager:show(_state.detail_dialog)
+end
+
+function FanQiePlugin:_downloadAllAndBuild(book)
+    if not book then
+        self:showInfo(_("没有书籍信息"))
+        return
+    end
+    local self_ref = self
+    local book_id = book.book_id or book.bookId
+    local settings = self.settings
+    local Async = require("fanqie.async")
+
+    local function start(chapters)
+        -- 写目录缓存，顺带把封面下到 book_dir/cover.jpg
+        Content.save_catalog_cache(settings, book_id, chapters, book.title, book.cover)
+        require("fanqie.download").downloadAllAndBuild(self_ref, book, chapters)
+    end
+
+    local chapters = Content.load_catalog_cache(settings, book_id)
+    if chapters and #chapters > 0 then
+        start(chapters)
+        return
+    end
+
+    self:showBusy(_("正在获取目录..."))
+    Async.run(function()
+        return self_ref:get_chapters(book_id)
+    end, function(ok, result, err)
+        self_ref:closeBusy()
+        if ok and type(result) == "table" and #result > 0 then
+            start(result)
+        else
+            self_ref:showError(T(_("获取目录失败：\n%1"), tostring(err or result)))
+        end
+    end, { poll_interval = 0.3, timeout = 60 })
 end
 
 -- 异步获取目录后打开下载对话框
