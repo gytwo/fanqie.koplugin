@@ -137,23 +137,15 @@ function EpubBuilder.build(settings, book, chapters, opts)
         if path then
             local html = read_file(path)
             local body = clean_chapter_body(html)
-            if body ~= "" then
-                local images = collect_image_hrefs(body)
-                body = rewrite_image_hrefs(body)
-                selected[#selected + 1] = { chapter = ch, body = body, images = images }
-                real_count = real_count + 1
-            else
-                selected[#selected + 1] = {
-                    chapter = ch,
-                    body = '<p>[内容下载失败]</p>',
-                    images = {},
-                }
-                missing = missing + 1
-            end
+            local images = collect_image_hrefs(body)
+            body = rewrite_image_hrefs(body)
+            selected[#selected + 1] = { chapter = ch, body = body, images = images }
+            real_count = real_count + 1
         else
             selected[#selected + 1] = {
                 chapter = ch,
-                body = '<p>[内容下载失败]</p>',
+                body = string.format('<h1>%s</h1>\n<p>[内容下载失败]</p>',
+                    xml_escape(ch.title or "")),
                 images = {},
             }
             missing = missing + 1
