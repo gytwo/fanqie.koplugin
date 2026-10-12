@@ -307,6 +307,14 @@ function FanQiePlugin:onReaderReady(config)
     end
     if res then
         Log.info("[FanQie] 阅读统计按书合并:", tostring(res.title), "/", tostring(res.book_id))
+        -- 作者兜底：书架接口不返回作者，唯一来源是书籍详情页。
+        -- 只在当前仍是 N/A 时触发一次异步抓取（有缓存则直接回填统计库）。
+        if res.authors == "N/A" and res.book_id then
+            local ok_bm, BookMeta = pcall(require, "fanqie.book_meta")
+            if ok_bm and type(BookMeta) == "table" and BookMeta.ensure then
+                pcall(BookMeta.ensure, self.settings, res.book_id)
+            end
+        end
     end
 end
 

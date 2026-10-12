@@ -206,10 +206,24 @@ function M.resolve(file_path, settings)
         return nil
     end
 
+    -- 作者兜底：书架/目录接口都不带作者，唯一可靠来源是书籍详情页
+    -- （fanqie/book_meta.lua 抓取并缓存）。有缓存就直接用，没有先留 N/A，
+    -- 由 main.lua 在文档就绪后异步抓取并回填统计库。
+    local author = book.author
+    if not author or author == "" then
+        local ok_bm, BookMeta = pcall(require, "fanqie.book_meta")
+        if ok_bm and type(BookMeta) == "table" and BookMeta.get_author then
+            local ok_a, cached = pcall(BookMeta.get_author, settings, book_id)
+            if ok_a and is_str(cached) and cached ~= "" then
+                author = cached
+            end
+        end
+    end
+
     local identity = {
         book_id = book_id,
         title = book.title,
-        authors = (book.author and book.author ~= "") and book.author or "N/A",
+        authors = (author and author ~= "") and author or "N/A",
         md5 = "fanqie-" .. book_id,
     }
 
