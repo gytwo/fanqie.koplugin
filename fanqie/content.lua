@@ -1001,6 +1001,7 @@ function Content.normalize_chapters(payload, book_id)
     if type(records) ~= "table" then
         return {}
     end
+
     -- Official API returns chapterListWithVolume as a 2D array:
     -- [[chapter1, chapter2, ...], [chapter101, ...]]
     -- Each volume is directly an array of chapters, not an object with chapterList property
@@ -1364,9 +1365,37 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     -- 不匹配（序章/后记/无"第X章"格式）则原样返回，不影响其他标题
     local function split_title_for_display(raw_title)
         local t = tostring(raw_title or "")
-        local num, rest = t:match("^(第[一二三四五六七八九十百千零〇%d]+[章卷节回部篇])%s*(.+)$")
-        if num and rest and rest ~= "" then
-            return '<span class="chap-num">' .. xml_escape(num) .. "</span><br/>" .. xml_escape(rest)
+        local chars = require("util").splitToChars(t)
+
+        local num_chars = {
+            ["一"]=true, ["二"]=true, ["三"]=true, ["四"]=true, ["五"]=true,
+            ["六"]=true, ["七"]=true, ["八"]=true, ["九"]=true, ["十"]=true,
+            ["百"]=true, ["千"]=true, ["零"]=true, ["〇"]=true, ["两"]=true,
+        }
+        local ending_chars = {
+            ["章"]=true, ["卷"]=true, ["节"]=true, ["回"]=true,
+            ["部"]=true, ["篇"]=true,
+        }
+
+        if chars[1] == "第" then
+            local i = 2
+            while i <= #chars do
+                local c = chars[i]
+                if num_chars[c] or c:match("^%d$") then
+                    i = i + 1
+                else
+                    break
+                end
+            end
+            if i >= 3 and ending_chars[chars[i]] then
+                local num = table.concat(chars, "", 1, i)
+                local rest = table.concat(chars, "", i + 1)
+                rest = rest:gsub("^%s+", "")
+                if rest ~= "" then
+                    return '<span class="chap-num">' .. xml_escape(num)
+                        .. "</span><br/>" .. xml_escape(rest)
+                end
+            end
         end
         return xml_escape(t)
     end
