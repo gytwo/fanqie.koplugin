@@ -175,13 +175,19 @@ function Download.execute(parent, book, chapters, start_idx, end_idx, opts)
     end
 
     local function updateProgress(stage, chapter_title)
+        if dialog._backgrounded then
+            -- 后台运行：不刷进度对话框，只更新全局状态供下载管理读取
+            if ok_state and _state then
+                _state.updateDownloadProgress(state.downloaded, state.total, chapter_title or "")
+            end
+            return
+        end
         dialog:setState{
             stage = stage,
             current = state.downloaded,
             total = state.total,
             chapter = chapter_title,
         }
-        -- 更新全局状态
         if ok_state and _state then
             _state.updateDownloadProgress(state.downloaded, state.total, chapter_title or "")
         end
