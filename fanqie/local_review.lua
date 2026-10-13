@@ -275,16 +275,14 @@ local function on_record_tap(plugin, record)
         plugin:showInfo(_("段评数据无效"))
         return
     end
-    local idx = tonumber(record.para_index)
-    if not idx then
-        local ok_state, _state = pcall(require, "fanqie.state")
-        if ok_state and _state and _state.getCurrentParaReviews then
-            local reviews = _state.getCurrentParaReviews() or {}
-            for i, pr in ipairs(reviews) do
-                if tostring(pr.ident) == tostring(record.ident) then
-                    idx = i
-                    break
-                end
+    local ok_state, _state = pcall(require, "fanqie.state")
+    local idx
+    if ok_state and _state and _state.getCurrentParaReviews then
+        local reviews = _state.getCurrentParaReviews() or {}
+        for i, pr in ipairs(reviews) do
+            if tostring(pr.ident) == tostring(record.ident) then
+                idx = i
+                break
             end
         end
     end
@@ -340,14 +338,6 @@ local function char_overlap(a, b)
     for c, n in pairs(ca) do common = common + math.min(n, cb[c] or 0) end
     local total = math.max(#aa, #bb)
     return total == 0 and 0 or common / total
-end
-
-local function merge_all_records(plugin)
-    local all = {}
-    for _, recs in pairs(plugin._local_review_cache or {}) do
-        for _, r in ipairs(recs) do all[#all + 1] = r end
-    end
-    return all
 end
 
 -- ============================================================================
@@ -584,27 +574,33 @@ function LocalReview.rematch_current_chapter(plugin)
     local chapter_title = toc[toc_idx] and toc[toc_idx].title or ""
     local chapter_start_page = tonumber(toc[toc_idx] and toc[toc_idx].page) or 1
 
-    local chapter_key = "local:" .. tostring(toc_idx) .. ":" .. tostring(chapter_start_page)
-    if plugin._local_review_cache then
-        plugin._local_review_cache[chapter_key] = nil
-    end
+    -- 清掉该 toc_idx 对应的云端缓存（按 item_id 清）
     if book.chapter_map then
+        local old_item_id = book.chapter_map[tostring(toc_idx)]
+        if old_item_id and old_item_id ~= "" then
+            if plugin._local_review_cache then
+                plugin._local_review_cache["cloud:" .. tostring(old_item_id)] = nil
+            end
+        end
         book.chapter_map[tostring(toc_idx)] = nil
     end
-    plugin._local_review_current_key = nil
+    plugin._local_review_current_local_key = nil
+    plugin._local_review_current_cloud_key = nil
 
     show_chapter_picker(plugin, book, chapter_title, function(item_id)
         if not item_id then return end
         set_chapter_map(plugin, book, toc_idx, item_id)
-        plugin._local_review_current_key = chapter_key
-        LocalReview.dump_current_chapter(plugin, book, item_id, chapter_start_page, chapter_key, toc_idx)
+        local cloud_key = "cloud:" .. tostring(item_id)
+        plugin._local_review_current_cloud_key = cloud_key
+        LocalReview.dump_current_chapter(plugin, book, item_id, chapter_start_page, cloud_key, toc_idx)
     end)
 end
 
 -- ============================================================================
 -- 3. 拉段评 + 定位
 -- ============================================================================
-function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_page, chapter_uid, on_done)
+function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_page, chapter_uid, on_done, opts)
+    opts = opts or {}
     local chapter = { itemId = item_id }
     local book_for_fetch = {
         book_id = book.book_id,
@@ -669,15 +665,14 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
         local records = {}
         local cursor_xp = chapter_start_xp
 
-        -- 预取判定：chapter_uid 不是当前章 key 时视为预取，不覆盖 _state
-        local is_prefetch = (chapter_uid ~= plugin._local_review_current_key)
+        -- 预取判定：优先用显式 opts.is_prefetch；否则用云端 key 比较
+        local is_prefetch = opts.is_prefetch == true
+            or (chapter_uid ~= plugin._local_review_current_cloud_key)
 
         local function finish()
             if saved_xp then pcall(doc.gotoXPointer, doc, saved_xp) end
 
-            -- 非预取时把 records 的 ident/count 写进 _state.current_para_reviews，
-            -- 让 main.lua 的 showParaReviewDetail(index) 能按 index 取到 ident。
-            -- 同时给每条 rec 标 para_index（1-based）。
+            -- 非预取时把 records 的 ident/count 写进 _state.current_para_reviews
             if not is_prefetch then
                 local ok_state, _state = pcall(require, "fanqie.state")
                 if ok_state and _state and _state.setCurrentParaReviews then
@@ -776,7 +771,10 @@ function LocalReview._plan_prefetch(plugin, toc, current_toc_idx)
         if idx > #toc then break end
         local item = toc[idx]
         local start_page = tonumber(item and item.page) or 1
-        local key = "local:" .. tostring(idx) .. ":" .. tostring(start_page)
+        local book = plugin._local_review_book
+        local mapped = book and book.chapter_map and book.chapter_map[tostring(idx)]
+        local key = mapped and ("cloud:" .. tostring(mapped))
+            or ("local:" .. tostring(idx) .. ":" .. tostring(start_page))
         if not cache[key] and not prefetching[key] then
             planned[#planned + 1] = {
                 key = key,
@@ -811,16 +809,31 @@ function LocalReview._prefetch_next(plugin, planned, i)
                 LocalReview._prefetch_next(plugin, planned, i + 1)
                 return
             end
+
+            -- 写入 chapter_map（预取结果也持久化，后续切章直接命中）
+            set_chapter_map(plugin, plugin._local_review_book, plan.toc_idx, item_id)
+
+            local cloud_key = "cloud:" .. tostring(item_id)
+
+            -- 云端缓存命中（同一云端章已被其它本地章拉过）：直接跳过，不重复拉取
+            if plugin._local_review_cache and plugin._local_review_cache[cloud_key] then
+                plugin._local_review_prefetching[plan.key] = nil
+                UIManager:scheduleIn(0.5, function()
+                    LocalReview._prefetch_next(plugin, planned, i + 1)
+                end)
+                return
+            end
+
             LocalReview.fetch_chapter_records(plugin, plugin._local_review_book,
-                item_id, plan.start_page, plan.key, function(records)
+                item_id, plan.start_page, cloud_key, function(records)
                     plugin._local_review_prefetching[plan.key] = nil
                     if records then
-                        plugin._local_review_cache[plan.key] = records
+                        plugin._local_review_cache[cloud_key] = records
                     end
                     UIManager:scheduleIn(0.5, function()
                         LocalReview._prefetch_next(plugin, planned, i + 1)
                     end)
-                end)
+                end, { is_prefetch = true })
         end,
         { toc_idx = plan.toc_idx })
 end
@@ -843,14 +856,14 @@ end
 -- ============================================================================
 -- 5. 拉当前章
 -- ============================================================================
-function LocalReview.dump_current_chapter(plugin, book, item_id, chapter_start_page, chapter_key, toc_idx)
+function LocalReview.dump_current_chapter(plugin, book, item_id, chapter_start_page, cloud_key, toc_idx)
     return LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_page,
-        chapter_key, function(records)
+        cloud_key, function(records)
             if records then
                 plugin._local_review_cache = plugin._local_review_cache or {}
-                plugin._local_review_cache[chapter_key] = records
+                plugin._local_review_cache[cloud_key] = records   -- 按云端 key 存
                 if plugin._local_review_overlay then
-                    plugin._local_review_overlay:setRecords(merge_all_records(plugin))
+                    plugin._local_review_overlay:setRecords(records)  -- 只传这一份，不 merge
                     UIManager:setDirty(plugin.ui, "partial")
                 end
             end
@@ -870,15 +883,17 @@ end
 function LocalReview.run(plugin)
     plugin._local_review_cache = {}
     plugin._local_review_prefetching = {}
-    plugin._local_review_current_key = nil
+    plugin._local_review_current_local_key = nil
+    plugin._local_review_current_cloud_key = nil
 
     LocalReview.auto_match(plugin, function(book)
         if not book then return end
         LocalReview.locate_current_chapter(plugin, book, function(item_id, chapter_start_page, toc_idx)
             if not item_id then return end
-            local chapter_key = "local:" .. tostring(toc_idx) .. ":" .. tostring(chapter_start_page)
-            plugin._local_review_current_key = chapter_key
-            LocalReview.dump_current_chapter(plugin, book, item_id, chapter_start_page, chapter_key, toc_idx)
+            set_chapter_map(plugin, book, toc_idx, item_id)
+            local cloud_key = "cloud:" .. tostring(item_id)
+            plugin._local_review_current_cloud_key = cloud_key
+            LocalReview.dump_current_chapter(plugin, book, item_id, chapter_start_page, cloud_key, toc_idx)
         end)
     end)
 end
@@ -898,6 +913,8 @@ function LocalReview.on_reader_ready(plugin)
     plugin._local_review_cache = plugin._local_review_cache or {}
     plugin._local_review_prefetching = plugin._local_review_prefetching or {}
     plugin._local_review_bindings = plugin._local_review_bindings or load_bindings(plugin)
+    plugin._local_review_current_local_key = nil   -- 本地章 key（判断是否切本地章）
+    plugin._local_review_current_cloud_key = nil   -- 云端 key（is_prefetch 判断 + cache 复用）
 
     local overlay = Overlay:new{
         records = {},
@@ -967,43 +984,74 @@ function LocalReview.on_page_update(plugin)
     local toc_idx = current_toc_index(doc, toc)
     local chapter_title = toc[toc_idx] and toc[toc_idx].title or ""
     local chapter_start_page = tonumber(toc[toc_idx] and toc[toc_idx].page) or 1
-    local chapter_key = "local:" .. tostring(toc_idx) .. ":" .. tostring(chapter_start_page)
+    local local_key = "local:" .. tostring(toc_idx) .. ":" .. tostring(chapter_start_page)
 
-    if plugin._local_review_current_key == chapter_key then
+    -- 判断是否切了本地章
+    if plugin._local_review_current_local_key == local_key then
         return
     end
-    plugin._local_review_current_key = chapter_key
+    plugin._local_review_current_local_key = local_key
 
-    if plugin._local_review_cache and plugin._local_review_cache[chapter_key] then
+    local book = plugin._local_review_book
+
+    -- 内部函数：用一份 records 更新 overlay 和 _state（overlay/state 始终同步）
+    local function apply_records(records, cloud_key)
+        plugin._local_review_current_cloud_key = cloud_key
         if plugin._local_review_overlay then
-            plugin._local_review_overlay:setRecords(merge_all_records(plugin))
+            plugin._local_review_overlay:setRecords(records or {})
             UIManager:setDirty(plugin.ui, "partial")
         end
-        -- 缓存命中时，把 records 的 ident/count 写进 _state（非预取）
         local ok_state, _state = pcall(require, "fanqie.state")
         if ok_state and _state and _state.setCurrentParaReviews then
-            local records = plugin._local_review_cache[chapter_key] or {}
             local reviews = {}
-            for i, rec in ipairs(records) do
+            for i, rec in ipairs(records or {}) do
                 rec.para_index = i
                 reviews[#reviews + 1] = {
                     ident = tostring(rec.ident or ""),
-                    count = tonumber(rec.count) or 0,
+                    count = tonumber(rec.count or 0),
                 }
             end
             _state.setCurrentParaReviews(reviews)
         end
-        LocalReview.trigger_prefetch(plugin, toc_idx)
+    end
+
+    -- 路径 A：chapter_map 已有该 toc_idx 的云端 item_id → 直接查云端缓存
+    local mapped_item_id = book and book.chapter_map and book.chapter_map[tostring(toc_idx)]
+    if mapped_item_id and mapped_item_id ~= "" then
+        local cloud_key = "cloud:" .. tostring(mapped_item_id)
+        local cached = plugin._local_review_cache and plugin._local_review_cache[cloud_key]
+        if cached then
+            apply_records(cached, cloud_key)
+            LocalReview.trigger_prefetch(plugin, toc_idx)
+            return
+        end
+        -- 云端缓存没有 → 拉取（用 mapped_item_id）
+        LocalReview.dump_current_chapter(plugin, book,
+            tostring(mapped_item_id), chapter_start_page, cloud_key, toc_idx)
         return
     end
 
-    LocalReview.locate_chapter_by_title(plugin, plugin._local_review_book,
+    -- 路径 B：chapter_map 没有 → 异步匹配云端 item_id
+    LocalReview.locate_chapter_by_title(plugin, book,
         chapter_title, chapter_start_page, function(item_id)
             if not item_id then return end
-            LocalReview.dump_current_chapter(plugin, plugin._local_review_book,
-                item_id, chapter_start_page, chapter_key, toc_idx)
+
+            -- 写入 chapter_map（自动匹配结果也持久化）
+            set_chapter_map(plugin, book, toc_idx, item_id)
+
+            local cloud_key = "cloud:" .. tostring(item_id)
+            local cached = plugin._local_review_cache and plugin._local_review_cache[cloud_key]
+            if cached then
+                -- 云端缓存命中（同一云端章的另一个本地章已拉过）
+                apply_records(cached, cloud_key)
+                LocalReview.trigger_prefetch(plugin, toc_idx)
+                return
+            end
+            -- 云端缓存没有 → 拉取
+            LocalReview.dump_current_chapter(plugin, book,
+                item_id, chapter_start_page, cloud_key, toc_idx)
         end,
-        { toc_idx = toc_idx })   -- 静默匹配，但手动映射优先
+        { toc_idx = toc_idx })
 end
 
 function LocalReview.on_pos_update(plugin, pos, pageno)
@@ -1020,7 +1068,8 @@ function LocalReview.on_close_document(plugin)
     plugin._local_review_overlay = nil
     plugin._local_review_cache = {}
     plugin._local_review_prefetching = {}
-    plugin._local_review_current_key = nil
+    plugin._local_review_current_local_key = nil
+    plugin._local_review_current_cloud_key = nil
 end
 
 return LocalReview
