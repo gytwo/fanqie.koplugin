@@ -2,13 +2,12 @@
 
 [![release](https://img.shields.io/github/v/release/seaneasysaid/fanqie.koplugin-fixed?label=release&labelColor=555555&color=007ec6)](https://github.com/seaneasysaid/fanqie.koplugin-fixed/releases/latest)
 [![downloads](https://img.shields.io/github/downloads/seaneasysaid/fanqie.koplugin-fixed/total?label=downloads&labelColor=555555&color=dfb317)](https://github.com/seaneasysaid/fanqie.koplugin-fixed/releases)
-[![changelog](https://img.shields.io/badge/%E6%9B%B4%E6%96%B0%E6%97%A5%E5%BF%97-CHANGELOG.md-2ea44f?labelColor=555555)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/%E6%9B%B4%E6%96%B0%E6%97%A5%E5%BF%97-CHANGELOG-2ea44f?labelColor=555555)](CHANGELOG.md)
 
 本项目是 [`hesan1232/fanqie.koplugin`](https://github.com/hesan1232/fanqie.koplugin) 的非官方增强版 Fork。
 
 > 本项目不是上游项目的官方版本。上游来源与代码差异在 Fork 关系与提交历史中公开保留。
 
-> 完整的版本变更记录见 **[CHANGELOG.md](CHANGELOG.md)**（按时间由新到旧排列）。
 
 ## 与原版的主要区别
 
