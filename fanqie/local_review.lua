@@ -723,9 +723,10 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
             -- 先画气泡
             if on_done then on_done(records) end
 
-            -- ★ 气泡画完后，后台落盘评论正文
+            -- 气泡画完后，后台落盘评论正文（按 opts.allow_download 决定是否下载）
             if result.list and #result.list > 0 then
-                LocalReview._background_cache_comments(plugin, book, item_id, result.list)
+                LocalReview._background_cache_comments(plugin, book, item_id, result.list,
+                    { download = opts.allow_download == true })
             end
         end
 
@@ -804,7 +805,11 @@ end
 -- 一次 Async.run（一次 fork）处理整章：子进程内循环拉该章所有 pid，
 -- 收集完一次性写盘。父进程不参与。
 -- 同一云端章只跑一个任务（防止重复启动）。
-function LocalReview._background_cache_comments(plugin, book, item_id, list)
+function LocalReview._background_cache_comments(plugin, book, item_id, list, opts)
+    opts = opts or {}
+    if opts.download ~= true then
+        return
+    end
     local ok_log, Log = pcall(require, "fanqie.logger")
     local function dbg(...)
         if ok_log and Log and Log.warn then Log.warn("[本地段评][后台落盘]", ...) end
@@ -1425,12 +1430,12 @@ function LocalReview.continue_chapter_review_cache(plugin, book, item_id)
 
     local reviews = Content.load_para_reviews_index(plugin.settings, book.book_id, item_id)
     if reviews and #reviews > 0 then
-        -- 有索引，只补评论正文
+        -- 有索引，只补评论正文（下载）
         plugin._comment_cache_running = plugin._comment_cache_running or {}
         plugin._comment_cache_running[tostring(book.book_id) .. ":" .. tostring(item_id)] = nil
-        LocalReview._background_cache_comments(plugin, book, item_id, reviews)
+        LocalReview._background_cache_comments(plugin, book, item_id, reviews, { download = true })
     else
-        -- 无索引，拉整个（索引 + findText + 落盘 + 评论正文）
+        -- 无索引，拉整个（下载）
         local cloud_key = "cloud:" .. tostring(item_id)
         LocalReview.fetch_chapter_records(plugin, book, item_id, 1, cloud_key, function(records)
             local Notification = require("ui/widget/notification")
@@ -1438,7 +1443,7 @@ function LocalReview.continue_chapter_review_cache(plugin, book, item_id)
                 text = string.format("段评 %d 条", records and #records or 0),
                 timeout = 2,
             })
-        end)
+        end, { allow_download = true })
     end
 end
 
