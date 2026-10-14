@@ -543,11 +543,10 @@ function FanQiePlugin:showParaReviewDetail(index)
     -- 先查本地磁盘缓存：命中直接渲染，不走网络
     if item_id and pid then
         local ok_content, Content = pcall(require, "fanqie.content")
-        if ok_content and Content and Content.load_para_comments then
-            local cached_map = Content.load_para_comments(self.settings, book_id, item_id)
-            local cached = cached_map and cached_map[tostring(pid)]
+        if ok_content and Content and Content.load_one_comment then
+            local cached = Content.load_one_comment(self.settings, book_id, item_id, pid)
             if cached then
-                if Log then Log.info("[段评] showParaReviewDetail: 本地缓存命中 item_id="
+                if Log then Log.info("[段评] showParaReviewDetail: 单条缓存命中 item_id="
                     .. tostring(item_id) .. " pid=" .. tostring(pid)
                     .. " book_id=" .. tostring(book_id)) end
                 self:_displayParaReviewDetail(review_index, total_reviews, true, cached, nil, bubble_count)
@@ -580,14 +579,7 @@ function FanQiePlugin:showParaReviewDetail(index)
             if not ok then error(result or "段评获取失败") end
             return result
         end, function(ok, result, err)
-            -- 拉取成功后单条落盘（用同一个 book_id）
-            if ok and result and item_id and pid then
-                local ok_content, Content = pcall(require, "fanqie.content")
-                if ok_content and Content and Content.save_para_comment then
-                    pcall(Content.save_para_comment,
-                        self_ref.settings, book_id, item_id, pid, result)
-                end
-            end
+            -- 点气泡不落盘
             self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, err, bubble_count)
         end, { poll_interval = 0.125, timeout = 60 })
     else
@@ -608,14 +600,7 @@ function FanQiePlugin:showParaReviewDetail(index)
         else
             ok, result = false, "无法识别段评来源: " .. ident_str:sub(1, 60)
         end
-        -- 同步路径也单条落盘
-        if ok and result and item_id and pid then
-            local ok_content, Content = pcall(require, "fanqie.content")
-            if ok_content and Content and Content.save_para_comment then
-                pcall(Content.save_para_comment,
-                    self_ref.settings, book_id, item_id, pid, result)
-            end
-        end
+        -- 点气泡不落盘
         self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, nil, bubble_count)
     end
 end
@@ -1242,13 +1227,22 @@ function FanQiePlugin:showReviewCacheManager()
         local review_count = entry.review_count or 0
         local comment_count = entry.comment_count or 0
         local text
-        if review_count == 0 then
+
+        -- 后台下载中？显示标记
+        local running_key = tostring(book.book_id) .. ":" .. tostring(entry.item_id)
+        local is_downloading = self._comment_cache_running
+            and self._comment_cache_running[running_key]
+
+        if is_downloading then
+            text = string.format("%s  [下载中… %d/%d]", entry.title or entry.item_id, comment_count, review_count)
+        elseif review_count == 0 then
             text = string.format("%s  [未拉取]", entry.title or entry.item_id)
         elseif comment_count >= review_count then
             text = string.format("%s  [%d/%d] ✓", entry.title or entry.item_id, comment_count, review_count)
         else
             text = string.format("%s  [%d/%d]", entry.title or entry.item_id, comment_count, review_count)
         end
+
         table.insert(items, {
             text = text,
             callback = function()
@@ -3079,12 +3073,8 @@ function FanQiePlugin:reloadCurrentChapter()
         if Log then Log.info("deleted para_reviews index:", item_id) end
     end
 
-    -- ★ 删除段评正文缓存，确保重新拉取
-    local para_comments_path = Content.book_cache_dir(self.settings, book.book_id) .. "/para_comments_" .. item_id .. ".lua"
-    if H.file_exists(para_comments_path) then
-        os.remove(para_comments_path)
-        if Log then Log.info("deleted para_comments cache:", item_id) end
-    end
+    -- ★ 删除段评正文缓存（单条文件 para_comments_<item_id>_<pid>.lua），确保重新拉取
+    pcall(Content.delete_chapter_comments, self.settings, book.book_id, item_id)
 
     -- ★ 删除段评 records 缓存，确保重新 findText 定位
     local para_records_path = Content.book_cache_dir(self.settings, book.book_id) .. "/para_records_" .. item_id .. ".lua"
