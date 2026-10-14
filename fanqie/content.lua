@@ -330,9 +330,9 @@ function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
     for i, ch in ipairs(chapters or {}) do
         local item_id = tostring(ch.itemId or ch.item_id or "")
         local t = tostring(ch.title or "")
-        -- Escape quotes/backslashes in title
         t = t:gsub("\\", "\\\\"):gsub('"', '\\"')
-        table.insert(parts, string.format('  { itemId = "%s", title = "%s" },', item_id, t))
+        table.insert(parts, string.format(
+            '  { itemId = "%s", title = "%s" },', item_id, t))
     end
     table.insert(parts, "}")
     H.write_file(path, table.concat(parts, "\n"))
@@ -1673,7 +1673,7 @@ function Content.save_para_reviews_index(settings, book_id, item_id, para_review
     local parts = { "return {" }
     for i, pr in ipairs(para_reviews or {}) do
         if pr.ident and pr.count then
-            table.insert(parts, string.format('  { ident = "%s", count = %d },', 
+            table.insert(parts, string.format('  { ident = "%s", count = %d },',
                 tostring(pr.ident):gsub('"', '\\"'), pr.count))
         end
     end
@@ -1694,4 +1694,143 @@ function Content.load_para_reviews_index(settings, book_id, item_id)
     return data
 end
 
+-- 通用 Lua table 序列化（string/number/boolean/table，跳过其它类型）
+local function lua_serialize(v)
+    local t = type(v)
+    if t == "string" then
+        return string.format("%q", v)
+    elseif t == "number" or t == "boolean" then
+        return tostring(v)
+    elseif t == "nil" then
+        return "nil"
+    elseif t == "table" then
+        local parts = {}
+        for k, val in pairs(v) do
+            local ks
+            if type(k) == "string" then
+                ks = string.format("[%q]", k)
+            elseif type(k) == "number" then
+                ks = "[" .. tostring(k) .. "]"
+            end
+            if ks then
+                parts[#parts + 1] = ks .. "=" .. lua_serialize(val)
+            end
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+    return "nil"
+end
+
+-- 读整章的段评正文缓存：{ [pid] = <API 原始 result>, ... }
+function Content.load_para_comments(settings, book_id, item_id)
+    local dir = Content.book_cache_dir(settings, book_id)
+    local path = H.join_path(dir, "para_comments_" .. tostring(item_id) .. ".lua")
+    if not H.file_exists(path) then return {} end
+    local ok, data = pcall(dofile, path)
+    if ok and type(data) == "table" then return data end
+    return {}
+end
+
+-- 计数文件：只存一行数字，读它不用 dofile 大文件
+local function comments_count_path(settings, book_id, item_id)
+    local dir = Content.book_cache_dir(settings, book_id)
+    return H.join_path(dir, "para_comments_" .. tostring(item_id) .. ".count")
+end
+
+function Content.load_comments_count(settings, book_id, item_id)
+    local path = comments_count_path(settings, book_id, item_id)
+    if not H.file_exists(path) then return nil end
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local line = f:read("*l")
+    f:close()
+    return tonumber(line)
+end
+
+function Content.save_comments_count(settings, book_id, item_id, count)
+    local path = comments_count_path(settings, book_id, item_id)
+    local f = io.open(path, "w")
+    if f then
+        f:write(tostring(count or 0))
+        f:close()
+    end
+end
+
+-- 单条写入（read-modify-write）。点气泡时拉到的正文用这个落盘。
+function Content.save_para_comment(settings, book_id, item_id, pid, result)
+    if not pid or not result then return end
+    local dir = Content.book_cache_dir(settings, book_id)
+    H.make_dir(dir)
+    local path = H.join_path(dir, "para_comments_" .. tostring(item_id) .. ".lua")
+
+    local existing = {}
+    if H.file_exists(path) then
+        local ok, data = pcall(dofile, path)
+        if ok and type(data) == "table" then existing = data end
+    end
+
+    existing[tostring(pid)] = result
+
+    local parts = { "return {" }
+    for k, v in pairs(existing) do
+        parts[#parts + 1] = string.format("[%q]=%s,", tostring(k), lua_serialize(v))
+    end
+    parts[#parts + 1] = "}"
+    H.write_file(path, table.concat(parts, "\n"))
+
+    -- ★ 写计数文件
+    local n = 0
+    for _ in pairs(existing) do n = n + 1 end
+    Content.save_comments_count(settings, book_id, item_id, n)
+end
+
+-- 批量写入（一次性覆盖整章文件）。后台落盘任务用这个。
+function Content.save_para_comments_batch(settings, book_id, item_id, all_results)
+    if not all_results then return end
+    local dir = Content.book_cache_dir(settings, book_id)
+    H.make_dir(dir)
+    local path = H.join_path(dir, "para_comments_" .. tostring(item_id) .. ".lua")
+
+    local parts = { "return {" }
+    local n = 0
+    for k, v in pairs(all_results) do
+        parts[#parts + 1] = string.format("[%q]=%s,", tostring(k), lua_serialize(v))
+        n = n + 1
+    end
+    parts[#parts + 1] = "}"
+    H.write_file(path, table.concat(parts, "\n"))
+
+    Content.save_comments_count(settings, book_id, item_id, n)
+end
+
+-- 段评 records 落盘：一章一个文件，含 pos0/pos1/ident/count/para_index
+function Content.save_para_records(settings, book_id, item_id, records)
+    if not records or #records == 0 then return end
+    local dir = Content.book_cache_dir(settings, book_id)
+    H.make_dir(dir)
+    local path = H.join_path(dir, "para_records_" .. tostring(item_id) .. ".lua")
+
+    local parts = { "return {" }
+    for _, rec in ipairs(records) do
+        parts[#parts + 1] = string.format(
+            "{ pos0=%q, pos1=%q, count=%d, ident=%q, para_index=%d },",
+            tostring(rec.pos0 or ""),
+            tostring(rec.pos1 or ""),
+            tonumber(rec.count) or 0,
+            tostring(rec.ident or ""),
+            tonumber(rec.para_index) or 0
+        )
+    end
+    parts[#parts + 1] = "}"
+    H.write_file(path, table.concat(parts, "\n"))
+end
+
+function Content.load_para_records(settings, book_id, item_id)
+    local dir = Content.book_cache_dir(settings, book_id)
+    local path = H.join_path(dir, "para_records_" .. tostring(item_id) .. ".lua")
+    if not H.file_exists(path) then return nil end
+    local ok, data = pcall(dofile, path)
+    if ok and type(data) == "table" and #data > 0 then return data end
+    return nil
+end
 return Content
