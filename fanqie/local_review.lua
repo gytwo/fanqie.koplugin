@@ -9,11 +9,14 @@ local GestureRange = require("ui/gesturerange")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local TextWidget = require("ui/widget/textwidget")
 local Notification = require("ui/widget/notification")
+local ok_socket, socket = pcall(require, "socket")
 
 local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(t) return t end
 local ok_state, _state = pcall(require("fanqie.state"))
 if not ok_state then _state = {} end
+local ok_H, H = pcall(require, "fanqie.helper")
+if not ok_H then H = nil end
 
 local Screen = Device.screen
 
@@ -489,6 +492,17 @@ function LocalReview.locate_chapter_by_title(plugin, book, chapter_title, chapte
         local raw = client:fetch_chapter_directory(book.book_id)
         local Content = require("fanqie.content")
         local chapters = Content.readable_chapters(Content.normalize_chapters(raw, book.book_id))
+
+        -- ★ 落盘目录（如果 catalog_cache.lua 不存在）
+        if chapters and #chapters > 0 then
+            local dir = Content.book_cache_dir(plugin.settings, book.book_id)
+            local cache_path = dir .. "/catalog_cache.lua"
+            if not H.file_exists(cache_path) then
+                pcall(Content.save_catalog_cache,
+                    plugin.settings, book.book_id, chapters, book.title, book.cover)
+            end
+        end
+
         local best_id, best_score
         for _i, ch in ipairs(chapters or {}) do
             local uid = tostring(ch.itemId or "")
@@ -672,6 +686,24 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
         local function finish()
             if saved_xp then pcall(doc.gotoXPointer, doc, saved_xp) end
 
+            local ok_content, Content = pcall(require, "fanqie.content")
+
+            -- 段落索引落盘（ident + count）
+            if result.list and #result.list > 0 then
+                if ok_content and Content and Content.save_para_reviews_index then
+                    pcall(Content.save_para_reviews_index,
+                        plugin.settings, book.book_id, item_id, result.list)
+                end
+            end
+
+            -- ★ records 落盘（含 pos0/pos1，供下次打开书直接读磁盘画气泡）
+            if #records > 0 then
+                if ok_content and Content and Content.save_para_records then
+                    pcall(Content.save_para_records,
+                        plugin.settings, book.book_id, item_id, records)
+                end
+            end
+
             -- 非预取时把 records 的 ident/count 写进 _state.current_para_reviews
             if not is_prefetch then
                 local ok_state, _state = pcall(require, "fanqie.state")
@@ -688,7 +720,13 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
                 end
             end
 
+            -- 先画气泡
             if on_done then on_done(records) end
+
+            -- ★ 气泡画完后，后台落盘评论正文
+            if result.list and #result.list > 0 then
+                LocalReview._background_cache_comments(plugin, book, item_id, result.list)
+            end
         end
 
         local function locate_one(i)
@@ -756,6 +794,159 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
 
         locate_one(1)
     end, { poll_interval = 0.125, timeout = 90 })
+end
+
+-- 后台把该章所有段评的评论正文落盘。
+-- 一次 Async.run（一次 fork）处理整章：子进程内循环拉该章所有 pid，
+-- 收集完一次性写盘。父进程不参与。
+-- 同一云端章只跑一个任务（防止重复启动）。
+-- 后台把该章所有段评的评论正文落盘。
+-- 一次 Async.run（一次 fork）处理整章：子进程内循环拉该章所有 pid，
+-- 收集完一次性写盘。父进程不参与。
+-- 同一云端章只跑一个任务（防止重复启动）。
+function LocalReview._background_cache_comments(plugin, book, item_id, list)
+    local ok_log, Log = pcall(require, "fanqie.logger")
+    local function dbg(...)
+        if ok_log and Log and Log.warn then Log.warn("[本地段评][后台落盘]", ...) end
+    end
+
+    if not list or #list == 0 then
+        dbg("跳过：list 为空")
+        return
+    end
+    local book_id = book.book_id
+    if not book_id or not item_id then
+        dbg("跳过：book_id/item_id 为空 book_id=" .. tostring(book_id)
+            .. " item_id=" .. tostring(item_id))
+        return
+    end
+
+    local Async = require("fanqie.async")
+    local Client = require("fanqie.client")
+
+    plugin._comment_cache_running = plugin._comment_cache_running or {}
+    local running_key = tostring(book_id) .. ":" .. tostring(item_id)
+    if plugin._comment_cache_running[running_key] then
+        dbg("跳过：running_key 已存在，已有任务在跑 " .. running_key)
+        return
+    end
+    plugin._comment_cache_running[running_key] = true
+    dbg("入队：" .. running_key .. " list_count=" .. tostring(#list)
+        .. " 延迟1秒启动")
+
+    -- 延迟 1 秒启动，给画气泡让出时间
+    UIManager:scheduleIn(1.0, function()
+        dbg("启动子进程：" .. running_key)
+
+        Async.run(function()
+            -- ============================================================
+            -- 子进程：循环拉该章所有 pid
+            --   · 每拉一条 → 只更新 .count（小文件，实时）
+            --   · 整章结束 → 一次性写 para_comments（大文件）
+            -- ============================================================
+            local Content = require("fanqie.content")
+            local settings = plugin.settings
+            local client = Client:new(settings)
+
+            local function cdbg(...)
+              --if ok_log and Log and Log.warn then Log.warn("[本地段评][后台落盘][子进程]", ...) end
+            end
+
+            -- 读现有缓存（一次）
+            local existing = Content.load_para_comments(settings, book_id, item_id)
+            local existing_count = 0
+            for _ in pairs(existing or {}) do existing_count = existing_count + 1 end
+            cdbg("读取已有缓存 existing_count=" .. tostring(existing_count))
+
+            -- 初始 .count 对齐一次
+            if existing_count > 0 then
+                pcall(Content.save_comments_count, settings, book_id, item_id, existing_count)
+            end
+
+            local new_results = {}
+            local saved_count = 0
+            local fail_count = 0
+            local skip_count = 0
+
+            for idx, pr in ipairs(list) do
+                local pid = tonumber(tostring(pr.ident):match("(%d+)$"))
+                if not pid then
+                    cdbg("跳过 idx=" .. tostring(idx) .. " 无法解析 pid ident=" .. tostring(pr.ident))
+                elseif existing and existing[tostring(pid)] then
+                    skip_count = skip_count + 1
+                else
+                    local ident = pr.ident
+                    local ok_r, result_r
+                    if ident:find("shushan:", 1, true) then
+                        ok_r, result_r = pcall(function()
+                            return client:shushan_get_para_review(ident, { count = 30, page_max = 1 })
+                        end)
+                    elseif ident:find("zhiqiu:", 1, true) then
+                        ok_r, result_r = pcall(function()
+                            return client:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 })
+                        end)
+                    else
+                        cdbg("跳过 idx=" .. tostring(idx) .. " 未知来源 ident=" .. tostring(ident):sub(1, 60))
+                    end
+
+                    if ok_r and result_r then
+                        new_results[tostring(pid)] = result_r
+                        saved_count = saved_count + 1
+                        cdbg("成功 pid=" .. tostring(pid)
+                            .. " 已拉=" .. tostring(saved_count)
+                            .. "/" .. tostring(#list))
+
+                        -- ★ 只更新 .count（+1），不写 para_comments、不写 catalog
+                        pcall(Content.save_comments_count,
+                            settings, book_id, item_id, existing_count + saved_count)
+                    else
+                        fail_count = fail_count + 1
+                        cdbg("失败 pid=" .. tostring(pid)
+                            .. " ident=" .. tostring(ident):sub(1, 80)
+                            .. " err=" .. tostring(result_r):sub(1, 200))
+                    end
+
+                end
+            end
+
+            -- ★ 整章结束：一次性写 para_comments
+            if saved_count > 0 or skip_count > 0 then
+                local merged = {}
+                for k, v in pairs(existing or {}) do merged[k] = v end
+                for k, v in pairs(new_results) do merged[k] = v end
+
+                local ok_w, err_w = pcall(Content.save_para_comments_batch,
+                    settings, book_id, item_id, merged)
+                if ok_w then
+                    cdbg("para_comments 写盘成功，共 " .. tostring(existing_count + saved_count) .. " 条")
+                else
+                    cdbg("para_comments 写盘失败 err=" .. tostring(err_w))
+                end
+
+                -- .count 最终值（保险，循环里已实时更新）
+                pcall(Content.save_comments_count,
+                    settings, book_id, item_id, existing_count + saved_count)
+            end
+
+            cdbg("汇总 saved=" .. tostring(saved_count)
+                .. " skip=" .. tostring(skip_count)
+                .. " fail=" .. tostring(fail_count)
+                .. " total=" .. tostring(#list))
+
+            return { saved = saved_count, skipped = skip_count, failed = fail_count }
+        end, function(ok, result, err)
+            plugin._comment_cache_running[running_key] = nil
+            if ok and result then
+                dbg("完成：" .. running_key
+                    .. " saved=" .. tostring(result.saved or 0)
+                    .. " skipped=" .. tostring(result.skipped or 0)
+                    .. " failed=" .. tostring(result.failed or 0))
+            else
+                dbg("失败：" .. running_key
+                    .. " err=" .. tostring(err))
+            end
+        end, { delay = 0, poll_interval = 0.5, timeout = 600 })
+    end)
 end
 
 -- ============================================================================
@@ -913,8 +1104,18 @@ function LocalReview.on_reader_ready(plugin)
     plugin._local_review_cache = plugin._local_review_cache or {}
     plugin._local_review_prefetching = plugin._local_review_prefetching or {}
     plugin._local_review_bindings = plugin._local_review_bindings or load_bindings(plugin)
-    plugin._local_review_current_local_key = nil   -- 本地章 key（判断是否切本地章）
-    plugin._local_review_current_cloud_key = nil   -- 云端 key（is_prefetch 判断 + cache 复用）
+    plugin._local_review_current_local_key = nil
+    plugin._local_review_current_cloud_key = nil
+
+    -- ★ 从 binding 加载 _local_review_book（关文档再打开时，plugin 是新实例，
+    --   _local_review_book 是 nil，从本地 binding 恢复）
+    local file = doc.file or doc.path
+    if file then
+        local binding = get_binding(plugin, file)
+        if binding and binding.book_id and binding.book_id ~= "" then
+            plugin._local_review_book = binding
+        end
+    end
 
     local overlay = Overlay:new{
         records = {},
@@ -993,6 +1194,7 @@ function LocalReview.on_page_update(plugin)
     plugin._local_review_current_local_key = local_key
 
     local book = plugin._local_review_book
+    local ok_content, Content = pcall(require, "fanqie.content")
 
     -- 内部函数：用一份 records 更新 overlay 和 _state（overlay/state 始终同步）
     local function apply_records(records, cloud_key)
@@ -1015,6 +1217,31 @@ function LocalReview.on_page_update(plugin)
         end
     end
 
+    -- 内部函数：cache 未命中时，先读磁盘 records，命中则 apply 并返回 true
+    local function try_disk_records(cloud_key, item_id)
+        if not (ok_content and Content and Content.load_para_records) then return false end
+        local disk_records = Content.load_para_records(plugin.settings, book.book_id, item_id)
+        if not disk_records or #disk_records == 0 then return false end
+        -- ★ 预验证 pos0 有效性
+        local valid = {}
+        for _, rec in ipairs(disk_records) do
+            if rec.pos0 then
+                -- ★ 加一层括号：只取 getPosFromXPointer 的第一个返回值
+                local pos = tonumber((doc:getPosFromXPointer(rec.pos0)))
+                if pos and pos ~= math.huge then
+                    rec.chapter_uid = cloud_key
+                    valid[#valid + 1] = rec
+                end
+            end
+        end
+        -- 有效率太低（< 50%）则视为失效，回退网络
+        if #valid < #disk_records * 0.5 then return false end
+        plugin._local_review_cache = plugin._local_review_cache or {}
+        plugin._local_review_cache[cloud_key] = valid
+        apply_records(valid, cloud_key)
+        return true
+    end
+
     -- 路径 A：chapter_map 已有该 toc_idx 的云端 item_id → 直接查云端缓存
     local mapped_item_id = book and book.chapter_map and book.chapter_map[tostring(toc_idx)]
     if mapped_item_id and mapped_item_id ~= "" then
@@ -1025,7 +1252,12 @@ function LocalReview.on_page_update(plugin)
             LocalReview.trigger_prefetch(plugin, toc_idx)
             return
         end
-        -- 云端缓存没有 → 拉取（用 mapped_item_id）
+        -- ★ cache 未命中 → 先读磁盘 records
+        if try_disk_records(cloud_key, tostring(mapped_item_id)) then
+            LocalReview.trigger_prefetch(plugin, toc_idx)
+            return
+        end
+        -- 磁盘也没有 → 拉取（用 mapped_item_id）
         LocalReview.dump_current_chapter(plugin, book,
             tostring(mapped_item_id), chapter_start_page, cloud_key, toc_idx)
         return
@@ -1047,7 +1279,12 @@ function LocalReview.on_page_update(plugin)
                 LocalReview.trigger_prefetch(plugin, toc_idx)
                 return
             end
-            -- 云端缓存没有 → 拉取
+            -- ★ cache 未命中 → 先读磁盘 records
+            if try_disk_records(cloud_key, tostring(item_id)) then
+                LocalReview.trigger_prefetch(plugin, toc_idx)
+                return
+            end
+            -- 磁盘也没有 → 拉取
             LocalReview.dump_current_chapter(plugin, book,
                 item_id, chapter_start_page, cloud_key, toc_idx)
         end,
@@ -1071,5 +1308,140 @@ function LocalReview.on_close_document(plugin)
     plugin._local_review_current_local_key = nil
     plugin._local_review_current_cloud_key = nil
 end
+
+-- ============================================================================
+-- 段评缓存管理：枚举 / 删除 / 继续下载
+-- ============================================================================
+
+-- 返回该书的段评缓存列表：{ {item_id, comment_count, title}, ... }
+-- 有 catalog_cache.lua 时遍历所有章；无目录时退回遍历 para_comments_*.lua
+function LocalReview.list_review_cache(plugin, book)
+    if not book or not book.book_id then return {} end
+    local ok_content, Content = pcall(require, "fanqie.content")
+    if not ok_content or not Content then return {} end
+    local dir = Content.book_cache_dir(plugin.settings, book.book_id)
+    local lfs = require("libs/libkoreader-lfs")
+    local list = {}
+
+    if lfs.attributes(dir, "mode") ~= "directory" then return {} end
+
+    -- 一次 lfs.dir 收集存在的文件名
+    local has_records, has_counts = {}, {}
+    for entry in lfs.dir(dir) do
+        local rid = entry:match("^para_records_(.+)%.lua$")
+        if rid then has_records[rid] = true end
+        local cid = entry:match("^para_comments_(.+)%.count$")
+        if cid then has_counts[cid] = true end
+    end
+
+    local catalog = Content.load_catalog_cache(plugin.settings, book.book_id) or {}
+
+    if #catalog > 0 then
+        for _, ch in ipairs(catalog) do
+            local item_id = tostring(ch.itemId or ch.item_id or "")
+            if item_id ~= "" then
+                local total = 0
+                if has_records[item_id] then
+                    local ok_r, recs = pcall(dofile, dir .. "/para_records_" .. item_id .. ".lua")
+                    if ok_r and type(recs) == "table" then
+                        for _ in ipairs(recs) do total = total + 1 end
+                    end
+                end
+                local saved = 0
+                if has_counts[item_id] then
+                    saved = Content.load_comments_count(plugin.settings, book.book_id, item_id) or 0
+                end
+                list[#list + 1] = {
+                    item_id = item_id,
+                    review_count = total,
+                    comment_count = saved,
+                    title = ch.title or item_id,
+                }
+            end
+        end
+    else
+        for item_id in pairs(has_records) do
+            local total = 0
+            local ok_r, recs = pcall(dofile, dir .. "/para_records_" .. item_id .. ".lua")
+            if ok_r and type(recs) == "table" then
+                for _ in ipairs(recs) do total = total + 1 end
+            end
+            local saved = 0
+            if has_counts[item_id] then
+                saved = Content.load_comments_count(plugin.settings, book.book_id, item_id) or 0
+            end
+            list[#list + 1] = {
+                item_id = item_id,
+                review_count = total,
+                comment_count = saved,
+                title = item_id,
+            }
+        end
+        table.sort(list, function(a, b) return tostring(a.item_id) < tostring(b.item_id) end)
+    end
+
+    return list
+end
+
+-- 删除单章段评缓存（para_reviews / para_records / para_comments 三个文件）
+-- 同时清内存 cache["cloud:<item_id>"]
+function LocalReview.delete_chapter_review_cache(plugin, book, item_id)
+    if not book or not book.book_id or not item_id then return end
+    local ok_content, Content = pcall(require, "fanqie.content")
+    if not ok_content or not Content then return end
+    local dir = Content.book_cache_dir(plugin.settings, book.book_id)
+    for _, name in ipairs({
+        "para_reviews_" .. tostring(item_id) .. ".lua",
+        "para_records_" .. tostring(item_id) .. ".lua",
+        "para_comments_" .. tostring(item_id) .. ".lua",
+        "para_comments_" .. tostring(item_id) .. ".count",
+    }) do
+        local path = dir .. "/" .. name
+        if H.file_exists(path) then os.remove(path) end
+    end
+    plugin._local_review_cache = plugin._local_review_cache or {}
+    plugin._local_review_cache["cloud:" .. tostring(item_id)] = nil
+end
+
+-- 触发单章下载：
+--   有 para_reviews → 只补评论正文（_background_cache_comments）
+--   无 para_reviews → 调 fetch_chapter_records 拉整个（索引 + findText + 评论正文）
+-- 没网络时弹 WiFi 框，联网后重跑。
+function LocalReview.continue_chapter_review_cache(plugin, book, item_id)
+    if not book or not book.book_id or not item_id then return end
+
+    -- 没网络时弹 WiFi 框，联网后重跑
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr and NetworkMgr.willRerunWhenOnline then
+        if NetworkMgr:willRerunWhenOnline(function()
+            LocalReview.continue_chapter_review_cache(plugin, book, item_id)
+        end) then
+            return
+        end
+    end
+
+    local ok_content, Content = pcall(require, "fanqie.content")
+    if not ok_content or not Content then return end
+
+    local reviews = Content.load_para_reviews_index(plugin.settings, book.book_id, item_id)
+    if reviews and #reviews > 0 then
+        -- 有索引，只补评论正文
+        plugin._comment_cache_running = plugin._comment_cache_running or {}
+        plugin._comment_cache_running[tostring(book.book_id) .. ":" .. tostring(item_id)] = nil
+        LocalReview._background_cache_comments(plugin, book, item_id, reviews)
+    else
+        -- 无索引，拉整个（索引 + findText + 落盘 + 评论正文）
+        local cloud_key = "cloud:" .. tostring(item_id)
+        LocalReview.fetch_chapter_records(plugin, book, item_id, 1, cloud_key, function(records)
+            local Notification = require("ui/widget/notification")
+            UIManager:show(Notification:new{
+                text = string.format("段评 %d 条", records and #records or 0),
+                timeout = 2,
+            })
+        end)
+    end
+end
+
+LocalReview.load_bindings = load_bindings
 
 return LocalReview
