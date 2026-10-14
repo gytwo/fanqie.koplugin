@@ -22,6 +22,10 @@ local Screen = Device.screen
 
 local LocalReview = {}
 
+-- 后台下载队列（模块级，跨 plugin 实例共享）
+local _bg_queue = {}
+local _bg_active = false
+
 local MODULE_NAME = "fanqie_local_review"
 local TOUCH_ID = "fanqie_local_review_tap"
 local PREFETCH_COUNT = 1
@@ -822,11 +826,9 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
     -- =========================================================================
     -- 全局队列：同一时间只跑一个后台下载，多个任务排队
     -- =========================================================================
-    plugin._comment_cache_queue = plugin._comment_cache_queue or {}
-    plugin._comment_cache_active = plugin._comment_cache_active or false
 
     local function start_task()
-        plugin._comment_cache_active = true
+        _bg_active = true
         plugin._comment_cache_running[running_key] = true
         dbg("启动任务：" .. running_key .. " list_count=" .. tostring(#list))
 
@@ -897,7 +899,7 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
                 return { saved = saved_count, skipped = skip_count, failed = fail_count }
             end, function(ok, result, err)
                 plugin._comment_cache_running[running_key] = nil
-                plugin._comment_cache_active = false
+                _bg_active = false
 
                 if ok and result then
                     dbg("完成：" .. running_key
@@ -910,7 +912,7 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
                 end
 
                 -- ★ 启动队列里下一个任务
-                local next_task = table.remove(plugin._comment_cache_queue, 1)
+                local next_task = table.remove(_bg_queue, 1)
                 if next_task then
                     dbg("队列下一个任务启动")
                     next_task()
@@ -919,11 +921,11 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
         end)
     end
 
-    if plugin._comment_cache_active then
+    if _bg_active then
         -- 已有任务在跑 → 排队
-        dbg("排队：" .. running_key .. " 队长=" .. tostring(#plugin._comment_cache_queue + 1))
+        dbg("排队：" .. running_key .. " 队长=" .. tostring(#_bg_queue + 1))
         plugin._comment_cache_running[running_key] = true   -- 占位，让 UI 显示"下载中"
-        table.insert(plugin._comment_cache_queue, start_task)
+        table.insert(_bg_queue, start_task)
         return
     end
 
