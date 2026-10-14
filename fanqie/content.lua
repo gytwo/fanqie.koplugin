@@ -15,7 +15,6 @@ if not ok_logger then
 end
 local LOG_MODULE = "[FanQie]"
 
--- High-resolution wall-clock timer (ms). Falls back to os.clock if no socket.
 local ok_socket_perf, socket_perf = pcall(require, "socket")
 local function now_ms()
     if ok_socket_perf and socket_perf and socket_perf.gettime then
@@ -30,7 +29,6 @@ local Content = {}
 
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
--- 创建 base64 解码查找表
 local b64decode = {}
 for i = 1, 64 do
     b64decode[b64chars:sub(i, i)] = i - 1
@@ -67,7 +65,6 @@ end
 
 local function base64_decode(data)
     if not data then return nil end
-    -- 移除所有非 base64 字符（除了 = 填充符）
     data = data:gsub("[^%w%+%/=]", "")
     if #data == 0 then return nil end
     local result = {}
@@ -77,7 +74,6 @@ local function base64_decode(data)
         local b = b64decode[data:sub(i + 1, i + 1)] or 0
         local c_char = data:sub(i + 2, i + 2)
         local d_char = data:sub(i + 3, i + 3)
-        -- 组合成 24 位值: (a << 18) | (b << 12) | (c << 6) | d
         local n = lshift(a, 18) + lshift(b, 12)
         if c_char and c_char ~= "=" then
             local c_val = b64decode[c_char] or 0
@@ -85,19 +81,16 @@ local function base64_decode(data)
             if d_char and d_char ~= "=" then
                 local d_val = b64decode[d_char] or 0
                 n = n + d_val
-                -- 输出 3 个字节
                 result[idx] = string.char(rshift(n, 16) % 256)
                 result[idx + 1] = string.char(rshift(n, 8) % 256)
                 result[idx + 2] = string.char(n % 256)
                 idx = idx + 3
             else
-                -- 2 个字节（d 是 =）
                 result[idx] = string.char(rshift(n, 16) % 256)
                 result[idx + 1] = string.char(rshift(n, 8) % 256)
                 idx = idx + 2
             end
         else
-            -- 1 个字节（c 是 =）
             result[idx] = string.char(rshift(n, 16) % 256)
             idx = idx + 1
         end
@@ -105,47 +98,34 @@ local function base64_decode(data)
     return table.concat(result)
 end
 
--- SVG 墨水屏兼容转换
--- crengine 不支持 rgba()、opacity、stroke-opacity 等半透明属性
--- 策略：
---   1. rgba(x,y,z,a) → 基于 alpha 映射为灰度纯色
---   2. 移除 opacity/stroke-opacity/fill-opacity 属性
---   3. 彩色（红/橙等）→ 深灰
---   4. 白色文字 → 深灰（墨水屏上白色文字不可见）
---   5. 给 <svg> 根元素添加浅灰背景，防止透明区域变黑
 local function fix_svg_for_inkscreen(svg_str)
     if not svg_str or svg_str:find("<svg", 1, true) ~= 1 then
         return svg_str
     end
-    -- rgba(r,g,b,a) → 纯色替换
     svg_str = svg_str:gsub("rgba%(%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)%s*,%s*([%.%d]+)%s*%)", function(r, g, b, a)
         local alpha = tonumber(a) or 1.0
         if alpha < 0.15 then
-            return "#FFFFFF"  -- 几乎透明 → 白色
+            return "#FFFFFF"
         elseif alpha < 0.3 then
-            return "#EEEEEE"  -- 浅灰
+            return "#EEEEEE"
         elseif alpha < 0.5 then
-            return "#DDDDDD"  -- 淡灰
+            return "#DDDDDD"
         elseif alpha < 0.7 then
-            return "#BBBBBB"  -- 中灰
+            return "#BBBBBB"
         else
-            return "#999999"  -- 深灰
+            return "#999999"
         end
     end)
-    -- 移除不支持的 opacity 属性
     svg_str = svg_str:gsub('opacity%s*=%s*"[%.%d]+"', "")
     svg_str = svg_str:gsub("opacity%s*=%s*'[%.%d]+'", "")
     svg_str = svg_str:gsub('stroke%-opacity%s*=%s*"[%.%d]+"', "")
     svg_str = svg_str:gsub("stroke%-opacity%s*=%s*'[%.%d]+'", "")
     svg_str = svg_str:gsub('fill%-opacity%s*=%s*"[%.%d]+"', "")
     svg_str = svg_str:gsub("fill%-opacity%s*=%s*'[%.%d]+'", "")
-    -- 彩色 → 深灰（墨水屏不支持彩色）
     svg_str = svg_str:gsub('fill%s*=%s*"#F06260"', 'fill="#444444"')
     svg_str = svg_str:gsub("fill%s*=%s*'#F06260'", "fill='#444444'")
-    -- 白色文字 → 深灰（墨水屏上白色不可见）
     svg_str = svg_str:gsub('fill%s*=%s*"#FFFFFF"', 'fill="#333333"')
     svg_str = svg_str:gsub("fill%s*=%s*'#FFFFFF'", "fill='#333333'")
-    -- 给 <svg> 根元素添加浅灰背景，防止透明区域在墨水屏上显示为黑色
     svg_str = svg_str:gsub("<svg([^>]*)>", function(attrs)
         if not attrs:find('fill=', 1, true) then
             return "<svg" .. attrs .. ' fill="#F5F5F5">'
@@ -155,8 +135,6 @@ local function fix_svg_for_inkscreen(svg_str)
     return svg_str
 end
 
--- 修正正文中所有 data:image/svg+xml;base64 图片
--- 解码 base64 → 修正 SVG → 重新编码
 local function fix_svg_imgs_in_text(text)
     local result = text:gsub('(<[iI][mM][gG][^>]*src%s*=%s*")(data:image/svg%+xml;base64,)([^"]*)("[^>]*>)',
         function(prefix, prefix2, b64_data, suffix)
@@ -180,7 +158,6 @@ local function basename_safe(value)
     if value == "" then
         value = "fanqie"
     end
-    -- 截断到 10 个字符（UTF-8 安全）
     local chars = require("util").splitToChars(value)
     if #chars > 10 then
         value = table.concat(chars, "", 1, 10)
@@ -188,26 +165,22 @@ local function basename_safe(value)
     return value
 end
 
--- book_id 专用：只清非法字符，不截断（大整数 ID 不能被截）
 local function id_safe(value)
     value = tostring(value or ""):gsub("[/\\:%*%?\"<>|]", "_")
     if value == "" then value = "fanqie" end
     return value
 end
 
--- book_id -> 目录路径（进程内缓存，避免每次扫目录）
 local _book_dir_cache = {}
 
 function Content.book_cache_dir(settings, book_id)
     local base = settings.cache_dir
     local id = id_safe(book_id)
 
-    -- 1. 进程内缓存命中
     if _book_dir_cache[id] then
         return _book_dir_cache[id]
     end
 
-    -- 2. 扫目录，兼容「纯 id」和「<title>-<id>」两种命名
     local lfs = require("libs/libkoreader-lfs")
     if lfs.attributes(base, "mode") == "directory" then
         for entry in lfs.dir(base) do
@@ -221,13 +194,11 @@ function Content.book_cache_dir(settings, book_id)
         end
     end
 
-    -- 3. 没找到（首次建目录前）：返回纯 id 路径
     local dir = base .. "/" .. id
     _book_dir_cache[id] = dir
     return dir
 end
 
--- Cache index: persists item_id → file path mapping across restarts
 function Content.save_cache_index(settings, book_id, cached_chapters)
     local dir = Content.book_cache_dir(settings, book_id)
     H.make_dir(dir)
@@ -241,8 +212,6 @@ function Content.save_cache_index(settings, book_id, cached_chapters)
     table.insert(parts, "}")
     H.write_file(index_path, table.concat(parts, "\n"))
 
-    -- 同步更新内存缓存：load_cache_index 优先读内存，若不更新会导致
-    -- 预下载/手动下载新增的章节在目录中不显示对号（内存缓存陈旧）
     local ok_state, _state = pcall(require, "fanqie.state")
     if ok_state and _state and _state.setChapterIndexCache then
         _state.setChapterIndexCache(book_id, cached_chapters)
@@ -291,23 +260,17 @@ function Content.verify_cache_path(path)
     return H.file_exists(path)
 end
 
--- Catalog (chapter directory) persistence: saves the full chapter list
--- so we don't have to re-fetch it from the server every time.
--- save_catalog_cache 支持额外的 title/cover 参数：
---   首次建目录时用 <title>-<id> 命名，并下载封面到 cover.jpg
 function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
     local id = id_safe(book_id)
     local dir = Content.book_cache_dir(settings, book_id)
 
-    -- 首次建目录：用 <title>-<id>
     local lfs = require("libs/libkoreader-lfs")
     if lfs.attributes(dir, "mode") ~= "directory" and title and title ~= "" then
         dir = settings.cache_dir .. "/" .. basename_safe(title) .. "-" .. id
     end
     H.make_dir(dir)
-    _book_dir_cache[id] = dir   -- 更新缓存
+    _book_dir_cache[id] = dir
 
-    -- 首次建目录时写入 cover.jpg
     if cover and cover ~= "" then
         local cover_path = dir .. "/cover.jpg"
         if not H.file_exists(cover_path) then
@@ -315,7 +278,6 @@ function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
                 return require("fanqie.client"):new(settings):get_binary(cover)
             end)
             if ok and data and #data > 0 then
-                -- 按真实格式决定扩展名
                 local ext = Content.detect_image_type(data) or ".jpg"
                 H.write_file(dir .. "/cover" .. ext, data)
             else
@@ -325,7 +287,6 @@ function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
     end
 
     local path = H.join_path(dir, "catalog_cache.lua")
-    -- Serialize chapters as a Lua table. Only keep fields needed for display.
     local parts = { "return {" }
     for i, ch in ipairs(chapters or {}) do
         local item_id = tostring(ch.itemId or ch.item_id or "")
@@ -338,12 +299,7 @@ function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
     H.write_file(path, table.concat(parts, "\n"))
 end
 
--- 目录缓存读取：内存主源 + 文件后备 + 回填
--- 优先查内存缓存（_state.cached_directory），命中直接返回，避免文件 IO；
--- 未命中时读文件缓存，并回填内存，后续读取全部走内存。
--- 此函数在父进程调用，回填内存安全有效。
 function Content.load_catalog_cache(settings, book_id)
-    -- 1. 先查内存缓存
     local ok_state, _state = pcall(require, "fanqie.state")
     if ok_state and _state and _state.getDirectoryCache then
         local mem = _state.getDirectoryCache(book_id)
@@ -352,7 +308,6 @@ function Content.load_catalog_cache(settings, book_id)
         end
     end
 
-    -- 2. 未命中：读文件缓存
     local dir = Content.book_cache_dir(settings, book_id)
     local path = H.join_path(dir, "catalog_cache.lua")
     if not H.file_exists(path) then
@@ -363,7 +318,6 @@ function Content.load_catalog_cache(settings, book_id)
         return nil
     end
 
-    -- 3. 回填内存缓存，后续读取走内存
     if ok_state and _state and _state.setDirectoryCache and catalog and #catalog > 0 then
         _state.setDirectoryCache(book_id, catalog)
     end
@@ -371,7 +325,6 @@ function Content.load_catalog_cache(settings, book_id)
 end
 
 function Content.clear_catalog_cache(settings, book_id)
-    -- 同步清理内存缓存，避免删文件后内存仍返回陈旧数据
     local ok_state, _state = pcall(require, "fanqie.state")
     if ok_state and _state and _state.invalidateDirectoryCache then
         _state.invalidateDirectoryCache(book_id)
@@ -383,7 +336,6 @@ function Content.clear_catalog_cache(settings, book_id)
     end
 end
 
--- Find a chapter file directly from filesystem, even if cache index is missing
 function Content.find_chapter_file(settings, book_id, item_id)
     local dir = Content.book_cache_dir(settings, book_id)
     if not dir then return nil end
@@ -442,7 +394,6 @@ local function media_type_for(data)
     return ".bin", "application/octet-stream"
 end
 
--- Public wrapper: returns (ext, media_type) only for valid image data, else nil
 function Content.detect_image_type(data)
     if type(data) ~= "string" or #data < 12 then return nil end
     local ext, mt = media_type_for(data)
@@ -463,12 +414,10 @@ end
 
 local function body_fragment(xhtml)
     xhtml = tostring(xhtml or "")
-    -- Remove XML declaration and DOCTYPE
     xhtml = xhtml:gsub("<%?xml.-%?>", "")
     xhtml = xhtml:gsub("<!DOCTYPE.-%>", "")
     xhtml = xhtml:gsub("<!%[CDATA%[.-%]%]>", "")
 
-    -- Extract body content between <body> and </body>
     local body = xhtml:match("<body[^>]->([%s%S]--)</body>")
     if not body then
         body = xhtml:match("<body[^>]->(.*)")
@@ -477,14 +426,12 @@ local function body_fragment(xhtml)
         body = xhtml
     end
 
-    -- Remove <script>, <style>, <header>, <nav> elements but keep <img>
     body = body:gsub("<script[^>]->[%s%S]-</script>", "")
     body = body:gsub("<style[^>]->[%s%S]-</style>", "")
     body = body:gsub("<header[^>]->[%s%S]-</header>", "")
     body = body:gsub("<nav[^>]->[%s%S]-</nav>", "")
     body = body:gsub("<!--[%s%S]--->", "")
 
-    -- Handle self-closing tags
     body = body:gsub("<br%s*/?>", "<br/>")
     body = body:gsub("<img([^>]-)/>", "<img%1>")
 
@@ -601,14 +548,11 @@ function Content.clean_chapter_content(raw_content, title)
 
     local content = raw_content
 
-    -- 移除不可见字符（零宽空格、BOM、软连字符、双向控制符等，聚合源广告中大量掺杂）
-    -- U+200B-200F, U+2028-202E, U+FEFF, U+00AD
-    content = content:gsub("\226\128[\139\140\141\142\143]", "")  -- U+200B-200F 零宽空格/方向标记
-    content = content:gsub("\226\128[\168\169\170\171\172\173\174]", "")  -- U+2028-202E 行/段分隔符与双向控制符
-    content = content:gsub("\194\173", "")  -- U+00AD 软连字符
-    content = content:gsub("\239\187\191", "")  -- U+FEFF BOM
+    content = content:gsub("\226\128[\139\140\141\142\143]", "")
+    content = content:gsub("\226\128[\168\169\170\171\172\173\174]", "")
+    content = content:gsub("\194\173", "")
+    content = content:gsub("\239\187\191", "")
 
-    -- Remove unwanted elements but preserve <img> and <comment> tags
     content = content:gsub("<header[^>]->[%s%S]-</header>", "")
     content = content:gsub("<script[^>]->[%s%S]-</script>", "")
     content = content:gsub("<style[^>]->[%s%S]-</style>", "")
@@ -620,11 +564,8 @@ function Content.clean_chapter_content(raw_content, title)
         content = body_match
     end
 
-    -- 移除末尾广告：部分聚合源广告以 📣 或 "本书源" 开头
-    -- 广告可能跨多行，从起始标志到内容结尾全部删除
-    -- 📣 = U+1F4E3 = F0 9F 93 A3
     local ad_start = nil
-    local qt_ad = content:find("\240\159\147\163", 1, true)  -- 📣
+    local qt_ad = content:find("\240\159\147\163", 1, true)
     local dl_ad = content:find("本书源", 1, true)
     if qt_ad then ad_start = qt_ad end
     if dl_ad and (not ad_start or dl_ad < ad_start) then ad_start = dl_ad end
@@ -632,20 +573,10 @@ function Content.clean_chapter_content(raw_content, title)
         content = content:sub(1, ad_start - 1)
     end
 
-    -- ========================================================================
-    -- 段评气泡生成（全局占位符方案，参考 kindle-forge 的全局替换）
-    -- <comment> 标签可能在 <p> 内部（与文字内联）或外部（段落之间）。
-    -- 旧方案只在段落之间查找 <comment>，<p> 内部的 <comment> 会被
-    -- txt:gsub("<[^>]+>","") 当作普通标签删除，导致气泡永远不出现。
-    -- 新方案：先全局把 <comment> 替换成占位符 \001CMTN\001，占位符不含
-    -- <>&" 等特殊字符，能安全穿过 strip_tags / decode_entities / trim /
-    -- xml_escape 全流程；最后统一还原为气泡 HTML。
-    -- ========================================================================
-    local comment_bubbles = {}   -- 占位符序号 → 气泡 HTML
+    local comment_bubbles = {}
     local comment_count = 0
-    local comment_samples = {}  -- 保留前 3 个 <comment> 原文用于日志诊断
+    local comment_samples = {}
 
-    -- 1. 匹配带 count 的 <comment ident="..." count="..." />
     content = content:gsub('<comment%s+ident="([^"]*)"%s+count="([^"]*)"%s*/?>', function(ident, count)
         comment_count = comment_count + 1
         local idx = comment_count
@@ -653,10 +584,6 @@ function Content.clean_chapter_content(raw_content, title)
         if #comment_samples < 3 then
             table.insert(comment_samples, string.format('<comment ident="%s" count="%s" />', ident:sub(1, 80), count))
         end
-        -- 用 <a href="fanqie-para:N"> 代替 <span onclick>，因为 KOReader 的 crengine
-        -- 不支持 JavaScript onclick 事件，但支持 <a> 链接点击 → 触发 onGotoLink 事件
-        -- href 中的 N 是段评在 para_reviews 表中的序号，插件通过 onGotoLink 拦截
-        -- 超过 99 条显示 99+，避免四位数字气泡过宽
         local n_label = tostring(n)
         if n > 99 then n_label = "99+" end
         comment_bubbles[idx] = string.format(
@@ -665,7 +592,6 @@ function Content.clean_chapter_content(raw_content, title)
         )
         return "\001CMT" .. idx .. "\001"
     end)
-    -- 2. 匹配不带 count 的 <comment ident="..." />
     content = content:gsub('<comment%s+ident="([^"]*)"%s*/?>', function(ident)
         comment_count = comment_count + 1
         local idx = comment_count
@@ -687,9 +613,6 @@ function Content.clean_chapter_content(raw_content, title)
         end
     end
 
-    -- SVG 墨水屏兼容修正：在段落处理前统一处理所有 data:image/svg+xml;base64 图片
-    -- crengine 不支持 rgba()、opacity、stroke-opacity 等半透明属性，
-    -- 会导致 SVG 背景变黑。这里提前解码→修正→重编码。
     local svg_count_before = 0
     for _ in content:gmatch('data:image/svg%+xml;base64,') do
         svg_count_before = svg_count_before + 1
@@ -701,8 +624,6 @@ function Content.clean_chapter_content(raw_content, title)
         end
     end
 
-    -- 辅助函数：从文本中提取占位符（用于段落之间的 <comment>，已变成占位符）
-    -- 占位符 \001CMTN\001 不含 <>&" ，不会被 strip_tags 删除
     local function extract_placeholders(text)
         local phs = {}
         for ph in text:gmatch("\001CMT%d+\001") do
@@ -711,9 +632,6 @@ function Content.clean_chapter_content(raw_content, title)
         return table.concat(phs, "")
     end
 
-    -- 辅助函数：从文本中提取 <img> 标签（用于段落之间的正文插图 / 神评预览图）
-    -- 这些 <img> 不在任何 <p> 内部（位于 </p> 与下一个 <p> 之间，或正文末尾），
-    -- 若不主动保留，会被下面的段落切分逻辑静默丢弃，导致正文插图被"清洗段评"误删。
     local function extract_images(text)
         local imgs = {}
         for img in text:gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -722,14 +640,10 @@ function Content.clean_chapter_content(raw_content, title)
         return table.concat(imgs, "")
     end
 
-    -- Extract paragraphs, preserving inline images IN THEIR ORIGINAL ORDER.
-    -- 段落之间的占位符（原 <comment>）提取后追加到段落末尾。
-    -- 段落内部的占位符随文字流自然保留，最终还原为内联气泡。
     local paragraphs = {}
     local para_regex = "<p[^>]->([%s%S]-)</p>"
     local pos = 1
 
-    -- 图片追踪：统计各位置发现的 <img> 数量，用于诊断"正文插图被清洗"问题
     local img_stats = { before = 0, inner = 0, tail = 0, fallback = 0 }
     local img_before_clean = 0
     for _ in content:gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -739,7 +653,6 @@ function Content.clean_chapter_content(raw_content, title)
     while true do
         local start_pos, end_pos, inner = content:find(para_regex, pos)
         if not start_pos then
-            -- 没有更多 <p> 标签，处理最后一段残留内容中的 <img> 与占位符
             local tail = content:sub(pos)
             local tail_imgs = extract_images(tail)
             for _ in tail_imgs:gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -763,8 +676,6 @@ function Content.clean_chapter_content(raw_content, title)
             break
         end
 
-        -- 处理 <p> 标签之前的内容（段落之间的 <img> 正文插图/神评预览图 与占位符）
-        -- 段落之间的 <img> 必须主动保留并挂到上一段末尾，否则会被段落切分丢弃
         local before_text = content:sub(pos, start_pos - 1)
         local before_imgs = extract_images(before_text)
         for _ in before_imgs:gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -779,15 +690,10 @@ function Content.clean_chapter_content(raw_content, title)
         end
         local ph_html = extract_placeholders(before_text)
 
-        -- Walk through the paragraph, interleaving text snippets with images
-        -- in exactly the order they appear in the source.
-        -- 注意：段落内部的占位符 \001CMTN\001 是纯文本，不会被
-        -- gsub("<[^>]+>","") 删除，会随文字一起进入 parts，最终内联显示。
         local parts = {}
         local scan = 1
         local inner_len = #inner
         while scan <= inner_len do
-            -- Try to find the next <img ...> or <img .../> tag
             local img_start, img_end, img_tag = inner:find('(<[iI][mM][gG][^>]*/?>)', scan)
             local br_start, br_end, br_tag = inner:find('(<br%s*/?>)', scan)
             local next_tag_start, next_tag_end, next_tag = nil, nil, nil
@@ -802,7 +708,6 @@ function Content.clean_chapter_content(raw_content, title)
             end
 
             if next_tag_start then
-                -- Text before this tag
                 if next_tag_start > scan then
                     local txt = inner:sub(scan, next_tag_start - 1)
                     txt = txt:gsub("<[^>]+>", "")
@@ -820,7 +725,6 @@ function Content.clean_chapter_content(raw_content, title)
                 end
                 scan = next_tag_end + 1
             else
-                -- No more tags; tail text
                 local txt = inner:sub(scan)
                 txt = txt:gsub("<[^>]+>", "")
                 txt = Content.decode_html_entities(txt)
@@ -834,15 +738,13 @@ function Content.clean_chapter_content(raw_content, title)
 
         local para_content = table.concat(parts, "\n")
         if para_content ~= "" then
-            -- 检测是否为纯图片段落（去除 img 标签后无文字内容）
-            -- 纯图片段落直接输出 img 标签本身，去掉外层 p，避免 text-indent 缩进
             local stripped = para_content:gsub("<[iI][mM][gG][^>]*/?>", "")
             stripped = stripped:gsub("%s", "")
             local is_img_only = stripped == "" and para_content:find("<[iI][mM][gG]")
             if is_img_only then
                 table.insert(paragraphs, para_content .. ph_html)
             else
-                            table.insert(paragraphs, "<p>" .. para_content .. "</p>" .. ph_html)
+                table.insert(paragraphs, "<p>" .. para_content .. "</p>" .. ph_html)
             end
         elseif ph_html ~= "" then
             table.insert(paragraphs, "<p>" .. ph_html .. "</p>")
@@ -850,9 +752,6 @@ function Content.clean_chapter_content(raw_content, title)
         pos = end_pos + 1
     end
 
-    -- If no <p> tags found, extract text and images directly.
-    -- We walk the content linearly, splitting on newlines AND <img> tags,
-    -- so images appear in their original position relative to the text.
     if #paragraphs == 0 then
         local lines = {}
         local scan = 1
@@ -860,7 +759,6 @@ function Content.clean_chapter_content(raw_content, title)
         while scan <= content_len do
             local img_start, img_end, img_tag = content:find("(<[iI][mM][gG][^>]*/?>)", scan)
             if not img_start then
-                -- No more images; emit the trailing text
                 local tail = content:sub(scan)
                 local ph_html = extract_placeholders(tail)
                 tail = tail:gsub("<br%s*/?>", "\n")
@@ -881,7 +779,6 @@ function Content.clean_chapter_content(raw_content, title)
                 end
                 break
             end
-            -- Emit text before the image
             local before = content:sub(scan, img_start - 1)
             local ph_html = extract_placeholders(before)
             before = before:gsub("<br%s*/?>", "\n")
@@ -900,7 +797,6 @@ function Content.clean_chapter_content(raw_content, title)
                     table.insert(lines, "<p>" .. ph_html .. "</p>")
                 end
             end
-            -- 直接输出 img 标签本身，不包外层 p
             table.insert(lines, img_tag)
             img_stats.fallback = img_stats.fallback + 1
             scan = img_end + 1
@@ -908,7 +804,6 @@ function Content.clean_chapter_content(raw_content, title)
         paragraphs = lines
     end
 
-    -- 最终还原：把所有占位符 \001CMTN\001 替换为真实气泡 HTML
     local result = table.concat(paragraphs, "\n")
     local restored_count = 0
     result = result:gsub("\001CMT(%d+)\001", function(idx_str)
@@ -924,7 +819,6 @@ function Content.clean_chapter_content(raw_content, title)
         logger.info(LOG_MODULE, "[段评] 气泡还原: restored=" .. restored_count .. "/" .. comment_count)
     end
 
-    -- 图片追踪汇总：对比清洗前后的 <img> 数量，定位"正文插图被清洗"问题
     if logger then
         local img_after = 0
         for _ in result:gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -958,14 +852,11 @@ function Content.txt_to_xhtml(text)
         .. '<body>\n' .. table.concat(parts, "\n") .. '\n</body></html>'
 end
 
--- 确保 itemId/bookId 等大整数ID始终为字符串，防止 Lua number 精度丢失
--- 返回: (string_id, was_numeric, precision_lost)
 local function to_precise_id(value)
     if value == nil then return nil end
     if type(value) == "string" then return value, false, false end
     if type(value) == "number" then
         local s = string.format("%.0f", value)
-        -- 检查是否精度丢失: 转回数字再转回字符串，看是否一致
         if tonumber(s) ~= value then
             return s, true, true
         end
@@ -974,7 +865,6 @@ local function to_precise_id(value)
     return tostring(value), false, false
 end
 
--- 递归处理chapter中的ID字段，转为字符串
 local function fix_chapter_ids(chapter)
     if type(chapter) ~= "table" then return chapter end
     local fixed = {}
@@ -1002,9 +892,6 @@ function Content.normalize_chapters(payload, book_id)
         return {}
     end
 
-    -- Official API returns chapterListWithVolume as a 2D array:
-    -- [[chapter1, chapter2, ...], [chapter101, ...]]
-    -- Each volume is directly an array of chapters, not an object with chapterList property
     if type(records.chapterListWithVolume) == "table" then
         local flattened = {}
         for _, volume in ipairs(records.chapterListWithVolume) do
@@ -1020,7 +907,6 @@ function Content.normalize_chapters(payload, book_id)
             return flattened
         end
     end
-    -- Direct chapter list fields (official + third-party variants)
     if type(records.chapterList) == "table" then
         local out = {}
         for _, ch in ipairs(records.chapterList) do
@@ -1028,7 +914,6 @@ function Content.normalize_chapters(payload, book_id)
         end
         return out
     end
-    -- Try extracting chapters from allItemIds if chapterListWithVolume/chapterList is empty
     if type(records.allItemIds) == "table" and #records.allItemIds > 0 then
         local chapters = {}
         for i, item_id in ipairs(records.allItemIds) do
@@ -1076,9 +961,7 @@ function Content.readable_chapters(chapters)
     return out
 end
 
--- Helper functions for image handling
 local function image_trim(value)
-    -- Also decode common HTML entities right at extraction time (matches miuread)
     local s = tostring(value or ""):match("^%s*(.-)%s*$") or ""
     s = s:gsub("&amp;", "&")
     s = s:gsub("&#38;", "&")
@@ -1101,7 +984,6 @@ local function image_attr(attrs, name_pattern)
     if not value then
         value = attrs:match("%s*" .. name_pattern .. "%s*=%s*([^%s>]+)")
     end
-    -- Also try at the beginning (no leading space)
     if not value then
         value = attrs:match("^" .. name_pattern .. "%s*=%s*[\"']([^\"']*)[\"']")
         if not value then
@@ -1112,9 +994,7 @@ local function image_attr(attrs, name_pattern)
 end
 
 local function image_remove_attr(attrs, name_pattern)
-    -- Remove quoted attribute: name="value" or name='value'
     local result = attrs:gsub("%s*" .. name_pattern .. "%s*=%s*[\"'][^\"']*[\"']", "")
-    -- Remove unquoted attribute: name=value
     result = result:gsub("%s*" .. name_pattern .. "%s*=%s*[^%s>]+", "")
     return result
 end
@@ -1147,13 +1027,12 @@ end
 function Content.download_remote_images(client, xhtml, used_names, progress)
     local assets = {}
     used_names = used_names or {}
-    local source_map = {}  -- maps URL -> local href
+    local source_map = {}
 
     local summary = { total = 0, downloaded = 0, failed = 0, data_uri = 0, total_found = 0 }
 
     xhtml = tostring(xhtml or ""):gsub("<[iI][mM][gG]([^>]*)>", function(attrs)
         summary.total_found = summary.total_found + 1
-        -- Find the best source URL
         local srcset = image_attr(attrs, "srcset")
         local source = image_attr(attrs, "data%-src")
             or image_attr(attrs, "data%-original")
@@ -1168,29 +1047,22 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
             return "<img" .. attrs .. ">"
         end
 
-        -- Decode HTML entities in the URL (e.g. &amp; -> &)
         clean_source = Content.decode_html_entities(clean_source)
 
-        -- Skip data: URIs
         if clean_source:lower():match("^data:") then
             summary.data_uri = summary.data_uri + 1
             return "<img" .. attrs .. ">"
         end
 
-        -- Check if we already have this URL mapped (after entity decoding)
         local local_src = source_map[clean_source]
         if not local_src then
             local url = image_remote_url(clean_source)
             if not url then
-                -- Non-remote image (relative, etc.) - skip
                 return "<img" .. attrs .. ">"
             end
 
             summary.total = summary.total + 1
 
-            -- Match the exact headers that successfully fetch the image from
-            -- fqnovelpic.com (verified via curl). Desktop Edge UA + NO Referer
-            -- (adding a Referer here triggers the CDN's anti-leech protection).
             local img_headers = {
                 ["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                 ["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8",
@@ -1199,12 +1071,10 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
                 ["Upgrade-Insecure-Requests"] = "1",
             }
 
-            -- Download the image. For fqnovelpic CDN we MUST NOT send a Referer
-            -- (anti-leech triggers 403). For other hosts keep the default.
-            local img_referer = nil  -- nil = default base URL in get_binary
+            local img_referer = nil
             local img_host = url:match("^https?://([^/]+)")
             if img_host and img_host:find("fqnovelpic") then
-                img_referer = false  -- explicitly send no Referer
+                img_referer = false
             end
             local ok, data = pcall(function()
                 return client:get_binary(url, {
@@ -1226,7 +1096,6 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
                 return "<img" .. attrs .. ">"
             end
 
-            -- Generate unique href
             local img_index = #assets + 1
             local href = image_unique_href(used_names, "img", img_index, ext)
             local local_path = "../" .. href
@@ -1243,7 +1112,6 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
             summary.downloaded = summary.downloaded + 1
         end
 
-        -- Replace src with local path
         if progress then
             progress(summary.downloaded, summary.total)
         end
@@ -1276,7 +1144,6 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
 
     local t_fetch = now_ms()
     local fetch_opts = opts.review and { review = true } or nil
-    -- 第3返回值 rate_info：本轮记录的限流时间戳，透传给 fetch_chapter_html → 父进程合并
     local result, _src_id, rate_info = client:get_chapter_content_with_fallback(book_id, item_id, fetch_opts)
     local fetch_elapsed = now_ms() - t_fetch
 
@@ -1287,9 +1154,6 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
     end
 
     local t_pua = now_ms()
-    -- Only decode PUA if content actually contains PUA codepoints
-    -- PUA range U+E3F8-U+E55C encodes to UTF-8 starting with 0xEE (238)
-    -- Normal Chinese text (U+4E00-U+9FFF) starts with 0xE4-0xE9, never 0xEE
     if content:find("\238", 1, true) then
         content = Content.decode_pua_content(content)
     end
@@ -1297,7 +1161,6 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
 
     local t_clean = now_ms()
 
-    -- 段评诊断：检查原始正文中是否含 <comment> 标签（区分"请求问题"还是"处理问题"）
     local raw_comment_count = 0
     local raw_comment_pos = content:find("<comment", 1, true)
     if raw_comment_pos then
@@ -1318,7 +1181,6 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
     local cleaned = Content.clean_chapter_content(content, title)
     local clean_elapsed = now_ms() - t_clean
     if logger then
-        -- 验证清洗后的正文是否含气泡
         local bubble_count = 0
         for _ in cleaned:gmatch('class="para%-comment"') do
             bubble_count = bubble_count + 1
@@ -1338,7 +1200,6 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
             "cleaned_len=" .. tostring(#cleaned))
     end
 
-    -- 段评数据从 result 中提取，存储到返回值中
     local para_reviews = result.para_reviews or {}
 
     return '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -1347,10 +1208,6 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
         para_reviews,
         rate_info
 end
-
--- ---------------------------------------------------------------------------
--- HTML format (standalone .html files, one per chapter)
--- ---------------------------------------------------------------------------
 
 function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     local book_id = book.book_id or book.bookId
@@ -1361,8 +1218,6 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     local path = dir .. "/" .. "chapter_" .. item_id .. ".html"
     local title = chapter.title or book.title or "FanQie"
 
-    -- 章节号与标题名分两行：把"第X章/卷/节/回/部/篇"前缀拆出，插 <br/>
-    -- 不匹配（序章/后记/无"第X章"格式）则原样返回，不影响其他标题
     local function split_title_for_display(raw_title)
         local t = tostring(raw_title or "")
         local chars = require("util").splitToChars(t)
@@ -1400,13 +1255,11 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
         return xml_escape(t)
     end
 
-    -- 1. Write downloaded image assets to actual files on disk (relative-path fallback for crengine)
-    --    href in assets is "images/img_001.png"; relative to dir this resolves correctly.
     local href_to_rel = {}
     if assets and #assets > 0 then
         H.make_dir(images_dir)
         for _, a in ipairs(assets) do
-            local file_href = a.href  -- "images/img_001.png"
+            local file_href = a.href
             local abs_path = dir .. "/" .. file_href
             local ok_write, err_write = pcall(function()
                 H.write_file(abs_path, a.data)
@@ -1419,7 +1272,6 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
         end
     end
 
-    -- 2. Build href -> base64 data URI map (primary strategy, single-file embedding)
     local href_to_data = {}
     if assets and #assets > 0 then
         for _, a in ipairs(assets) do
@@ -1428,10 +1280,8 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
         end
     end
 
-    -- 3. Extract body fragment (already has images processed by download_remote_images)
     local body = body_fragment(xhtml)
 
-    -- 图片追踪：body_fragment 前后的 <img> 数量对比
     if logger then
         local img_before_fragment = 0
         for _ in tostring(xhtml):gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -1447,12 +1297,8 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
         end
     end
 
-    -- 4. Process <img> tags in the body:
-    --    (a) downloaded src -> embed as base64 data URI (preferred)
-    --    (b) everything else: decode HTML entities in the src URL (&amp; -> &) so online links work
     local visited = {}
     body = body:gsub('<[iI][mM][gG]([^>]*)>', function(attrs)
-        -- Extract current src (quoted variants first)
         local src, quote_char = nil, nil
         local s_start, s_end, q, val = attrs:find('%ssrc%s*=%s*(["\'])(.-)%1')
         if s_start then
@@ -1466,7 +1312,6 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
 
         local new_src = nil
         if src then
-            -- First, try data-URI embedding for downloaded assets
             local data_uri = href_to_data[src]
             if not data_uri then
                 local stripped = src:gsub("^%.%./", "")
@@ -1475,7 +1320,6 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
             if data_uri then
                 new_src = data_uri
             else
-                -- Not a downloaded asset; still decode HTML entities so URLs are valid
                 new_src = Content.decode_html_entities(src)
             end
         end
@@ -1484,16 +1328,13 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
             return "<img" .. attrs .. ">"
         end
 
-        -- Replace only the src attribute in attrs, preserving all others (width, height, alt, ...)
         local new_attrs
         if quote_char then
             new_attrs = attrs:gsub('(%ssrc%s*=%s*)["\'].-["\']', '%1' .. quote_char .. new_src .. quote_char, 1)
         else
             new_attrs = attrs:gsub('(%ssrc%s*=%s*)[^%s>]+', '%1' .. '"' .. new_src .. '"', 1)
         end
-        -- Safety fallback: if gsub missed, reconstruct manually
         if new_attrs == attrs then
-            -- Remove old src (any form) and append new one
             local cleaned = attrs:gsub('%ssrc%s*=%s*["\'][^"\']*["\']', ''):gsub('%ssrc%s*=%s*[^%s>]+', '')
             new_attrs = cleaned .. ' src="' .. new_src .. '"'
         end
@@ -1501,8 +1342,6 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     end)
 
     css = css or [[body { font-size: 1.05em; }]]
-    -- 段评交互通过 <a href="fanqie-para:N"> 链接实现，KOReader crengine
-    -- 不支持 JavaScript，点击链接会触发 onGotoLink 事件，插件拦截处理
     local html = [[<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1522,7 +1361,6 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     return path
 end
 
--- 按 book._search_source 锁定源取正文（不做多源 fallback）。
 function Content.fetch_chapter_content_locked(client, settings, book, chapter, opts)
     opts = opts or {}
     local src = book._search_source or "official"
@@ -1583,7 +1421,6 @@ function Content.fetch_chapter_html(client, settings, book, chapter, opts)
         error("fetch_chapter_content failed: " .. tostring(xhtml))
     end
 
-    -- 段评标记 CSS（[数字] 方括号形式，墨水屏黑白兼容，纯文本可靠渲染）
     local css = [[
 body { font-size: 1em; }
 p{
@@ -1612,7 +1449,6 @@ a.para-comment {
     local assets = {}
     local cache = settings:get("cache", {})
     local img_elapsed = 0
-    -- Match menu semantics: download unless explicitly disabled (nil/true → download)
     if cache.download_book_images ~= false then
         local used_names = {}
         local t_img = now_ms()
@@ -1635,14 +1471,11 @@ a.para-comment {
     book.cached_file = path
     book.item_id = chapter.itemId
     book.reader_url = book.reader_url or FanQie.reader_url(chapter.itemId)
-    
-    -- 存储段评数据到缓存
+
     if para_reviews and #para_reviews > 0 then
         Content.save_para_reviews_index(settings, book_id, item_id, para_reviews)
     end
 
-    -- skip_cache_index：子进程异步下载时由父进程统一持久化 cache_index.lua，
-    -- 避免子进程与父进程争写共享索引文件导致丢条目。
     local idx_elapsed = 0
     if not opts.skip_cache_index then
         local t_idx = now_ms()
@@ -1665,7 +1498,6 @@ a.para-comment {
     return path, chapter, para_reviews, rate_info
 end
 
--- 段评数据持久化：保存/加载每个章节的段评索引
 function Content.save_para_reviews_index(settings, book_id, item_id, para_reviews)
     local dir = Content.book_cache_dir(settings, book_id)
     H.make_dir(dir)
@@ -1694,7 +1526,6 @@ function Content.load_para_reviews_index(settings, book_id, item_id)
     return data
 end
 
--- 通用 Lua table 序列化（string/number/boolean/table，跳过其它类型）
 local function lua_serialize(v)
     local t = type(v)
     if t == "string" then
@@ -1721,89 +1552,59 @@ local function lua_serialize(v)
     return "nil"
 end
 
--- 读整章的段评正文缓存：{ [pid] = <API 原始 result>, ... }
-function Content.load_para_comments(settings, book_id, item_id)
+local function one_comment_path(settings, book_id, item_id, pid)
     local dir = Content.book_cache_dir(settings, book_id)
-    local path = H.join_path(dir, "para_comments_" .. tostring(item_id) .. ".lua")
-    if not H.file_exists(path) then return {} end
+    return H.join_path(dir,
+        "para_comments_" .. tostring(item_id) .. "_" .. tostring(pid) .. ".lua")
+end
+
+function Content.save_one_comment(settings, book_id, item_id, pid, result)
+    if not pid or not result then return end
+    local path = one_comment_path(settings, book_id, item_id, pid)
+    H.make_dir(path:match("^(.*)/[^/]+$"))
+    H.write_file(path, "return " .. lua_serialize(result))
+end
+
+function Content.load_one_comment(settings, book_id, item_id, pid)
+    if not pid then return nil end
+    local path = one_comment_path(settings, book_id, item_id, pid)
+    if not H.file_exists(path) then return nil end
     local ok, data = pcall(dofile, path)
     if ok and type(data) == "table" then return data end
-    return {}
+    return nil
 end
 
--- 计数文件：只存一行数字，读它不用 dofile 大文件
-local function comments_count_path(settings, book_id, item_id)
+function Content.has_one_comment(settings, book_id, item_id, pid)
+    if not pid then return false end
+    return H.file_exists(one_comment_path(settings, book_id, item_id, pid))
+end
+
+function Content.count_all_comments(settings, book_id)
     local dir = Content.book_cache_dir(settings, book_id)
-    return H.join_path(dir, "para_comments_" .. tostring(item_id) .. ".count")
-end
-
-function Content.load_comments_count(settings, book_id, item_id)
-    local path = comments_count_path(settings, book_id, item_id)
-    if not H.file_exists(path) then return nil end
-    local f = io.open(path, "r")
-    if not f then return nil end
-    local line = f:read("*l")
-    f:close()
-    return tonumber(line)
-end
-
-function Content.save_comments_count(settings, book_id, item_id, count)
-    local path = comments_count_path(settings, book_id, item_id)
-    local f = io.open(path, "w")
-    if f then
-        f:write(tostring(count or 0))
-        f:close()
+    local lfs = require("libs/libkoreader-lfs")
+    local counts = {}
+    if lfs.attributes(dir, "mode") ~= "directory" then return counts end
+    for entry in lfs.dir(dir) do
+        local iid = entry:match("^para_comments_(%d+)_%d+%.lua$")
+        if iid then
+            counts[iid] = (counts[iid] or 0) + 1
+        end
     end
+    return counts
 end
 
--- 单条写入（read-modify-write）。点气泡时拉到的正文用这个落盘。
-function Content.save_para_comment(settings, book_id, item_id, pid, result)
-    if not pid or not result then return end
+function Content.delete_chapter_comments(settings, book_id, item_id)
     local dir = Content.book_cache_dir(settings, book_id)
-    H.make_dir(dir)
-    local path = H.join_path(dir, "para_comments_" .. tostring(item_id) .. ".lua")
-
-    local existing = {}
-    if H.file_exists(path) then
-        local ok, data = pcall(dofile, path)
-        if ok and type(data) == "table" then existing = data end
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(dir, "mode") ~= "directory" then return end
+    local prefix = "para_comments_" .. tostring(item_id) .. "_"
+    for entry in lfs.dir(dir) do
+        if entry:sub(1, #prefix) == prefix and entry:sub(-4) == ".lua" then
+            os.remove(dir .. "/" .. entry)
+        end
     end
-
-    existing[tostring(pid)] = result
-
-    local parts = { "return {" }
-    for k, v in pairs(existing) do
-        parts[#parts + 1] = string.format("[%q]=%s,", tostring(k), lua_serialize(v))
-    end
-    parts[#parts + 1] = "}"
-    H.write_file(path, table.concat(parts, "\n"))
-
-    -- ★ 写计数文件
-    local n = 0
-    for _ in pairs(existing) do n = n + 1 end
-    Content.save_comments_count(settings, book_id, item_id, n)
 end
 
--- 批量写入（一次性覆盖整章文件）。后台落盘任务用这个。
-function Content.save_para_comments_batch(settings, book_id, item_id, all_results)
-    if not all_results then return end
-    local dir = Content.book_cache_dir(settings, book_id)
-    H.make_dir(dir)
-    local path = H.join_path(dir, "para_comments_" .. tostring(item_id) .. ".lua")
-
-    local parts = { "return {" }
-    local n = 0
-    for k, v in pairs(all_results) do
-        parts[#parts + 1] = string.format("[%q]=%s,", tostring(k), lua_serialize(v))
-        n = n + 1
-    end
-    parts[#parts + 1] = "}"
-    H.write_file(path, table.concat(parts, "\n"))
-
-    Content.save_comments_count(settings, book_id, item_id, n)
-end
-
--- 段评 records 落盘：一章一个文件，含 pos0/pos1/ident/count/para_index
 function Content.save_para_records(settings, book_id, item_id, records)
     if not records or #records == 0 then return end
     local dir = Content.book_cache_dir(settings, book_id)
@@ -1833,4 +1634,5 @@ function Content.load_para_records(settings, book_id, item_id)
     if ok and type(data) == "table" and #data > 0 then return data end
     return nil
 end
+
 return Content
