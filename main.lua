@@ -526,15 +526,37 @@ function FanQiePlugin:showParaReviewDetail(index)
 
     local self_ref = self
     local ident = pr.ident
-    local book_id = _state.current_book and _state.current_book.book_id or ""
+    -- ★ book_id 优先用 _local_review_book（本地段评匹配的云端书），
+    --   和 _background_cache_comments 落盘时用的 book.book_id 一致
+    local book_id = self._local_review_book and self._local_review_book.book_id
+    if not book_id or book_id == "" then
+        book_id = _state.current_book and _state.current_book.book_id or ""
+    end
     local review_index = index
     local total_reviews = #reviews
-    -- 气泡上的 count = 服务端该段评论总数（章节缓存 index 提供）。
-    -- 书山 /idea_comment 响应无 common_list_info，总数只能以此为权威来源。
     local bubble_count = tonumber(pr.count) or 0
 
-    -- 将段评获取（阻塞 HTTP）移到子进程，UI 线程仅轮询，不阻塞用户操作。
-    -- 子进程不可用时 Async.run 内部自动降级为延后同步。
+    -- 解析 item_id 和 pid
+    local item_id = tostring(ident):match("^%w+:[^:]+:([^:]+):")
+    local pid = tonumber(tostring(ident):match("(%d+)$"))
+
+    -- 先查本地磁盘缓存：命中直接渲染，不走网络
+    if item_id and pid then
+        local ok_content, Content = pcall(require, "fanqie.content")
+        if ok_content and Content and Content.load_para_comments then
+            local cached_map = Content.load_para_comments(self.settings, book_id, item_id)
+            local cached = cached_map and cached_map[tostring(pid)]
+            if cached then
+                if Log then Log.info("[段评] showParaReviewDetail: 本地缓存命中 item_id="
+                    .. tostring(item_id) .. " pid=" .. tostring(pid)
+                    .. " book_id=" .. tostring(book_id)) end
+                self:_displayParaReviewDetail(review_index, total_reviews, true, cached, nil, bubble_count)
+                return
+            end
+        end
+    end
+
+    -- 本地没有 → 走网络
     self:showBusy(_("正在获取段评..."))
     if Async and Async.run then
         Async.run(function()
@@ -543,18 +565,8 @@ function FanQiePlugin:showParaReviewDetail(index)
             local is_zhiqiu    = ident_str:find("zhiqiu:", 1, true)
             local is_shushan   = ident_str:find("shushan:", 1, true)
 
-            if Log then
-                Log.info("[段评] showParaReviewDetail(异步): idx=" .. tostring(review_index)
-                    .. " is_zhiqiu=" .. tostring(is_zhiqiu)
-                    .. " is_shushan=" .. tostring(is_shushan)
-                    .. " ident=" .. ident_str:sub(1, 80))
-            end
-
             local ok, result
             if is_shushan then
-                -- 书山自有段落级段评 JSON 通道（GET /idea_comment?api=1，2026-09-13 实测可用），
-                -- 不再依赖知秋。ident 格式 shushan:<bid>:<cid>:<pid>，返回番茄原生结构，
-                -- 与 _displayParaReviewDetail 解析器兼容。
                 ok, result = pcall(function() return c:shushan_get_para_review(ident, { count = 30, page_max = 1 }) end)
                 if not ok then
                     error("书山段评获取失败：" .. tostring(result or "")
@@ -563,23 +575,29 @@ function FanQiePlugin:showParaReviewDetail(index)
             elseif is_zhiqiu then
                 ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 }) end)
             else
-                -- 无法识别的 ident（多为旧缓存中已移除书源的历史段评）
                 error("无法识别段评来源: " .. ident_str:sub(1, 60))
             end
             if not ok then error(result or "段评获取失败") end
             return result
         end, function(ok, result, err)
+            -- 拉取成功后单条落盘（用同一个 book_id）
+            if ok and result and item_id and pid then
+                local ok_content, Content = pcall(require, "fanqie.content")
+                if ok_content and Content and Content.save_para_comment then
+                    pcall(Content.save_para_comment,
+                        self_ref.settings, book_id, item_id, pid, result)
+                end
+            end
             self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, err, bubble_count)
         end, { poll_interval = 0.125, timeout = 60 })
     else
-        -- 降级：Async 模块未加载（极端情况），同步执行
+        -- 降级同步路径
         local c = self_ref.client or Client:new(self_ref.settings)
         local ident_str = tostring(ident)
         local is_zhiqiu    = ident_str:find("zhiqiu:", 1, true)
         local is_shushan   = ident_str:find("shushan:", 1, true)
         local ok, result
         if is_shushan then
-            -- 书山自有段评通道（不依赖知秋）
             ok, result = pcall(function() return c:shushan_get_para_review(ident, { page_max = 2 }) end)
             if not ok then
                 error("书山段评获取失败：" .. tostring(result or "")
@@ -588,8 +606,15 @@ function FanQiePlugin:showParaReviewDetail(index)
         elseif is_zhiqiu then
             ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 }) end)
         else
-            -- 无法识别的 ident（多为旧缓存中已移除书源的历史段评）
             ok, result = false, "无法识别段评来源: " .. ident_str:sub(1, 60)
+        end
+        -- 同步路径也单条落盘
+        if ok and result and item_id and pid then
+            local ok_content, Content = pcall(require, "fanqie.content")
+            if ok_content and Content and Content.save_para_comment then
+                pcall(Content.save_para_comment,
+                    self_ref.settings, book_id, item_id, pid, result)
+            end
         end
         self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, nil, bubble_count)
     end
@@ -991,6 +1016,12 @@ function FanQiePlugin:getMainMenuItems()
         end,
         },
         {
+            text = _("本地书籍-段评缓存管理"),
+            callback = self:safeCallback(_("段评缓存管理"), function()
+                self:showReviewCacheManager()
+            end),
+        },
+        {
             text = _("下载管理"),
             callback = self:safeCallback(_("下载管理"), function()
                 self:showDownloadManager()
@@ -1150,6 +1181,205 @@ function FanQiePlugin:getSettingsMenuItems()
             end,
         },
     }
+end
+
+-- ===========================================================================
+-- 本地书籍-段评缓存管理
+-- ===========================================================================
+function FanQiePlugin:showReviewCacheManager()
+    local LocalReview = require("fanqie.local_review")
+
+    -- 没绑定 → 尝试从 binding 恢复
+    if not self._local_review_book or not self._local_review_book.book_id then
+        local doc = self.ui and self.ui.document
+        local file = doc and (doc.file or doc.path)
+        if file then
+            local bindings = LocalReview.load_bindings(self)
+            if bindings and bindings[file] and bindings[file].book_id then
+                self._local_review_book = bindings[file]
+            end
+        end
+    end
+
+    -- 还没绑定 → 弹搜索，绑定完继续
+    if not self._local_review_book or not self._local_review_book.book_id then
+        LocalReview.auto_match(self, function(book)
+            if not book then return end
+            self._local_review_book = book
+            self:showReviewCacheManager()
+        end)
+        return
+    end
+
+    local book = self._local_review_book
+    local Content = require("fanqie.content")
+
+    -- 读 catalog，没有就拉目录生成（静默，不弹提示）
+    local catalog = Content.load_catalog_cache(self.settings, book.book_id)
+    if not catalog or #catalog == 0 then
+        local client = self.client
+        local settings = self.settings
+        local book_id = book.book_id
+        Async.run(function()
+            local b = { book_id = book_id }
+            return Content.fetch_catalog(client, b)
+        end, function(ok, chapters, err)
+            if not ok or type(chapters) ~= "table" or #chapters == 0 then
+                self:showError(T(_("获取目录失败:\n%1"), tostring(err or chapters)))
+                return
+            end
+            Content.save_catalog_cache(settings, book_id, chapters, book.title, book.cover)
+            self:showReviewCacheManager()
+        end, { poll_interval = 0.3, timeout = 60 })
+        return
+    end
+
+    -- catalog 有了 → 列所有章，未拉取的显示 [未拉取]，点哪章下哪章
+    local list = LocalReview.list_review_cache(self, book)
+
+    local items = {}
+    for _, entry in ipairs(list) do
+        local review_count = entry.review_count or 0
+        local comment_count = entry.comment_count or 0
+        local text
+        if review_count == 0 then
+            text = string.format("%s  [未拉取]", entry.title or entry.item_id)
+        elseif comment_count >= review_count then
+            text = string.format("%s  [%d/%d] ✓", entry.title or entry.item_id, comment_count, review_count)
+        else
+            text = string.format("%s  [%d/%d]", entry.title or entry.item_id, comment_count, review_count)
+        end
+        table.insert(items, {
+            text = text,
+            callback = function()
+                self:_showReviewCacheChapterActions(book, entry)
+            end,
+        })
+    end
+
+    local menu = Menu:new{
+        title = _("段评缓存管理"),
+        item_table = items,
+        items_per_page = 12,
+        is_borderless = true,
+        is_popout = false,
+        close_callback = function()
+            _state.active_menu = nil
+        end,
+    }
+    _state.active_menu = menu
+    UIManager:show(menu)
+end
+
+function FanQiePlugin:_showReviewCacheChapterActions(book, entry)
+    local LocalReview = require("fanqie.local_review")
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local Notification = require("ui/widget/notification")
+
+    local dialog
+
+    local review_count = entry.review_count or 0
+    local comment_count = entry.comment_count or 0
+    local fully_cached = review_count > 0 and comment_count >= review_count
+    local has_reviews = review_count > 0
+
+    local buttons = {}
+
+    if fully_cached then
+        buttons[1] = {
+            {
+                text = _("删除缓存"),
+                callback = function()
+                    UIManager:close(dialog)
+                    UIManager:show(ConfirmBox:new{
+                        text = T(_("确定删除《%1》的段评缓存？"), entry.title or entry.item_id),
+                        ok_text = _("删除"),
+                        cancel_text = _("取消"),
+                        ok_callback = function()
+                            LocalReview.delete_chapter_review_cache(self, book, entry.item_id)
+                            UIManager:nextTick(function()
+                                UIManager:show(Notification:new{
+                                    text = _("已删除"),
+                                    timeout = 2,
+                                })
+                            end)
+                            UIManager:close(_state.active_menu)
+                            _state.active_menu = nil
+                            self:showReviewCacheManager()
+                        end,
+                    })
+                end,
+            },
+        }
+    elseif has_reviews then
+        buttons[1] = {
+            {
+                text = _("继续下载"),
+                callback = function()
+                    UIManager:close(dialog)
+                    LocalReview.continue_chapter_review_cache(self, book, entry.item_id)
+                    UIManager:nextTick(function()
+                        UIManager:show(Notification:new{
+                            text = _("已加入后台下载队列"),
+                            timeout = 2,
+                        })
+                    end)
+                end,
+            },
+            {
+                text = _("删除缓存"),
+                callback = function()
+                    UIManager:close(dialog)
+                    UIManager:show(ConfirmBox:new{
+                        text = T(_("确定删除《%1》的段评缓存？"), entry.title or entry.item_id),
+                        ok_text = _("删除"),
+                        cancel_text = _("取消"),
+                        ok_callback = function()
+                            LocalReview.delete_chapter_review_cache(self, book, entry.item_id)
+                            UIManager:nextTick(function()
+                                UIManager:show(Notification:new{
+                                    text = _("已删除"),
+                                    timeout = 2,
+                                })
+                            end)
+                            UIManager:close(_state.active_menu)
+                            _state.active_menu = nil
+                            self:showReviewCacheManager()
+                        end,
+                    })
+                end,
+            },
+        }
+    else
+        buttons[1] = {
+            {
+                text = _("拉取并下载"),
+                callback = function()
+                    UIManager:close(dialog)
+                    LocalReview.continue_chapter_review_cache(self, book, entry.item_id)
+                    UIManager:nextTick(function()
+                        UIManager:show(Notification:new{
+                            text = _("已加入后台下载队列"),
+                            timeout = 2,
+                        })
+                    end)
+                end,
+            },
+        }
+    end
+
+    dialog = ButtonDialog:new{
+        title = string.format("%s\n%s",
+            entry.title or entry.item_id,
+            fully_cached
+                and string.format("共 %d 段段评，已全部缓存", review_count)
+                or (has_reviews
+                    and string.format("共 %d 段段评，已缓存 %d 段", review_count, comment_count)
+                    or _("该章段评未拉取"))),
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
 end
 
 -- ===========================================================================
@@ -2006,12 +2236,11 @@ function FanQiePlugin:_doSearch(keyword, opts)
         })
         return
     end
-    self:showBusy(_("正在搜索..."))
+    self:showTransientInfo(_("正在搜索..."), 2)
     local client = self.client
     Async.run(function()
         return client:search_with_fallback(keyword)
     end, function(ok, books, err)
-        self:closeBusy()
         if not ok or type(books) ~= "table" then
             self:showError(T(_("搜索失败:\n%1"), display_error(err or books)))
             return
@@ -2817,25 +3046,25 @@ function FanQiePlugin:reloadCurrentChapter()
     local book = _state.current_book
     local chapters = _state.current_chapters
     local current_idx = _state.current_chapter_index
-    
+
     if not book or not chapters or not current_idx then
         self:showInfo(_("没有可重新获取的章节"))
         return
     end
-    
+
     local chapter = chapters[current_idx]
     if not chapter then return end
-    
+
     local item_id = tostring(chapter.itemId)
     local cached_chapters = getCachedChapters(self, book)
     local existing_path = cached_chapters[item_id]
-    
+
     -- Delete cached file if exists
     if existing_path and H.file_exists(existing_path) then
         os.remove(existing_path)
         if Log then Log.info("deleted cached chapter:", item_id) end
     end
-    
+
     -- Also try to delete from expected location
     local expected_path = Content.book_cache_dir(self.settings, book.book_id) .. "/chapter_" .. item_id .. ".html"
     if H.file_exists(expected_path) then
@@ -2849,12 +3078,27 @@ function FanQiePlugin:reloadCurrentChapter()
         os.remove(para_reviews_path)
         if Log then Log.info("deleted para_reviews index:", item_id) end
     end
+
+    -- ★ 删除段评正文缓存，确保重新拉取
+    local para_comments_path = Content.book_cache_dir(self.settings, book.book_id) .. "/para_comments_" .. item_id .. ".lua"
+    if H.file_exists(para_comments_path) then
+        os.remove(para_comments_path)
+        if Log then Log.info("deleted para_comments cache:", item_id) end
+    end
+
+    -- ★ 删除段评 records 缓存，确保重新 findText 定位
+    local para_records_path = Content.book_cache_dir(self.settings, book.book_id) .. "/para_records_" .. item_id .. ".lua"
+    if H.file_exists(para_records_path) then
+        os.remove(para_records_path)
+        if Log then Log.info("deleted para_records cache:", item_id) end
+    end
+
     _state.clearParaReviews()
 
     -- Clear cache index entry
     cached_chapters[item_id] = nil
     Content.save_cache_index(self.settings, book.book_id, cached_chapters)
-    
+
     -- Re-download
     self:navigateToChapter(book, chapters, current_idx, {
         error_message = "重新获取章节失败:\n%1",
