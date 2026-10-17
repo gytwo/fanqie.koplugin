@@ -15,7 +15,7 @@ local SourceManager = {}
 -- Used for menu display, configuration checks and fetcher dispatch.
 SourceManager.REGISTRY = {
     official = {
-        name = "官方API（解码）",
+        name = "官方源（App协议）",
         configurable = false,
     },
     zhiqiu = {

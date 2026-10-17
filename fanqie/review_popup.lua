@@ -101,6 +101,7 @@ function M.show(opts)
         para_nav = opts.para_nav,
         more_text = opts.more_text,
         on_more = opts.on_more,
+        on_replies = opts.on_replies,
     }
     _pool[position] = popup
     UIManager:show(popup)

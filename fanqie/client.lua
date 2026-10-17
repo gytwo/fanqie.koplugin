@@ -158,7 +158,7 @@ function Client:new(settings)
     }, self)
     -- Source fetcher dispatch table: source_id -> function(book_id, item_id, opts).
     obj._source_fetchers = {
-        official = function(bid, iid) return obj:official_get_content(bid, iid) end,
+        official = function(bid, iid, opts) return obj:official_get_content(bid, iid, opts) end,
         zhiqiu = function(bid, iid, opts) return obj:zhiqiu_get_content(bid, iid, opts) end,
         shushan = function(bid, iid, opts) return obj:shushan_get_content(bid, iid, opts) end,
     }
@@ -517,9 +517,121 @@ function Client:fetch_chapter_directory(book_id)
     error(err_msg)
 end
 
--- Fetch chapter content via the official FanQie API (public, no login needed).
+-- 官方源是否使用 App reading 协议（默认开）。
+-- 关掉后回到旧的网页正文接口（`/api/reader/chapter/content`，现已 404）。
+function Client:official_use_app_protocol()
+    local ok, value = pcall(function() return self.settings:get("official_use_app", true) end)
+    if not ok then return true end
+    return value ~= false
+end
+
+-- 清除本机注册的番茄 App 设备身份与章节密钥缓存，下次取正文时重新注册。
+-- 设备身份被风控（连续空响应/403）时用这个重置。
+function Client:official_app_reset_identity()
+    local ok_set = pcall(function() self.settings:set("reading_device", nil) end)
+    local ok_key = pcall(function() self.settings:set("reading_v1_key", nil) end)
+    pcall(function() self.settings:flush() end)
+    return ok_set and ok_key
+end
+
+-- 段评气泡注入（官方 App 协议）。
+-- App 正文是 HTML，段落形如 <p idx="N" p_idx="40000"><blk p_idx="N">正文</blk></p>，
+-- blk 的 p_idx 正是段评统计（idea/list）用的段落序号。把
+-- <comment ident="official:<book>/<item>/<pid>" count="N" /> 插到该段落 </p> 前，
+-- 后续交给 content.lua 既有的气泡清洗管线处理。
+-- 返回 (注入后的正文, para_reviews)，para_reviews 顺序与气泡序号一致。
+local function inject_comment_tags(content, book_id, item_id, stats)
+    local para_reviews = {}
+    if type(content) ~= "string" or type(stats) ~= "table" then
+        return content, para_reviews
+    end
+    local out = content:gsub("(<p%s[^>]*>[%s%S]-</p>)", function(seg)
+        local pid = tonumber(seg:match('<blk[^>]*p_idx="(%d+)"'))
+        local info = pid and stats[pid]
+        local n = info and (tonumber(info.count) or 0) or 0
+        if n > 0 and not seg:find("<comment", 1, true) then
+            local ident = string.format("official:%s:%s:%d", book_id, item_id, pid)
+            table.insert(para_reviews, { ident = ident, count = n })
+            local tag = string.format('<comment ident="%s" count="%d" />', ident, n)
+            return seg:sub(1, -5) .. tag .. "</p>"
+        end
+        return seg
+    end)
+    return out, para_reviews
+end
+
+-- 通过番茄 App reading 协议取正文：设备注册 → registerkey → batch_full → 本地解密。
+-- opts.review = true 时顺带拉段评统计并注入气泡（失败不阻塞正文）。
+-- 返回 {content, title, author, source="official_reading", para_reviews} 或 (nil, err)。
+function Client:official_app_get_content(book_id, item_id, opts)
+    opts = opts or {}
+    local Reading = require("fanqie.reading")
+    local row, err = Reading.fetch(self, self.settings, book_id, item_id)
+    if type(row) ~= "table" or type(row.content) ~= "string" or row.content == "" then
+        return nil, err or "App 协议未返回正文"
+    end
+
+    local para_reviews = {}
+    if opts.review then
+        local ok_log, logger_mod = pcall(require, "fanqie.logger")
+        local log_info = function(...) if ok_log and logger_mod then pcall(logger_mod.info, ...) end end
+        local log_warn = function(...) if ok_log and logger_mod then pcall(logger_mod.warn, ...) end end
+
+        -- Comments.stats 失败时返回 (nil, err)：必须留痕，否则「没气泡」会被
+        -- 误判成「本章本来就没有段评」。
+        local ok_stats, stats, stats_err = pcall(function()
+            local Comments = require("fanqie.reading.comments")
+            return Comments.stats(self, self.settings, item_id)
+        end)
+        if not ok_stats then
+            stats, stats_err = nil, stats
+        end
+        if type(stats) == "table" then
+            local ok_inject, content2, reviews = pcall(inject_comment_tags,
+                row.content or "", tostring(book_id), tostring(item_id), stats)
+            if ok_inject then
+                row.content = content2
+                para_reviews = reviews or {}
+            else
+                log_warn("[FanQie][official] 段评气泡注入失败:",
+                    tostring(content2))
+            end
+            local para_n = 0
+            for _ in pairs(stats) do para_n = para_n + 1 end
+            log_info("[FanQie][official] 段评统计注入:",
+                "itemId=" .. tostring(item_id),
+                "paras=" .. tostring(para_n),
+                "bubbles=" .. tostring(#para_reviews))
+        else
+            log_warn("[FanQie][official] 段评统计获取失败（正文不带气泡）:",
+                tostring(stats_err or stats))
+        end
+    end
+
+    row.para_reviews = para_reviews
+    return row
+end
+
+-- Fetch chapter content via the official FanQie API.
+-- 优先走 App reading 协议（v2.3.0 起官方唯一可用路径）；失败则回退到旧的
+-- 网页接口（公共、无需登录，现多返回 404，仅作兜底）。
 -- Returns {content, title, author} on success; errors on failure.
-function Client:official_get_content(book_id, item_id)
+function Client:official_get_content(book_id, item_id, opts)
+    if self:official_use_app_protocol() then
+        local ok, row, err = pcall(function()
+            return self:official_app_get_content(book_id, item_id, opts)
+        end)
+        if ok and type(row) == "table" and type(row.content) == "string" and #row.content > 0 then
+            return row
+        end
+        local reason = ok and tostring(err) or ("App协议异常: " .. tostring(row))
+        local ok_log, logger_mod = pcall(require, "fanqie.logger")
+        if ok_log and logger_mod and logger_mod.info then
+            pcall(logger_mod.info, "[FanQie][official] App协议失败，回退网页接口:", reason)
+        end
+        self._official_app_error = reason
+    end
+
     local url = FanQie.chapter_content_url(book_id, item_id)
     local result = self:get_json(url)
     if type(result) == "table" and result.data then
@@ -540,6 +652,91 @@ function Client:official_get_content(book_id, item_id)
             tostring(item_id), table.concat(keys, ",")))
     end
     error(string.format("官方API响应无效: itemId=%s, type=%s", tostring(item_id), type(result)))
+end
+
+-- ============================================================================
+-- 官方 App 段评（/novel/commentapi/comment/list）— 官方源的段评列表通道
+-- ident 格式：official:<bid>:<cid>:<pid>（pid 为 App 正文 blk 的段落序号）
+-- opts: { count, cursor, sort, item_version }
+--
+-- 返回结构刻意做成与书山/知秋一致的「新格式」
+--   { data = { data_list = {...}, common_list_info = {total,has_more,cursor} } }
+-- 这样 main.lua 既有的解析器、气泡总数兜底、续拉游标全部原样复用。
+-- 失败返回 (nil, err)，绝不返回空页 —— 否则上层会显示成「共 0 条评论」。
+-- ============================================================================
+--- 官方源段评的二级评论（回复列表）。
+--- 返回 { replies = 扁平回复数组, total, has_more, cursor } 或 (nil, err)。
+--- 回复在接口里是平铺的，层级靠 reply_to_reply_id 指父回复；
+--- 展示按时间顺序平铺 + 「回复 @某人」前缀，阅读体验和树形一致且不会丢条。
+function Client:official_get_para_replies(comment_id, opts)
+    opts = opts or {}
+    comment_id = tostring(comment_id or "")
+    if comment_id == "" then
+        return nil, "缺少段评 ID"
+    end
+    local Comments = require("fanqie.reading.comments")
+    local list, info, err = Comments.replies(self, self.settings, comment_id, {
+        count = tonumber(opts.count) or 20,
+        cursor = tostring(opts.cursor or ""),
+    })
+    if not list then
+        return nil, err or "官方段评回复获取失败"
+    end
+    local flat = {}
+    for _, item in ipairs(list) do
+        flat[#flat + 1] = Comments.flatten_reply(item)
+    end
+    info = type(info) == "table" and info or {}
+    local total = tonumber(info.total) or #flat
+    local has_more = info.has_more
+    if has_more == nil then
+        local cursor = tostring(info.cursor or "")
+        has_more = (cursor ~= "" and cursor ~= "0" and #flat > 0)
+    end
+    return {
+        replies = flat,
+        total = total,
+        has_more = has_more,
+        cursor = info.cursor,
+    }
+end
+
+function Client:official_get_para_review(ident, opts)
+    opts = opts or {}
+    local book_id, item_id, pid = tostring(ident):match("^official:(%d+):(%d+):(%d+)$")
+    if not book_id then
+        return nil, "段评标识无效（官方源）: " .. tostring(ident):sub(1, 60)
+    end
+    local Comments = require("fanqie.reading.comments")
+    local data_list, info, err = Comments.list(self, self.settings, item_id, book_id,
+        tonumber(pid), {
+            count = tonumber(opts.count) or 20,
+            cursor = tostring(opts.cursor or ""),
+            sort = tonumber(opts.sort) or 0,
+            item_version = opts.item_version,
+        })
+    if not data_list then
+        return nil, err or "官方段评列表获取失败"
+    end
+    info = type(info) == "table" and info or {}
+    local total = tonumber(info.total) or #data_list
+    -- has_more 缺失时用游标兜底：接口给了下一页游标就说明还有内容，
+    -- 否则「继续加载」按钮永远不出现（总数已知却只能看第一页）。
+    local has_more = info.has_more
+    if has_more == nil then
+        local cursor = tostring(info.cursor or "")
+        has_more = (cursor ~= "" and cursor ~= "0")
+    end
+    return {
+        data = {
+            data_list = data_list,
+            common_list_info = {
+                total = total,
+                has_more = has_more,
+                cursor = info.cursor,
+            },
+        },
+    }
 end
 
 -- ============================================================================

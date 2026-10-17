@@ -72,11 +72,18 @@ end
 local function itemsKey(items)
     local parts = {}
     for _, item in ipairs(items or {}) do
-        parts[#parts + 1] = string.format("%s|%s|%s|%d",
+        -- 回复展开状态必须进 key：否则「展开」后内容变了、key 没变，
+        -- setContent 会认为无需重排，弹窗永远看不到新加载的回复。
+        parts[#parts + 1] = string.format("%s|%s|%s|%d|%s|%s|%d|%s|%s",
             tostring(item.abstract or ""),
             tostring(item.author or ""),
             tostring(item.content or ""),
-            tonumber(item.likes_count) or 0)
+            tonumber(item.likes_count) or 0,
+            tostring(tonumber(item.reply_count) or 0),
+            tostring(item.replies_expanded and 1 or 0),
+            (type(item.replies) == "table") and #item.replies or 0,
+            tostring(item.replies_more and 1 or 0),
+            tostring(item.replies_loading and 1 or 0))
     end
     return table.concat(parts, "\n")
 end
@@ -207,8 +214,25 @@ function PageRenderer:paginate()
     for _, block in ipairs(blocks) do
         if block.kind == "paragraph" then
             y = y + math.floor(base_size * (block.spacing_before or 0) + 0.5)
-            addTextPiece(block.variant, block.text, block.fg, text_w, 0,
-                block.variant == "meta")
+            -- 回复块缩进：层级 * 约 1.15 个字宽，正文宽度同步收窄
+            local level = tonumber(block.indent_level) or 0
+            local indent = 0
+            if level > 0 then
+                indent = math.floor(base_size * 1.15 * level)
+                if indent > text_w / 2 then indent = math.floor(text_w / 2) end
+            end
+            local block_w = text_w - indent
+            if block_w < 10 then block_w = 10 end
+            local before = #pieces
+            addTextPiece(block.variant, block.text, block.fg, block_w, indent,
+                block.variant == "meta" or block.variant == "reply_meta")
+            if #pieces > before then
+                local piece = pieces[#pieces]
+                -- 弹窗靠这两个字段做点击命中：只有带 action 的行会拦截点击，
+                -- 其余区域仍旧翻页。
+                piece.action = block.action
+                piece.item_index = block.item_index
+            end
             y = y + math.floor(base_size * (block.spacing_after or 0) + 0.5)
         end
     end

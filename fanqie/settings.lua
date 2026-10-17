@@ -45,6 +45,9 @@ local defaults = {
     para_review_enabled = false,
     download_dir = "",
     config_loaded = true,
+    -- 官方源正文走 App reading 协议（设备注册 + 四神签名 + 本地解密）。
+    -- 关闭后回退旧的网页接口（现已基本 404），一般不需要关。
+    official_use_app = true,
     -- Book source management
     sources = {
         official = {

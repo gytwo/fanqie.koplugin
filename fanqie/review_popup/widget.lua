@@ -63,6 +63,9 @@ local ThoughtPopupWidget = InputContainer:extend{
     more_text = nil,
     on_more = nil,
     _more_busy = false,
+    -- 二级评论回调：on_replies(item, cursor, done)，
+    -- done(ok, result, err)，result = { replies, total, has_more, cursor }
+    on_replies = nil,
     -- 续拉重开后恢复的滚动位置（内容坐标）；_buildLayout 消费后清零
     _restore_offset = nil,
 
@@ -150,6 +153,7 @@ function ThoughtPopupWidget:_reopen(opts)
     self.para_nav = opts.para_nav
     self.more_text = opts.more_text
     self.on_more = opts.on_more
+    self.on_replies = opts.on_replies
     self.height_ratio = math.max(0.1, math.min(0.9, self.height_ratio or 0.70))
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
 
@@ -286,6 +290,15 @@ function ThoughtPopupWidget:onTapClose(_, ges)
         UIManager:close(self)
         return true
     end
+    -- 二级评论入口优先于翻页：只有「展开/收起/继续加载」这几行会拦截点击
+    local scroll = self._scroll_container
+    if scroll and scroll.dimen and ges.pos:intersectWith(scroll.dimen) then
+        local content_y = (ges.pos.y - scroll.dimen.y) + (scroll.scroll_offset or 0)
+        local piece = self:_findActionPieceAtContentY(content_y)
+        if piece and self:_handleReplyAction(piece) then
+            return true
+        end
+    end
     -- Optional tap-to-page: tapping the left/right half of the bar pages
     -- up/down through the review list (same feel as the weread centered popup).
     -- When everything fits on one page, scrollToPage is a no-op.
@@ -350,6 +363,115 @@ function ThoughtPopupWidget:_findItemAtContentY(y)
         end
     end
     return nil
+end
+
+--- 命中测试：只找带 action 的行（展开/收起/继续加载回复）。
+--- 返回 piece（含 action / item_index）。
+function ThoughtPopupWidget:_findActionPieceAtContentY(y)
+    local pieces = self._pages and self._pages.layout and self._pages.layout.pieces
+    if not pieces then return nil end
+    for _, piece in ipairs(pieces) do
+        if piece.action and piece.y and piece.piece_h
+            and piece.y <= y and y < piece.y + piece.piece_h then
+            return piece
+        end
+    end
+    return nil
+end
+
+--- 重新分页并重建布局，保留当前滚动位置。
+--- 展开/收起回复会改变内容高度，必须整体重排（缓存 key 里带了回复状态）。
+function ThoughtPopupWidget:_refreshAfterReplyChange()
+    local offset = (self._scroll_container and self._scroll_container.scroll_offset) or 0
+    self._restore_offset = offset
+    self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
+        self.doc_margins, self.height_ratio, nil, self.contrast)
+    self:_buildLayout()
+    UIManager:setDirty(self, function()
+        return "partial", self.container.dimen
+    end)
+end
+
+function ThoughtPopupWidget:_handleReplyAction(piece)
+    local item = self.items and self.items[tonumber(piece.item_index) or 0]
+    if not item or not self.on_replies then return false end
+
+    if piece.action == "toggle_replies" then
+        if item.replies_loading then return true end
+        if item.replies_expanded then
+            item.replies_expanded = false
+            self:_refreshAfterReplyChange()
+            return true
+        end
+        if type(item.replies) == "table" and #item.replies > 0 then
+            item.replies_expanded = true
+            self:_refreshAfterReplyChange()
+            return true
+        end
+        -- 首次展开：先把「正在加载」显示出来，再去拉数据，避免点了没反应
+        item.replies_expanded = true
+        item.replies_loading = true
+        self:_refreshAfterReplyChange()
+        self:_fetchReplies(item, nil)
+        return true
+    end
+
+    if piece.action == "more_replies" then
+        if item.replies_loading then return true end
+        item.replies_loading = true
+        self:_refreshAfterReplyChange()
+        self:_fetchReplies(item, item.replies_cursor)
+        return true
+    end
+
+    return false
+end
+
+function ThoughtPopupWidget:_fetchReplies(item, cursor)
+    local widget = self
+    local function done(ok, result, err)
+        item.replies_loading = false
+        if ok and type(result) == "table" and type(result.replies) == "table" then
+            item.replies = item.replies or {}
+            for _, r in ipairs(result.replies) do
+                item.replies[#item.replies + 1] = r
+            end
+            item.replies_total = tonumber(result.total) or #item.replies
+            item.replies_more = result.has_more == true
+            item.replies_cursor = result.cursor
+            item.replies_expanded = true
+            if (tonumber(item.reply_count) or 0) < (tonumber(item.replies_total) or 0) then
+                item.reply_count = item.replies_total
+            end
+        else
+            -- 拉失败就收起，不留一个"展开中"的空壳；下次点会重新请求
+            item.replies_expanded = false
+            local reason = tostring(err or result or "未知原因")
+            item.replies_error = reason
+            -- 具体原因一并显示：「可能被风控」「HTTP 4xx」「返回为空」这类
+            -- 信息直接决定用户该重试还是该换节点，藏在日志里等于没给。
+            local brief = reason:gsub("%s+", " ")
+            if #brief > 60 then brief = brief:sub(1, 60) .. "…" end
+            local ok_msg = pcall(function()
+                UIManager:show(require("ui/widget/infomessage"):new{
+                    text = "回复加载失败：" .. brief,
+                })
+            end)
+            _ = ok_msg
+            local ok_log, log_mod = pcall(require, "fanqie.logger")
+            if ok_log and log_mod and log_mod.warn then
+                pcall(log_mod.warn, "[段评] 回复加载失败: " .. reason)
+            end
+        end
+        widget:_refreshAfterReplyChange()
+    end
+
+    local ok_call = pcall(self.on_replies, item, cursor, done)
+    if not ok_call then
+        item.replies_loading = false
+        item.replies_expanded = false
+        self:_refreshAfterReplyChange()
+    end
 end
 
 function ThoughtPopupWidget:_showThoughtActionMenu(item)

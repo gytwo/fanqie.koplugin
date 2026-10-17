@@ -507,16 +507,26 @@ function FanQiePlugin:showParaReviewDetail(index)
             local ident_str = tostring(ident)
             local is_zhiqiu    = ident_str:find("zhiqiu:", 1, true)
             local is_shushan   = ident_str:find("shushan:", 1, true)
+            local is_official  = ident_str:find("official:", 1, true)
 
             if Log then
                 Log.info("[段评] showParaReviewDetail(异步): idx=" .. tostring(review_index)
                     .. " is_zhiqiu=" .. tostring(is_zhiqiu)
                     .. " is_shushan=" .. tostring(is_shushan)
+                    .. " is_official=" .. tostring(is_official)
                     .. " ident=" .. ident_str:sub(1, 80))
             end
 
             local ok, result
-            if is_shushan then
+            if is_official then
+                -- 官方 App 段评通道（/novel/commentapi/comment/list），
+                -- 与官方正文同一条签名链路；ident 格式 official:<bid>:<cid>:<pid>。
+                ok, result = pcall(function() return c:official_get_para_review(ident, { count = 20 }) end)
+                if not ok then
+                    error("官方段评获取失败：" .. tostring(result or "")
+                        .. "（若持续失败可在书源管理里重置官方设备身份）")
+                end
+            elseif is_shushan then
                 -- 书山自有段落级段评 JSON 通道（GET /idea_comment?api=1，2026-09-13 实测可用），
                 -- 不再依赖知秋。ident 格式 shushan:<bid>:<cid>:<pid>，返回番茄原生结构，
                 -- 与 _displayParaReviewDetail 解析器兼容。
@@ -542,8 +552,14 @@ function FanQiePlugin:showParaReviewDetail(index)
         local ident_str = tostring(ident)
         local is_zhiqiu    = ident_str:find("zhiqiu:", 1, true)
         local is_shushan   = ident_str:find("shushan:", 1, true)
+        local is_official  = ident_str:find("official:", 1, true)
         local ok, result
-        if is_shushan then
+        if is_official then
+            ok, result = pcall(function() return c:official_get_para_review(ident, { count = 20 }) end)
+            if not ok then
+                error("官方段评获取失败：" .. tostring(result or ""))
+            end
+        elseif is_shushan then
             -- 书山自有段评通道（不依赖知秋）
             ok, result = pcall(function() return c:shushan_get_para_review(ident, { page_max = 2 }) end)
             if not ok then
@@ -591,6 +607,10 @@ local function _parseParaReviewResult(result)
                 local stat = c.stat or {}
 
                 table.insert(comments, {
+                    -- ⚠️ comment_id 必须带出来：官方源的「展开 N 条回复」
+                    -- 全靠它拼 reply/list 的地址，漏掉就会在点击时报
+                    -- 「缺少段评 ID」（2026-10-17 实测踩过）。
+                    comment_id = c.comment_id,
                     username = base_info.user_name or common.user_name or "匿名",
                     text = content.text or common.text or "",
                     like_count = stat.digg_count or 0,
@@ -617,8 +637,10 @@ local function _parseParaReviewResult(result)
     return comments, total, cursor, has_more
 end
 
--- 归一化为富排版 items：{ abstract, author, content, likes_count }（过滤空正文）
-local function _normParaRichItems(comments, abstract)
+-- 归一化为富排版 items：{ abstract, author, content, likes_count }
+-- supports_replies 为真时额外携带 comment_id / reply_count / 展开状态，
+-- 供弹窗渲染「展开 N 条回复」入口（目前只有官方源支持）。
+local function _normParaRichItems(comments, abstract, supports_replies)
     local rich_items = {}
     for _, comment in ipairs(comments or {}) do
         local username = tostring(comment.username or comment.user_name
@@ -629,12 +651,18 @@ local function _normParaRichItems(comments, abstract)
         local like_count = tonumber(comment.like_count or comment.likeCount
             or comment.digg_count) or 0
         if content_text ~= "" then
-            table.insert(rich_items, {
+            local item = {
                 abstract = abstract,
                 author = username,
                 content = content_text,
                 likes_count = like_count,
-            })
+            }
+            if supports_replies then
+                item.comment_id = comment.comment_id
+                item.reply_count = tonumber(comment.reply_count) or 0
+                item.can_replies = true
+            end
+            table.insert(rich_items, item)
         end
     end
     return rich_items
@@ -717,7 +745,9 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
         end
 
         -- 归一化 items: { abstract, author, content, likes_count }
-        local rich_items = _normParaRichItems(comments, abstract)
+        -- 只有官方源接了二级评论接口，其它书源不渲染「展开回复」入口
+        local supports_replies = tostring(ident or ""):find("official:", 1, true) ~= nil
+        local rich_items = _normParaRichItems(comments, abstract, supports_replies)
 
         if #rich_items == 0 then
             self:showInfo(T(_("本条段评共 %1 条评论，暂无显示数据"), tostring(total)))
@@ -824,6 +854,48 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                 o.more_text = nil
                 o.on_more = nil
             end
+            -- 二级评论：弹窗里点「展开 N 条回复」时回调到这里拉取。
+            -- done(ok, result, err)，result = { replies, total, has_more, cursor }
+            o.on_replies = function(item, cursor, done)
+                local st2 = _para_more_state
+                if not st2 or type(item) ~= "table" then
+                    return done(false, nil, "段评上下文已失效")
+                end
+                if not tostring(st2.ident or ""):find("official:", 1, true) then
+                    return done(false, nil, "当前书源不支持回复")
+                end
+                local cid = item.comment_id
+                if cid == nil or tostring(cid) == "" then
+                    return done(false, nil, "缺少段评 ID")
+                end
+                if Log then
+                    Log.info("[段评] 展开回复: cid=" .. tostring(cid)
+                        .. " type=" .. type(cid)
+                        .. " len=" .. tostring(#tostring(cid))
+                        .. " cursor=" .. tostring(cursor))
+                end
+                Async.run(function()
+                    local c = Client:new(self.settings)
+                    local res, rerr = c:official_get_para_replies(cid, {
+                        cursor = cursor, count = 20,
+                    })
+                    -- ⚠️ Async 的子进程只序列化**第一个**返回值：`return nil, err`
+                    -- 会让父进程拿到 ok=true, result=nil，失败原因直接蒸发，
+                    -- 用户只能看到笼统的「回复加载失败」。必须 error() 抛出去。
+                    if type(res) ~= "table" then
+                        error(tostring(rerr or "段评回复获取失败"), 0)
+                    end
+                    return res
+                end, function(ok3, res3, err3)
+                    if not ok3 or type(res3) ~= "table" then
+                        if Log then
+                            Log.warn("[段评] 展开回复失败: cid=" .. tostring(cid)
+                                .. " err=" .. tostring(err3 or res3))
+                        end
+                    end
+                    done(ok3, res3, err3)
+                end, { poll_interval = 0.125, timeout = 45 })
+            end
             -- 续拉重开恢复滚动位置；点新段落打开时不恢复（从第一页看起）
             o.restore_scroll = st.restoring or nil
             st.restoring = false
@@ -841,7 +913,12 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             end
             Async.run(function()
                 local c = Client:new(self.settings)
-                return c:shushan_get_para_review(st.ident,
+                local idt = st.ident
+                if idt:find("official:", 1, true) then
+                    return c:official_get_para_review(idt,
+                        { cursor = st.cursor, count = 20 })
+                end
+                return c:shushan_get_para_review(idt,
                     { cursor = st.cursor, count = 20, page_max = 1 })
             end, function(ok2, result2, err2)
                 st.busy = false
@@ -857,7 +934,8 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                     if abstract2 == "" and st.rich_items[1] then
                         abstract2 = st.rich_items[1].abstract or ""
                     end
-                    local new_items = _normParaRichItems(comments2, abstract2)
+                    local new_items = _normParaRichItems(comments2, abstract2,
+                        tostring(st.ident or ""):find("official:", 1, true) ~= nil)
                     for _, it in ipairs(new_items) do
                         table.insert(st.rich_items, it)
                     end
@@ -1142,6 +1220,48 @@ function FanQiePlugin:getSourceDetailMenuItems(source_id)
                 local c = self.settings:get_source(source_id)
                 self.settings:set_source_field(source_id, "enabled", c.enabled == false)
                 if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        })
+    end
+
+    -- Official source: 正文走哪条协议（App reading 协议 / 老的网页接口）
+    if source_id == "official" then
+        table.insert(items, {
+            text_func = function()
+                if self.settings:get("official_use_app", true) ~= false then
+                    return _("正文协议: App协议（推荐）")
+                end
+                return _("正文协议: 网页接口（旧，多已失效）")
+            end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                local use_app = self.settings:get("official_use_app", true) ~= false
+                self.settings:set("official_use_app", not use_app)
+                self.settings:flush()
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        })
+        table.insert(items, {
+            text_func = function()
+                local dev = self.settings:get("reading_device", nil)
+                if type(dev) == "table" and dev.device_id then
+                    return _("设备身份: 已注册") .. " (" .. tostring(dev.device_id):sub(-6) .. ")"
+                end
+                return _("设备身份: 未注册（首次取正文时自动注册）")
+            end,
+            keep_menu_open = true,
+        })
+        table.insert(items, {
+            text = _("重置设备身份"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self.settings:set("reading_device", nil)
+                self.settings:set("reading_v1_key", nil)
+                self.settings:flush()
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+                UIManager:show(InfoMessage:new{
+                    text = _("已清除设备身份与章节密钥，下次取正文会重新注册"), timeout = 3,
+                })
             end,
         })
     end
