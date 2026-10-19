@@ -195,6 +195,28 @@ local function buildRegisterRequest(client, profile)
         }
 end
 
+--- device_register 响应里的 device_id / install_id 也可能是 19 位裸数字，
+--- 同样会被 JSON 解码按 double 抹平（末位丢失，tostring 甚至给出 7.3e+18）。
+--- 这种坏值会被持久化进 settings，之后每次启动都带着它请求，只能手动清配置才能恢复，
+--- 所以在解码前就给这两个键的超长裸数字补引号，让它们以字符串原样保留。
+--- 键名带引号匹配：已加引号的字符串、以及 *_str 变体（引号后是 _ 不是 :）都不会被误伤。
+local BIGINT_ID_FIELDS = { "device_id", "install_id" }
+
+local function quote_bigint_ids(text)
+    if type(text) ~= "string" or text == "" then
+        return text
+    end
+    for _i, key in ipairs(BIGINT_ID_FIELDS) do
+        text = text:gsub('"' .. key .. '"%s*:%s*(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)', function(v)
+            if #v < 16 then
+                return nil          -- 15 位以内仍在 double 精确范围内
+            end
+            return '"' .. key .. '":"' .. v .. '"'
+        end)
+    end
+    return text
+end
+
 --- 同步向 log.snssdk.com 注册，拿到本机专属 device_id/install_id。
 ---@param client table 本地 HTTP 客户端（Client 实例）
 ---@param settings table
@@ -218,6 +240,7 @@ function Device.register(client, settings)
     if not text or text == "" then
         return nil, "device_register 空响应"
     end
+    text = quote_bigint_ids(text)
     local ok, data = pcall(function() return client:json_decode(text) end)
     if not ok or type(data) ~= "table" then
         return nil, "device_register 响应无效"

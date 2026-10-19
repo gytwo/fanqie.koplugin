@@ -13,7 +13,43 @@ local Crypto = {}
 local HARDCODED_KEY = Aes.from_hex("ac25c67ddd8f38c1b37a2348828e222e")
 local AID = 1967
 
+--- 十进制数字串 ÷ 256，返回商（无前导零）与余数。
+--- 全程只用 < 2^53 的整数：rem < 256 ⇒ cur = rem * 10 + digit ≤ 2559，精确。
+local function divmod256(digits)
+    local q, rem = {}, 0
+    for i = 1, #digits do
+        local cur = rem * 10 + (digits:byte(i) - 48)
+        local d = math.floor(cur / 256)
+        rem = cur - d * 256
+        if #q > 0 or d > 0 then
+            q[#q + 1] = string.char(48 + d)
+        end
+    end
+    return table.concat(q), rem
+end
+
+--- 🔴 device_id 是服务端签发的十进制串，可能是 19 位（如 7300000000000000001），
+--- 超过 double 的 2^53 精确上限（9007199254740992）。早期实现直接 tonumber()，
+--- 19 位时最低位被抹平 ⇒ registerkey 请求里加密的 device_id 与 query 里的明文
+--- 对不上 ⇒ 换不到 v1_key ⇒ 官方源整条链路失效，且报错很像「被风控」。
+--- 字符串一律走十进制长除法（不依赖 ffi，fengari 等测试环境同样精确）；
+--- 数字与空值维持原逻辑，16 位以内串的结果与原实现逐字节相同。
 local function le64(n)
+    if type(n) == "string" and n:match("^%d+$") then
+        local digits = n:gsub("^0+", "")
+        if digits == "" then digits = "0" end
+        local out = {}
+        for i = 1, 8 do
+            if digits == "0" then
+                out[i] = "\0"
+            else
+                local q, r = divmod256(digits)
+                out[i] = string.char(r)
+                digits = (q == "") and "0" or q
+            end
+        end
+        return table.concat(out)
+    end
     n = tonumber(n) or 0
     local out = {}
     for i = 1, 8 do
