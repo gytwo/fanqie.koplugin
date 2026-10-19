@@ -1,22 +1,10 @@
 -- 书籍元数据（作者）解析与缓存。
---
--- 背景：番茄的「书架」官方接口（bookshelf/multidetail）**不返回作者字段**，
---   官方目录接口也只给章节 id 列表；书山 /content 与知秋 /novel/chap 同样
---   只有正文。经实测，唯一稳定带作者的是书籍详情页 HTML：
---       https://fanqienovel.com/page/<book_id>
---       内含 <span class="author-name-text">作者名</span>
---   该页面是公开页（带不带 cookie 都能取），但体积偏大（0.2~1.7MB），
---   所以这里做成「按书抓一次 → 落盘缓存 → 回填统计库」，绝不在翻页路径上同步抓。
---
--- 缓存位置：<cache_dir>/<book_id>/book_meta.lua
---   return { author = "作者名", at = <epoch>, tried = true }  -- 成功
---   return { author = "",       at = <epoch>, tried = true }  -- 页面确认无作者
--- 有 tried 标记就不再重复抓（避免每本书每次打开都发一次网络请求）。
---
--- ⭐ 关键：只有「页面正常返回、但确实解析不出作者」才写 tried。
---   「传输层/服务端故障」（无网、超时、5xx、反爬 515）**一律不落盘**，
---   这样下次打开这本书还会自动重试，不会因为一次网络抖动就永久放弃。
---   单次抓取内部另有 3 次重试（间隔 1s / 2s），覆盖偶发反爬。
+-- 背景：书架/目录/书山/知秋接口都不带作者，唯一稳定来源是公开详情页
+--   https://fanqienovel.com/page/<book_id> 里的 <span class="author-name-text">。
+--   页面 0.2~1.7MB，所以按书抓一次 → 落盘缓存 → 回填统计库，绝不在翻页路径上同步抓。
+-- 缓存：<cache_dir>/<book_id>/book_meta.lua = { author, at, tried }
+-- ⭐ 只有「页面正常但没有作者」(empty) 才写 tried；传输层/5xx/反爬 515 一律不落盘，
+--   否则一次网络抖动就永久放弃（抓取内部另带 3 次重试，间隔 1s/2s）。
 
 local M = {}
 

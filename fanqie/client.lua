@@ -613,7 +613,7 @@ function Client:official_app_get_content(book_id, item_id, opts)
 end
 
 -- Fetch chapter content via the official FanQie API.
--- 优先走 App reading 协议（v2.3.0 起官方唯一可用路径）；失败则回退到旧的
+-- 优先走 App reading 协议；失败则回退到旧的
 -- 网页接口（公共、无需登录，现多返回 404，仅作兜底）。
 -- Returns {content, title, author} on success; errors on failure.
 function Client:official_get_content(book_id, item_id, opts)
@@ -654,20 +654,11 @@ function Client:official_get_content(book_id, item_id, opts)
     error(string.format("官方API响应无效: itemId=%s, type=%s", tostring(item_id), type(result)))
 end
 
--- ============================================================================
--- 官方 App 段评（/novel/commentapi/comment/list）— 官方源的段评列表通道
--- ident 格式：official:<bid>:<cid>:<pid>（pid 为 App 正文 blk 的段落序号）
--- opts: { count, cursor, sort, item_version }
---
--- 返回结构刻意做成与书山/知秋一致的「新格式」
---   { data = { data_list = {...}, common_list_info = {total,has_more,cursor} } }
--- 这样 main.lua 既有的解析器、气泡总数兜底、续拉游标全部原样复用。
--- 失败返回 (nil, err)，绝不返回空页 —— 否则上层会显示成「共 0 条评论」。
--- ============================================================================
---- 官方源段评的二级评论（回复列表）。
---- 返回 { replies = 扁平回复数组, total, has_more, cursor } 或 (nil, err)。
---- 回复在接口里是平铺的，层级靠 reply_to_reply_id 指父回复；
---- 展示按时间顺序平铺 + 「回复 @某人」前缀，阅读体验和树形一致且不会丢条。
+-- 官方 App 段评列表（/novel/commentapi/comment/list），ident = official:<bid>:<cid>:<pid>。
+-- 返回结构刻意与书山/知秋的「新格式」一致，main.lua 的解析器/气泡兜底/续拉游标原样复用。
+-- ⚠️ 失败返回 (nil, err)，绝不返回空页 —— 否则上层会显示成「共 0 条评论」。
+--- 官方源二级评论（回复列表）：{ replies, total, has_more, cursor } 或 (nil, err)。
+--- 接口返回是平铺的，层级靠 reply_to_reply_id；展示按时间平铺 +「回复 @某人」，不会丢条。
 function Client:official_get_para_replies(comment_id, opts)
     opts = opts or {}
     comment_id = tostring(comment_id or "")
@@ -739,12 +730,10 @@ function Client:official_get_para_review(ident, opts)
     }
 end
 
--- ============================================================================
 -- 知秋「番茄四合一」Source (ZhiQiu) — delegate to fanqie/zhiqiu.lua
 -- Base: https://fq.vv9v.cn  Auth headers: x-sec-token + x-android-id
 -- Content: GET /novel/chap?novelId=<book_id>&chapId=<item_id>
 -- Catalog: GET /novel/catalog?novelId=<book_id>
--- ============================================================================
 
 function Client:zhiqiu_get_content(book_id, item_id, opts)
     opts = opts or {}
@@ -758,13 +747,11 @@ function Client:zhiqiu_get_catalog(book_id, opts)
     return ZhiQiu.get_catalog(self, self.settings, book_id, opts)
 end
 
--- ============================================================================
 -- 书山聚合 Source (ShuShan) — delegate to fanqie/shushan.lua
 -- Base: https://v2.vossc.com  Auth: X-Api-Key(base64 api_key) + X-Device-Id
 -- Content: POST /content (番茄官方 book_id/item_id; 可解锁VIP章)
 -- Catalog: POST /catalog (输入 base64 详情URL → 章节目录)
 -- Search:  GET  /search
--- ============================================================================
 
 function Client:shushan_get_content(book_id, item_id, opts)
     opts = opts or {}

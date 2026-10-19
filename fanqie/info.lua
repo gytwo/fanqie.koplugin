@@ -2,7 +2,6 @@
 -- 所有需要展示版本/关于的地方统一从这里读取，避免多处维护不同步。
 --   - main.lua: require("fanqie.info") 读取 version 和 about_template
 --   - _meta.lua: pcall(require, "fanqie.info") 读取 version 和 description
---
 -- about_template 用 T() 格式化，占位符：
 --   %1 = 版本号（self.version）
 --   %2 = 缓存目录（self.settings:get_download_dir()）

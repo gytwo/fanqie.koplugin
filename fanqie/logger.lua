@@ -1,11 +1,6 @@
--- FanQie Plugin Logger
--- Only writes to fanqie.log file.
--- Usage:
---   local Log = require("lib.logger")
---   Log.debug("some", "details")  -- only shown when developer_logs=true
---   Log.info("always shown")
---   Log.warn("warning")
---   Log.error("error")
+-- fanqie/logger.lua — 只写 fanqie.log 文件。
+-- 用法：local Log = require("fanqie.logger")，Log.info/warn/error/debug(...)
+-- debug 仅在 developer_logs=true 时落盘。
 
 local Log = {}
 local LOG_MODULE = "[FanQie]"

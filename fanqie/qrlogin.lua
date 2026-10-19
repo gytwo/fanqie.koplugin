@@ -1,17 +1,6 @@
--- fanqie/qrlogin.lua
--- 番茄小说扫码登录模块
---
--- 流程参考 kindle-forge/backend/fanqie/qrlogin.py:
---   1. GET 登录页预热 cookie (passport_csrf_token)
---   2. GET /passport/web/get_qrcode/ 获取二维码 token + qrcode_index_url
---   3. 轮询 GET /passport/web/check_qrconnect/?token=... 直到 jar 出现 sessionid
---
--- UI 参考 miuread-koreader/miuread/auth.lua:
---   generation 防旧回调 + QRMessage 显示二维码 + UIManager:scheduleIn 轮询
---
--- 网络请求通过 fanqie/async.lua 在子进程执行，避免阻塞 UI 线程；
--- 子进程只做 HTTP + JSON 解析，不写 settings（fork 继承的 settings 对象
--- 在子进程的写不影响父进程），登录成功后在 UI 线程回调里持久化 cookie。
+-- 番茄扫码登录：预热 cookie → get_qrcode 取二维码 → 轮询 check_qrconnect 直到拿到 sessionid。
+-- UI 用 generation 号防旧回调，网络走 async 子进程，避免阻塞。
+-- ⚠️ 子进程不写 settings（fork 出的写不到父进程），cookie 只在 UI 线程回调里持久化。
 
 local Device = require("device")
 local UIManager = require("ui/uimanager")

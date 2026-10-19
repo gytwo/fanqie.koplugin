@@ -20,7 +20,6 @@ local TIMEOUT = 20
 
 -- 高精度毫秒时间戳（X-Ss-Req-Ticket 用；os.time() 只有秒级分辨率，
 -- 同一秒内多个请求的 ticket 几乎相同，且 math.random 未播种时序列固定）。
---
 -- 🔴 必须定义在 signed_call 之前：Lua 的 local 作用域从声明语句*之后*才开始，
 -- 若把本块写在文件末尾，signed_call 里的 now_ms 会被解析成**全局 nil**，
 -- 运行时报 "attempt to call global 'now_ms' (a nil value)"，
@@ -131,7 +130,6 @@ end
 
 -- 供 fanqie/reading/comments.lua（段评）等兄弟模块复用同一签名请求链路。
 Reading.signed_call = signed_call
-
 
 --- registerkey：换取章节内容密钥 v1_key（36 字节 hex）。
 ---@param client table

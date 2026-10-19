@@ -1,7 +1,6 @@
 -- FanQie Plugin Source Manager
 -- Central registry + rate limiter + active-source resolution for book sources.
 -- A generic scheduler that iterates user-configured sources in priority order.
---
 -- Usage:
 --   local SM = require("fanqie.sources")
 --   local active = SM.get_active_sources(settings)

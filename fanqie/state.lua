@@ -54,7 +54,6 @@ function M.loadReviewState(settings)
     else
         M.enable_review = false
     end
-    -- 加载持久化的下载历史和任务状态
     M.loadDownloadState()
 end
 
@@ -64,7 +63,7 @@ local function persist_review_state(enabled)
     pcall(function() M._settings_ref:setParaReviewEnabled(enabled == true) end)
 end
 
--- ===== 下载状态持久化 =====
+-- 下载状态持久化
 -- 持久化下载历史到文件（避免 KOReader 退出后丢失）
 local function persist_download_history()
     if not M._settings_ref then return end
@@ -74,7 +73,6 @@ local function persist_download_history()
     end)
 end
 
--- 持久化当前下载任务到文件
 local function persist_download_task()
     if not M._settings_ref then return end
     pcall(function()
@@ -87,12 +85,10 @@ end
 -- 如果发现"正在下载"的任务（说明上次退出时下载未完成），标记为"中断"并归入历史
 M.loadDownloadState = function()
     if not M._settings_ref then return end
-    -- 加载历史记录
     local ok_h, history = pcall(function() return M._settings_ref:get("download_history") end)
     if ok_h and type(history) == "table" then
         M.download_history = history
     end
-    -- 加载未完成的下载任务
     local ok_t, task = pcall(function() return M._settings_ref:get("download_task") end)
     log_debug("loadDownloadState: history_count=" .. tostring(#M.download_history)
         .. " persisted_task=" .. tostring(task and task.book_title or "nil")
@@ -187,11 +183,10 @@ M.invalidateDirectoryCache = function(book_id)
     end
 end
 
--- ===== 目录内存缓存：内存主源 + 文件后备 =====
+-- 目录内存缓存：内存主源 + 文件后备
 -- 结构：cached_directory[book_id] = { chapters = {...}, timestamp = os.time() }
 -- 与 chapter_index 一致，采用 CACHE_EXPIRY_SECONDS (24h) TTL，避免进程长时间驻留后
 -- 内存数据与文件/服务器严重脱节。
---
 -- 注意：Async.run 的 work_func 在子进程执行，子进程内存不回传父进程。
 --       因此 setDirectoryCache 只能在父进程（Async 回调 / 主线程）调用，
 --       子进程内调用无效。当前所有写入点都在父进程，符合此约束。
@@ -230,7 +225,6 @@ M.isTocMenuOpen = function()
     return M.toc_menu_open == true
 end
 
--- 段评开关
 M.setReviewEnabled = function(enabled)
     M.enable_review = enabled == true
     persist_review_state(M.enable_review)
@@ -240,7 +234,6 @@ M.isReviewEnabled = function()
     return M.enable_review == true
 end
 
--- 段评数据管理
 M.setCurrentParaReviews = function(para_reviews)
     M.current_para_reviews = para_reviews or {}
     M.current_para_index = 0

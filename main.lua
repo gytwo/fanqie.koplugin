@@ -53,7 +53,6 @@ local PathChooser = safe_require("ui/widget/pathchooser")
 
 local Event = safe_require("ui/event")
 
-
 local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(text) return text end
 
@@ -91,16 +90,10 @@ local Async = safe_require("fanqie.async")
 
 local unpack_args = unpack or table.unpack
 
--- 菜单入口排序：番茄书架默认排在「工具」菜单第二位（微信读书之后）。
--- KOReader 的 MenuSorter 对不在默认顺序表里的项，会按 sorting_hint 追加到
--- 菜单末尾，无法保证位置；weread 插件的做法是改写 KOReader 默认顺序表，
--- 这里沿用同一方式。
---
--- 插件按 path 字母序加载（PluginLoader:loadPlugins），fanqie 先于 weread，
--- 所以本插件插入之后 weread 还会 table.insert(..., 1, "weread") 抢第一位，
--- 把番茄挤到第三位。因此除了在模块加载时插入，还要在插件 init 时（此时
--- weread 必然已加载）再校正一次，让番茄始终紧跟在 weread 后面。
--- 用户手动调整过菜单顺序的话，KOReader 的用户排序表优先级更高，不受影响。
+-- 菜单排序：让番茄书架紧跟在「微信读书」之后（工具菜单第二位）。
+-- 不在默认顺序表里的项，MenuSorter 会追加到菜单末尾，所以改写默认顺序表
+-- （weread 也是这个做法）。插件按 path 字母序加载，fanqie 先于 weread，
+-- 因此 init 时（weread 已就位）要再校正一次；用户自排序的优先级更高，不受影响。
 local MENU_ID = "fanqie"
 local MENU_ANCHOR_ID = "weread"
 
@@ -318,8 +311,6 @@ function FanQiePlugin:onReaderReady(config)
     end
 end
 
-
-
 function FanQiePlugin:onDispatcherRegisterActions()
     -- 参考内置插件模式：用 general=true，让动作在 FileManager 和 Reader
     -- 的手势管理「General」分类下都可绑定、可触发（不局限于某个上下文）。
@@ -441,13 +432,10 @@ function FanQiePlugin:addToMainMenu(menu_items)
     end
 end
 
--- ===========================================================================
 -- 段评
--- ===========================================================================
 -- 段评开关已移至「设置」页面（getSettingsMenuItems 中的"段评显示"），
 -- 阅读时点击「重新获取本章节」会根据开关状态决定是否带段评获取正文。
 
--- 显示段评列表对话框
 function FanQiePlugin:showParaReviewList()
     local reviews = _state.getCurrentParaReviews()
     if #reviews == 0 then
@@ -455,7 +443,6 @@ function FanQiePlugin:showParaReviewList()
         return
     end
 
-    -- 构建段评列表项
     local items = {}
     for i, pr in ipairs(reviews) do
         table.insert(items, {
@@ -480,7 +467,6 @@ function FanQiePlugin:showParaReviewList()
     UIManager:show(menu)
 end
 
--- 显示单段段评详情（从API获取评论数据）
 function FanQiePlugin:showParaReviewDetail(index)
     local reviews = _state.getCurrentParaReviews()
     local pr = reviews[index]
@@ -609,7 +595,7 @@ local function _parseParaReviewResult(result)
                 table.insert(comments, {
                     -- ⚠️ comment_id 必须带出来：官方源的「展开 N 条回复」
                     -- 全靠它拼 reply/list 的地址，漏掉就会在点击时报
-                    -- 「缺少段评 ID」（2026-10-17 实测踩过）。
+                    -- 「缺少段评 ID」。
                     comment_id = c.comment_id,
                     username = base_info.user_name or common.user_name or "匿名",
                     text = content.text or common.text or "",
@@ -733,10 +719,8 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
     self:closeBusy()
 
     if #comments > 0 then
-        -- ================================================================
         -- B 档：把段评弹框从纯 TextViewer 换成微信读书「想法」式富排版弹框
         -- （移植自 weread.koplugin 的 thought_popup 渲染管线，见 fanqie/review_popup/）
-        -- ================================================================
         -- 归一再展示: 取第一条非空 para_src 作为整段引文(abstract)，没有则不显示引文
         local abstract = ""
         for _, c0 in ipairs(comments) do
@@ -802,10 +786,8 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             end
         end
 
-        -- ================================================================
         -- 书山段评懒加载：首屏只展示已拉到的 1 页（20 条），
         -- 底部「继续加载（还剩 N 条）」按钮续拉下一页。
-        -- ================================================================
         _para_more_state = {
             ident = tostring(ident),
             index = index,
@@ -977,16 +959,10 @@ end
 
 -- 段评异步获取已迁移至 showParaReviewDetail / _displayParaReviewDetail
 
-
--- ============================================================================
 -- 段评链接拦截
--- ============================================================================
--- KOReader 的 ReaderLink:showLinkBox() 在检测到 <a> 链接点击时，直接调用
--- self:onGotoLink()（方法调用，非事件广播），因此插件自身的 onGotoLink 永远
--- 收不到。ReaderLink:onGotoLink 不认识 fanqie-para: 协议，会报"无效或外部链接"。
---
--- 解决方案：通过 patches/core.lua 猴补丁 ReaderLink.onGotoLink，在原函数之前
--- 检查 fanqie-para: 前缀，匹配则派发 FanQieParaReview 事件给本插件。
+-- ReaderLink:showLinkBox() 是直接方法调用而非事件广播，插件的 onGotoLink 收不到；
+-- 且它不认 fanqie-para: 协议，会报「无效或外部链接」。
+-- 所以由 patches/core.lua 猴补 ReaderLink.onGotoLink：命中前缀就派发事件给本插件。
 function FanQiePlugin:onFanQieParaReview(idx)
     if not self:isCurrentDocFanqie() then return end
     if not idx then return end
@@ -1051,9 +1027,7 @@ function FanQiePlugin:getMainMenuItems()
     return items
 end
 
--- ===========================================================================
 -- Settings menu
--- ===========================================================================
 
 function FanQiePlugin:getSettingsMenuItems()
     return {
@@ -1170,9 +1144,7 @@ function FanQiePlugin:getSettingsMenuItems()
     }
 end
 
--- ===========================================================================
 -- Book source management
--- ===========================================================================
 
 function FanQiePlugin:getSourceMenuItems()
     local SourceManager = require("fanqie.sources")
@@ -1852,8 +1824,6 @@ function FanQiePlugin:getLogMenuItems()
                 end
                 dst:write(content)
                 dst:close()
-                -- 直接用文本查看器展示（原先会先构造一个从未使用的 FileManager
-                -- 实例，白白初始化文件管理器，已移除）
                 if TextViewer then
                     UIManager:show(TextViewer:new{
                         title = _("FanQie 插件日志"),
@@ -1919,9 +1889,7 @@ function FanQiePlugin:showDownloadDirPicker(touchmenu_instance)
     UIManager:show(path_chooser)
 end
 
--- ===========================================================================
 -- Config file loading
--- ===========================================================================
 
 function FanQiePlugin:loadConfigFile(silent, force)
     local plugin_path = self:getPluginPath()
@@ -1951,9 +1919,7 @@ function FanQiePlugin:getPluginPath()
     return path:match("^(.*)/[^/]+$") or "."
 end
 
--- ===========================================================================
 -- Network check
--- ===========================================================================
 
 function FanQiePlugin:checkNetwork()
     local NetworkMgr = require("ui/network/manager")
@@ -1963,8 +1929,6 @@ function FanQiePlugin:checkNetwork()
     end
     return true
 end
-
-
 
 function FanQiePlugin:showBookList(books)
     -- 先关闭旧的书架菜单，避免后台刷新后两个书架 UI 叠在一起
@@ -2147,7 +2111,6 @@ function FanQiePlugin:_preloadAllCovers(books)
             return
         end
 
-        -- 已有缓存路径，跳过
         if book.cover_path then
             UIManager:scheduleIn(0.05, function() preload_one(idx + 1) end)
             return
@@ -2157,7 +2120,6 @@ function FanQiePlugin:_preloadAllCovers(books)
         local cover_path = cover_cache_dir .. "/" .. cover_filename
         local book_id = book.book_id or book.bookId
 
-        -- 文件已存在，设置路径并更新 UI
         if H.file_exists(cover_path) then
             book.cover_path = cover_path
             update_ui_cover(book_id, cover_path)
@@ -2282,7 +2244,6 @@ function FanQiePlugin:showBookDetail(book)
     UIManager:show(_state.detail_dialog)
 end
 
--- 异步获取目录后打开下载对话框
 function FanQiePlugin:_startBookDownload(book)
     local self_ref = self
     local book_id = book.book_id
@@ -2301,7 +2262,6 @@ function FanQiePlugin:_startBookDownload(book)
                     self_ref:showError(T(_("获取目录失败:\n%1"), display_error(err or chapters)))
                     return
                 end
-                -- 检查已缓存章节数量
                 local cached_map = Content.load_cache_index(self_ref.settings, book_id) or {}
                 local cached_count = 0
                 for _ in pairs(cached_map) do cached_count = cached_count + 1 end
@@ -2337,9 +2297,7 @@ function FanQiePlugin:_startBookDownload(book)
     end
 end
 
--- ===========================================================================
 -- Chapter listing
--- ===========================================================================
 
 function FanQiePlugin:showChapterListing(book, opts)
     opts = opts or {}
@@ -2542,9 +2500,7 @@ function FanQiePlugin:showChapterListing(book, opts)
             return
         end
 
-        -- 获取成功：覆盖旧缓存
         Content.save_catalog_cache(settings, book_id, fetched)
-        -- 同时更新内存缓存
         _state.setDirectoryCache(book_id, fetched)
 
         display_chapters(fetched)
@@ -2597,9 +2553,7 @@ function FanQiePlugin:get_chapters(book_id)
     return Content.fetch_catalog(self.client, book)
 end
 
--- ===========================================================================
 -- Chapter reading & auto-jump next chapter
--- ===========================================================================
 
 function FanQiePlugin:navigateToChapter(book, chapters, chapter_index, opts)
     opts = opts or {}
@@ -2650,7 +2604,6 @@ function FanQiePlugin:navigateToChapter(book, chapters, chapter_index, opts)
     if existing_path and H.file_exists(existing_path) then
         _state.current_chapter_index = chapter_index
         _state.pre_download_triggered = false
-        -- 加载段评数据到全局状态
         if review_enabled then
             local reviews = Content.load_para_reviews_index(self.settings, book.book_id, item_id)
             _state.setCurrentParaReviews(reviews)
@@ -2695,7 +2648,6 @@ function FanQiePlugin:navigateToChapter(book, chapters, chapter_index, opts)
         -- 父进程统一持久化完整索引
         Content.save_cache_index(settings, book.book_id, cc)
 
-        -- 存储段评数据到全局状态
         if review_enabled and para_reviews then
             _state.setCurrentParaReviews(para_reviews)
         end
@@ -2870,7 +2822,6 @@ function FanQiePlugin:preDownloadChapters(book, chapters, current_index)
             else
                 Log.warn("pre-download: failed chapter", target_idx, ":", err)
             end
-            -- 继续下一章
             UIManager:scheduleIn(0, function() download_one(offset + 1) end)
         end, { poll_interval = 0.2, timeout = 60 })
     end
@@ -2943,7 +2894,6 @@ function FanQiePlugin:retryPendingProgress()
     local start_time = now_sec()
     UIManager:scheduleIn(0.5, function()
         local pending = _state.getPendingProgress()
-        -- 收集本书的待上传条目为顺序列表
         local queue = {}
         for key, item in pairs(pending) do
             if item.book_id == book_id then
@@ -2971,7 +2921,6 @@ function FanQiePlugin:retryPendingProgress()
                 else
                     if Log then Log.warn("retryPendingProgress item failed:", item.item_id, err) end
                 end
-                -- 处理下一条
                 UIManager:scheduleIn(0, function() process_next(i + 1) end)
             end, { poll_interval = 0.2, timeout = 30 })
         end
@@ -3057,7 +3006,6 @@ function FanQiePlugin:onFanQiePrevChapter()
 
     -- 下载完成后的跳章逻辑（缓存命中与异步下载共用）
     local function finish_prev(p)
-        -- 加载段评数据
         if review_enabled then
             local reviews = Content.load_para_reviews_index(self.settings, book.book_id, item_id)
             _state.setCurrentParaReviews(reviews)
@@ -3184,7 +3132,6 @@ function FanQiePlugin:onEndOfBook()
 
     -- 下载完成后的跳章逻辑（缓存命中与异步下载共用）
     local function finish_next(p)
-        -- 加载段评数据
         if review_enabled then
             local reviews = Content.load_para_reviews_index(self.settings, book.book_id, item_id)
             _state.setCurrentParaReviews(reviews)
@@ -3291,7 +3238,6 @@ function FanQiePlugin:onEndOfBook()
                 UIManager:scheduleIn(0.5, wait_then_download)
                 return
             end
-            -- 无下载在进行且未缓存，自己下载
             start_download()
         end
         UIManager:scheduleIn(0.5, wait_then_download)
@@ -3360,9 +3306,7 @@ function FanQiePlugin:onShowFanQieBookshelf()
     return true
 end
 
--- ===========================================================================
 -- Cache management
--- ===========================================================================
 
 function FanQiePlugin:getCacheMenuItems()
     local items = {}
@@ -3430,9 +3374,7 @@ function FanQiePlugin:getCacheMenuItems()
     return items
 end
 
--- ===========================================================================
 -- Download management
--- ===========================================================================
 
 function FanQiePlugin:showDownloadManager()
     local self_ref = self
@@ -3440,7 +3382,6 @@ function FanQiePlugin:showDownloadManager()
     -- 定时刷新控制标志（Menu 关闭后停止刷新）
     local refresh_active = true
 
-    -- 调试日志
     local task = _state.getDownloadTask()
     local history = _state.getDownloadHistory()
     if Log and Log.info then
@@ -3453,13 +3394,11 @@ function FanQiePlugin:showDownloadManager()
     local function buildProgressText(current, total)
         if not total or total <= 0 then return "0%" end
         local pct = math.floor((current or 0) / total * 100)
-        -- 10 格进度条，每格代表 10%
         local filled = math.floor(pct / 10)
         local bar = string.rep("█", filled) .. string.rep("░", 10 - filled)
         return string.format("%s %d%% (%d/%d)", bar, pct, current or 0, total)
     end
 
-    -- 构建 Menu items
     local function buildItems()
         local items = {}
         local task = _state.getDownloadTask()
@@ -3468,7 +3407,6 @@ function FanQiePlugin:showDownloadManager()
                 .. " status=" .. tostring(task and task.status or "nil"))
         end
 
-        -- 当前下载任务
         if task and task.status == "downloading" then
             table.insert(items, {
                 text = T(_("正在下载: 《%1》"), task.book_title or task.book_id or "未知"),
@@ -3497,7 +3435,6 @@ function FanQiePlugin:showDownloadManager()
                         ok_callback = function()
                             _state.clearDownloadTask()
                             self_ref:showInfo(_("已取消下载"))
-                            -- 刷新列表
                             if dialog and dialog.updateItems then
                                 dialog.item_table = buildItems()
                                 dialog:updateItems()
@@ -3515,7 +3452,6 @@ function FanQiePlugin:showDownloadManager()
             table.insert(items, { text = "", separator = true })
         end
 
-        -- 历史下载记录
         local history = _state.getDownloadHistory()
         if #history > 0 then
             table.insert(items, {
@@ -3578,15 +3514,12 @@ function FanQiePlugin:showDownloadManager()
 
         local task = _state.getDownloadTask()
         if task and task.status == "downloading" then
-            -- 有下载任务，刷新列表
             dialog.item_table = buildItems()
             if dialog.updateItems then
                 dialog:updateItems()
             end
-            -- 继续定时刷新
             UIManager:scheduleIn(2, refreshProgress)
         else
-            -- 下载完成或取消，最后刷新一次
             dialog.item_table = buildItems()
             if dialog.updateItems then
                 dialog:updateItems()
@@ -3594,7 +3527,6 @@ function FanQiePlugin:showDownloadManager()
         end
     end
 
-    -- 如果有下载任务，启动定时刷新
     local task = _state.getDownloadTask()
     if task and task.status == "downloading" then
         UIManager:scheduleIn(2, refreshProgress)
@@ -3691,9 +3623,7 @@ function FanQiePlugin:clearAllCache()
     self:showInfo(string.format(_("缓存已清除\n共删除 %d 个文件"), removed_count))
 end
 
--- ===========================================================================
 -- Book opening (from bookshelf or direct)
--- ===========================================================================
 
 -- 用缓存目录进入阅读（离线模式或网络获取失败时的回退路径）
 function FanQiePlugin:_openBookWithCache(book, cached_chapters)
@@ -3849,9 +3779,7 @@ function FanQiePlugin:openBook(book)
     end, { poll_interval = 0.3, timeout = 60 })
 end
 
--- ===========================================================================
 -- UI helpers
--- ===========================================================================
 
 function FanQiePlugin:showBusy(text)
     self._busy_msg = InfoMessage:new{ text = text, norefresh = true }

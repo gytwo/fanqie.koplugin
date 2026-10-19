@@ -1,27 +1,11 @@
--- FanQie Plugin — 书山聚合 source (ShuShan)
--- =============================================================================
--- Protocol (https://v2.vossc.com), 5.48 book source, verified live 2026-09-05.
--- Auth is an email/password account + a REAL 16-hex Android device id:
---   Login:    POST /login   form: email, password
---             → data.user.api_key  (16-char plain string, long-lived)
---   Search:   GET  /search?login=search&key=<kw>&page=<n>&source=<src>
---   Catalog:  POST /catalog  json {source, url(base64 book url), name, tab, bookid}
---             → data: [ { url="book_id=X&item_id=Y", title, cid, tag, isVip,... } ]
---   Content:  POST /content  json {cid, source, book_id, item_id, version:"12"}
---             headers  X-Api-Key: base64(api_key)
---                      X-Device-Type: android|ios
---                      X-Device-Id: <real 16-hex android id>
---             → data.content  (plain text on a successfully-registered device)
--- The 书山 service proxies the target source (番茄/晋江/…) itself, so the same
--- book_id/item_id obtained from a 番茄 catalog can be fetched here through 书山
--- (which can also unlock VIP/pay chapters the official API refuses).
---
--- SAFETY: unlike 知秋, 书山 validates the device id server-side. A bogus /
--- random id triggers a soft block (429 "设备码无效") and historically a forged id
--- caused hard bans. We therefore NEVER auto-generate an android id: the user
--- must supply the REAL 16-hex Android ID of a device that has already logged
--- into 书山 via the 阅读 app. We keep email/password + android id in settings.
--- =============================================================================
+-- FanQie Plugin — 书山聚合 source (ShuShan)，https://v2.vossc.com
+-- 协议：POST /login{email,password}        → data.user.api_key
+--       POST /catalog{source,url,name,tab,bookid} → 带 book_id/item_id 的目录
+--       POST /content{cid,source,book_id,item_id,version} → data.content 明文正文
+--       头部 X-Api-Key / X-Device-Type / X-Device-Id
+-- 书山 自己代理目标站（番茄/晋江…），同一 book_id/item_id 走它可取到官方接口拒给的 VIP 章。
+-- ⚠️ 设备号由服务端校验：假 id 会被软封（429「设备码无效」），历史上还封过号，
+--    所以绝不自动生成，只能由用户填真实 16 位十六进制 Android ID。
 
 local H = require("fanqie.helper")
 local FanQie = require("fanqie.fanqie")
@@ -160,17 +144,13 @@ end
 ShuShan.base64_encode = base64_encode
 ShuShan.base64_decode = base64_decode
 
--- =============================================================================
 --  base64(api_key) helper — the actual X-Api-Key header value.
--- =============================================================================
 function ShuShan.secret_key_header(cfg)
     local api_key = H.trim(cfg.api_key or "")
     return base64_encode(api_key)
 end
 
--- =============================================================================
 --  Settings accessors
--- =============================================================================
 -- 归一化节点地址：补 scheme、去掉尾部斜杠。空值返回 ""。
 local function normalize_base(u)
     u = H.trim(u or "")
@@ -279,21 +259,10 @@ function ShuShan.validate_android_id(aid)
     return false, aid
 end
 
--- =============================================================================
 --  HTTP helpers (GET/POST JSON)
--- =============================================================================
 
--- =============================================================================
---  多节点请求：传输层故障时自动切换下一个节点。
--- =============================================================================
--- opts.path 为相对路径（可含 query），会对候选节点依次尝试。
--- 切换判据（仅当"这次请求本身没成功"才换节点）：
---   * 无响应 / 超时 / 连接错误         → 换
---   * HTTP 5xx（服务端故障）           → 换
---   * HTTP 2xx 但响应不是 JSON         → 换
---   * HTTP 4xx（凭据/设备码/参数问题） → 不换，直接报错（换节点也救不了）
---   * HTTP 2xx 且是合法 JSON           → 返回；业务层 code 由调用方判断
--- 任一节点成功即把它记为后续首选，并解除其冷却。
+-- 多节点请求：只对传输层故障换节点 —— 无响应/超时/连接错误、5xx、2xx 但非 JSON；
+-- 4xx（凭据/设备码/参数问题）不换，直接报错。成功节点记为后续首选并解除冷却。
 local function request_json_multi(client, settings, cfg, opts)
     local bases = ShuShan.candidate_bases(cfg)
     local label = opts.label or "书山请求"
@@ -368,9 +337,7 @@ local function request_json_multi(client, settings, cfg, opts)
     error(msg, 0)
 end
 
--- =============================================================================
 --  Login — POST /login with email+password, store api_key.
--- =============================================================================
 -- Returns (ok, err|api_key). err is nil on success.
 function ShuShan.login(client, settings, override_email, override_password)
     local cfg = settings:get_source("shushan")
@@ -409,9 +376,7 @@ function ShuShan.login(client, settings, override_email, override_password)
     return true, api_key
 end
 
--- =============================================================================
 --  api_key resolution — login if missing/forced.
--- =============================================================================
 -- Returns the api_key string; throws on failure.
 function ShuShan.ensure_api_key(client, settings, force)
     local cfg = settings:get_source("shushan") or {}
@@ -430,9 +395,7 @@ function ShuShan.ensure_api_key(client, settings, force)
     return result
 end
 
--- =============================================================================
 --  Content — POST /content for one chapter.
--- =============================================================================
 -- book_id/item_id come from the catalog. Returns {content=string, ...}.
 function ShuShan.get_content(client, settings, book_id, item_id, opts)
     opts = opts or {}
@@ -489,7 +452,7 @@ function ShuShan.get_content(client, settings, book_id, item_id, opts)
             tostring(data.content or obj.msg or obj.error or "")))
     end
 
-    -- 实测（2026-09-05，已登记设备）服务端直接返回明文 UTF-8 正文，无需解密。
+    -- 实测服务端直接返回明文 UTF-8 正文，无需解密。
     -- 若未来返回 base64 密文，需在此接入 AES-CBC 解密（key/iv 见顶部常量）；
     -- 当前版本只做明文透传。解码函数 base64_decode 已内置供后续扩展。
 
@@ -569,9 +532,7 @@ function ShuShan.get_content(client, settings, book_id, item_id, opts)
     }
 end
 
--- =============================================================================
 --  番茄段评列表拉取 — GET {host}/para?source=fq&chapter_id=<番茄item_id>
--- =============================================================================
 -- 返回 [{paragraph_id, comment_count, hot, ...}, ...]；任何失败返回 nil。
 -- 仅对番茄源的章节有意义（其它上游源的 /para source 取值不同，本函数不处理）。
 function ShuShan._fetch_fq_para_reviews(client, settings, book_id, item_id)
@@ -625,17 +586,10 @@ function ShuShan._fetch_fq_para_reviews(client, settings, book_id, item_id)
     return out
 end
 
--- =============================================================================
---  段落级段评正文 —— GET {host}/idea_comment?api=1&book_id&item_id&para&cursor
--- =============================================================================
--- 书山自有的段落级 JSON 段评通道（2026-09-13 逆向 SPA /idea_comment 内部真实调用、
--- 实测可用）。此前误判「书山只有 HTML 页」，实际真正的数据接口是同一页面 URL 上带
--- api=1 的相对请求。返回番茄原生结构（与知秋 paragraph_list 同构）：
---   { code:0, data:{ data_list:[{comment:{common,stat,expand}}],
---                    para_src_content:"段落原文" } }
--- 与 main.lua 的 _displayParaReviewDetail 解析器直接兼容；唯一差异是段落原文放在
--- data.para_src_content（而非 comment.expand.para_src_content），此处已注入补齐。
--- cursor 为偏移量（cursor=0/20/40…），非服务端游标。
+-- 段落级段评 —— GET {host}/idea_comment?api=1&book_id&item_id&para&cursor
+-- 返回番茄原生结构（与知秋 paragraph_list 同构），main.lua 的解析器可直接吃；
+-- 唯一差异是段落原文在 data.para_src_content，这里注入补齐。
+-- cursor 是偏移量（0/20/40…），不是服务端游标。
 function ShuShan.get_para_review(client, settings, book_id, item_id, para_id, opts)
     opts = opts or {}
     local cfg = settings:get_source("shushan") or {}
@@ -749,9 +703,7 @@ function ShuShan.get_para_review(client, settings, book_id, item_id, para_id, op
     }
 end
 
--- =============================================================================
 --  Catalog — POST /catalog for one book's chapter list.
--- =============================================================================
 -- input book_url is the base64-encoded 番茄 detail URL from /search.
 -- Returns list of { url=book_id&item_id, title, cid, tag, isVip, isPay }.
 function ShuShan.get_catalog(client, settings, book_url, opts)
@@ -795,9 +747,7 @@ function ShuShan.get_catalog(client, settings, book_url, opts)
     return chapters
 end
 
--- =============================================================================
 --  Search — GET /search (used to locate a book then fetch its catalog).
--- =============================================================================
 -- source can be "番茄小说", "番茄小说-VIP" etc. Returns the response data list.
 function ShuShan.search(client, settings, keyword, opts)
     opts = opts or {}
@@ -819,22 +769,11 @@ function ShuShan.search(client, settings, keyword, opts)
     return obj.data or obj
 end
 
--- =============================================================================
---  节点测速（连通性 + 延迟）
--- =============================================================================
--- 背景（2026-09-18 修复）：/detection 是服务端的**轻量存活探针**，返回
---   200 + 纯文本 "书山聚合"（Content-Type: text/html），**不是 JSON**。
--- 旧实现让 query_status 走 request_json_multi 的"严格 JSON"判定，于是每个节点
---   都在 json_decode 那步被判成"响应非JSON" → 逐个把节点标记为坏 → 最终报
---   "全部节点失败"，界面上永远显示"检测失败"。而真实业务接口（/content、
---   /search）返回的是合法 JSON，所以出现"能正常看书却检测失败"。
--- 修复：探针按 **HTTP 2xx** 判定存活（响应体非空作为附加信息），不再要求 JSON。
---
--- 探针**不带任何凭据**（绝不把 base64(api_key) 广播给池里每个节点）：
---   /detection 无需鉴权即返回存活标志；凭据有效性由真实业务请求自然验证。
---
--- 返回数组（保持传入 bases 的顺序）：{ base, ms, ok, code, note, retryable }
---   retryable = 是否属于"该换节点"类故障（无响应/超时/5xx），供冷却决策参考。
+-- 节点测速（连通性 + 延迟）
+-- ⚠️ /detection 返回 200 + 纯文本「书山聚合」，不是 JSON：必须按 HTTP 2xx 判存活，
+--    走严格 JSON 判定会把每个节点都判坏，出现「能看书却检测失败」。
+-- 探针不带任何凭据（不把 api_key 广播给池里每个节点）。
+-- 返回 { base, ms, ok, code, note, retryable }，retryable 表示属于该换节点类故障。
 function ShuShan.probe_nodes(client, settings, opts)
     opts = opts or {}
     local cfg = settings:get_source("shushan") or {}
@@ -921,16 +860,8 @@ function ShuShan.select_fastest(client, settings, opts)
     return best, results
 end
 
--- =============================================================================
---  Query status — 服务器连通性检查（多节点，任一可达即通过）。
--- =============================================================================
--- 修复（2026-09-18）：/detection 是服务端的轻量存活探针，返回 200 + 纯文本
---   "书山聚合"（Content-Type: text/html），**不是 JSON**。旧实现让它走
---   request_json_multi 的严格 JSON 判定 → 每个节点都在 json_decode 那步被判成
---   "响应非JSON" → 逐个标记节点坏 → 报"全部节点失败" → 界面永远"检测失败"；
---   而真实业务接口（/content、/search）返回合法 JSON，所以"能看书却检测失败"。
--- 现在显式声明 accept_nonjson，2xx 即算该节点连通。
--- 探针**不带 api_key**：避免把凭据广播给池里每个节点，/detection 也无需鉴权。
+-- 服务器连通性检查（多节点，任一可达即通过）。
+-- /detection 是纯文本探针：必须显式 accept_nonjson，2xx 即算连通；且不带 api_key。
 function ShuShan.query_status(client, settings)
     local cfg = settings:get_source("shushan")
     local obj = request_json_multi(client, settings, cfg, {

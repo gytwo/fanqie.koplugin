@@ -36,7 +36,7 @@ local function status_text(book)
     return _("未开始")
 end
 
--- ---- 封面网格布局：比例 0.68 / gutter 6 / 阴影 3 / 圆角 5 / 标题行 22 / 副行 16 ----
+-- 封面网格布局：比例 0.68 / gutter 6 / 阴影 3 / 圆角 5 / 标题行 22 / 副行 16
 
 local GRID_COLS = 4
 local GRID_ROWS = 3
@@ -92,7 +92,7 @@ local function cellCardMetrics(cell_w, cell_h)
     }
 end
 
--- ---- 圆角封面卡与阴影 ----
+-- 圆角封面卡与阴影
 
 local function inside_rounded_rect(px, py, width, height, radius)
     if px < 0 or py < 0 or px >= width or py >= height then return false end
@@ -236,7 +236,7 @@ function BlankCell:paintTo(bb, x, y)
     bb:paintRect(x, y, self.width, self.height, Blitbuffer.COLOR_WHITE)
 end
 
--- ---- 封面网格条目（竖排：圆角封面卡+阴影在上，标题 + 进度在下） ----
+-- 封面网格条目（竖排：圆角封面卡+阴影在上，标题 + 进度在下）
 
 local ShelfItem = InputContainer:extend{
     entry = nil,
@@ -304,7 +304,6 @@ function ShelfItem:init()
         face = Font:getFace("cfont", 15),
         max_width = m.cover_w,
     }
-    -- 第二行：进度「x/y章」弱化色
     local sub_widget = TextWidget:new{
         text = tostring(self.entry.status or ""),
         face = Font:getFace("smallinfofont", 13),

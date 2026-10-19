@@ -104,14 +104,9 @@ local function base64_decode(data)
     return table.concat(result)
 end
 
--- SVG 墨水屏兼容转换
--- crengine 不支持 rgba()、opacity、stroke-opacity 等半透明属性
--- 策略：
---   1. rgba(x,y,z,a) → 基于 alpha 映射为灰度纯色
---   2. 移除 opacity/stroke-opacity/fill-opacity 属性
---   3. 彩色（红/橙等）→ 深灰
---   4. 白色文字 → 深灰（墨水屏上白色文字不可见）
---   5. 给 <svg> 根元素添加浅灰背景，防止透明区域变黑
+-- SVG 墨水屏兼容转换：crengine 不支持半透明属性
+-- rgba → 按 alpha 映射灰度；去掉 opacity/stroke-opacity/fill-opacity；
+-- 彩色与白色文字 → 深灰；<svg> 根加浅灰背景，防止透明区域变黑。
 local function fix_svg_for_inkscreen(svg_str)
     if not svg_str or svg_str:find("<svg", 1, true) ~= 1 then
         return svg_str
@@ -177,8 +172,6 @@ local function basename_safe(value)
     end
     return value
 end
-
-
 
 function Content.book_cache_dir(settings, book_id)
     return settings.cache_dir .. "/" .. basename_safe(book_id)
@@ -561,15 +554,9 @@ function Content.clean_chapter_content(raw_content, title)
         content = content:sub(1, ad_start - 1)
     end
 
-    -- ========================================================================
-    -- 段评气泡生成（全局占位符方案，参考 kindle-forge 的全局替换）
-    -- <comment> 标签可能在 <p> 内部（与文字内联）或外部（段落之间）。
-    -- 旧方案只在段落之间查找 <comment>，<p> 内部的 <comment> 会被
-    -- txt:gsub("<[^>]+>","") 当作普通标签删除，导致气泡永远不出现。
-    -- 新方案：先全局把 <comment> 替换成占位符 \001CMTN\001，占位符不含
-    -- <>&" 等特殊字符，能安全穿过 strip_tags / decode_entities / trim /
-    -- xml_escape 全流程；最后统一还原为气泡 HTML。
-    -- ========================================================================
+    -- 段评气泡生成（全局占位符方案）
+    -- <comment> 可能在 <p> 内部，直接处理会被 strip_tags 当普通标签删掉 → 气泡永不出现。
+    -- 所以先换成占位符 \001CMTN\001（不含 <>&" 等字符），穿过整条清洗流程后再还原。
     local comment_bubbles = {}   -- 占位符序号 → 气泡 HTML
     local comment_count = 0
     local comment_samples = {}  -- 保留前 3 个 <comment> 原文用于日志诊断
@@ -1293,9 +1280,7 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
         rate_info
 end
 
--- ---------------------------------------------------------------------------
 -- HTML format (standalone .html files, one per chapter)
--- ---------------------------------------------------------------------------
 
 function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     local book_id = book.book_id or book.bookId
@@ -1457,7 +1442,6 @@ body { font-size: 1em; }
 p{
    text-indent: 2em;
 }
-
 
 img {
   display: block;

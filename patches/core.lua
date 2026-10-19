@@ -54,9 +54,7 @@ M.install = function()
 
     local Event = require("ui/event")
 
-    -- =========================================================================
     -- 补丁1：ReaderToc — 番茄文档的目录交给插件处理
-    -- =========================================================================
     local ReaderToc = require("apps/reader/modules/readertoc")
     if not ReaderToc[M._mark] then
         local original_onShowToc = ReaderToc.onShowToc
@@ -71,9 +69,7 @@ M.install = function()
         ReaderToc[M._mark] = true
     end
 
-    -- =========================================================================
     -- 补丁2：ReadHistory — 番茄缓存文件不进入阅读历史
-    -- =========================================================================
     local ReadHistory = require("readhistory")
     if not ReadHistory[M._mark] then
         local original_addItem = ReadHistory.addItem
@@ -86,9 +82,7 @@ M.install = function()
         ReadHistory[M._mark] = true
     end
 
-    -- =========================================================================
     -- 补丁3：ReaderPaging — 在第一页前翻页时触发上一章
-    -- =========================================================================
     local ReaderPaging = require("apps/reader/modules/readerpaging")
     if not ReaderPaging[M._mark_nav] then
         local original_onGotoViewRel = ReaderPaging.onGotoViewRel
@@ -104,9 +98,7 @@ M.install = function()
         ReaderPaging[M._mark_nav] = true
     end
 
-    -- =========================================================================
     -- 补丁4：ReaderRolling — 滚动模式下第一页前翻页触发上一章
-    -- =========================================================================
     local ReaderRolling = require("apps/reader/modules/readerrolling")
     if not ReaderRolling[M._mark_nav] then
         local original_onGotoViewRel_rolling = ReaderRolling.onGotoViewRel
@@ -123,9 +115,7 @@ M.install = function()
         ReaderRolling[M._mark_nav] = true
     end
 
-    -- =========================================================================
     -- 补丁5：ReaderLink — 拦截 fanqie-para:N 段评链接
-    -- =========================================================================
     -- 原因：ReaderLink:showLinkBox() 直接调用 self:onGotoLink()（方法调用，
     --   非事件广播），所以插件自身的 onGotoLink 永远收不到。
     --   ReaderLink:onGotoLink 不认识 fanqie-para: 协议，会报"无效或外部链接"。

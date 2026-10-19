@@ -91,7 +91,6 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
     local b = { book_id = book.book_id, title = book.title, author = book.author }
     local self_ref = parent
 
-    -- 设置全局下载任务状态
     if ok_state and _state then
         _state.setDownloadTask({
             book_id = book.book_id,
@@ -138,7 +137,6 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
     dialog:show()
     dialog:setState{ stage = "prepare", current = 0, total = total }
 
-    -- 下载会话状态（闭包内共享）
     local state = {
         downloaded = 0,
         failed = 0,
@@ -169,7 +167,6 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
             total = state.total,
             chapter = chapter_title,
         }
-        -- 更新全局状态
         if ok_state and _state then
             _state.updateDownloadProgress(state.downloaded, state.total, chapter_title or "")
         end
@@ -187,7 +184,6 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
                 .. " cancelled=" .. tostring(cancelled)
                 .. " backgrounded=" .. tostring(dialog._backgrounded))
         end
-        -- 清除全局下载任务
         if ok_state and _state then
             local task = _state.getDownloadTask()
             if task then
@@ -343,7 +339,6 @@ function Download.execute(parent, book, chapters, start_idx, end_idx)
     schedule_next(start_idx)
 end
 
--- 自定义范围输入对话框
 local function showCustomRangeDialog(parent, book, chapters, current_index)
     local dialog
     local default_text = current_index
@@ -386,7 +381,6 @@ local function showCustomRangeDialog(parent, book, chapters, current_index)
     dialog:onShowKeyboard()
 end
 
--- "当前阅读后N章"输入对话框
 local function showAfterNDialog(parent, book, chapters, current_index)
     local dialog
     dialog = InputDialog:new{
@@ -437,7 +431,6 @@ function Download.showOptionsDialog(parent, book, chapters, opts)
     local total = #chapters
     local has_current = current_index and current_index >= 1 and current_index < total
 
-    -- 检查是否正在下载（避免重复下载请求）
     if ok_state and _state and _state.is_downloading then
         parent:showInfo(_("正在下载中，请稍候再试"))
         return

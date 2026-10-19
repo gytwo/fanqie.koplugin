@@ -1,20 +1,8 @@
--- fanqie/async.lua
--- 异步子进程执行模块：把阻塞的网络/IO 操作放到子进程，UI 线程通过
--- UIManager:scheduleIn 轮询管道，保持 KOReader 界面响应。
---
--- 设计参考 koreader frontend/ui/trapper.lua 的 runInSubProcess + pipe 模式
--- （见 trapper.lua dismissableRunInSubprocess），以及 assistant.koplugin
--- 的 backgroundRequest 用法。区别于 trapper 的是：本模块不依赖 TrapWidget，
--- 采用纯回调驱动（on_done），适合“后台静默执行”的进度上传 / 预下载场景。
---
--- 协议：子进程执行 work_func，把结果以 JSON 写入管道后关闭 fd：
---   成功: {"ok":true,"result":<可序列化值>}
---   失败: {"ok":false,"err":"<错误信息>"}
--- 父进程在 UI 线程轮询 getNonBlockingReadSize / isSubProcessDone，
--- 一次性 readAllFromFD 读取并解析，最后回调 on_done(ok, result, err)。
---
--- 不支持子进程时（Windows 测试环境 / 旧版无 fork）自动降级为
--- “延后同步执行”，保证功能可用，只是仍会短暂阻塞。
+-- 异步子进程：阻塞的网络/IO 放子进程，UI 线程轮询管道，界面不冻结。
+-- 参考 frontend/ui/trapper.lua 的 runInSubProcess + pipe，但纯回调驱动（on_done）。
+-- 管道协议：成功 {"ok":true,"result":…}；失败 {"ok":false,"err":"…"}。
+-- ⚠️ 子进程只回传**第一个**返回值：失败原因必须在子进程内 error(msg, 0) 抛出。
+-- 无 fork 时（Windows 测试 / 旧环境）降级为延后同步执行，仍会短暂阻塞。
 
 local ok_ffiutil, ffiutil = pcall(require, "ffi/util")
 local ok_UIManager, UIManager = pcall(require, "ui/uimanager")
@@ -113,7 +101,6 @@ end
 
 --- 在子进程中执行 work_func（无参闭包，返回可 JSON 序列化值或抛错），
 --- 完成后在 UI 线程回调 on_done(ok, result, err)。
----
 --- @param work_func function  子进程内执行的工作函数（闭包捕获的状态在 fork 时被继承）
 --- @param on_done    function|nil  回调 function(ok, result, err)，在 UI 线程运行
 --- @param opts       table|nil  { delay=0, poll_interval=0.125, timeout=60 }

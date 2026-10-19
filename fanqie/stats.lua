@@ -1,38 +1,15 @@
--- 阅读统计合并：把番茄"同一本书的所有章节"在 KOReader 阅读统计里算成一本，
--- 并让"页数"仍然是真实页数（跨章累加），而不是退化成章数。
---
--- 背景：插件把每一章存成一个独立的 .html 文件，KOReader 的 statistics 插件
---   用 (title, authors, md5) 三元组标识"一本书"（md5 取自文档 sidecar 的
---   partial_md5_checksum），于是每一章都成了统计里独立的一条记录。
---
--- 两个必须一起解决的问题：
---   1) 身份：在 statistics 实例上猴补丁 initData()，让它在本插件的章节文件上
---      临时用「书名 + 作者 + 按 book_id 生成的固定标识」去读/建同一条记录；
---      initData 结束后还原 doc_props，界面上仍然显示章节标题。
---   2) 页数：合并身份后各章页码都从 1 开始，而 page_stat_data 按
---      (id_book, page) 存，不同章的"第 3 页"会互相覆盖。
---      这里采用「跨章连续虚拟页号」：第 N 章的第 P 页 = (N-1)*SPAN + P。
---      这样每章占一段互不重叠的页号，真实翻过的页数可以跨章累加，
---      已读页数 = count(DISTINCT page) 就是真实页数，阅读时长也逐页保留。
---
--- 为什么必须让 book.pages 与 page_stat_data.total_pages 相等：
---   page_stat 是个视图，会按 pages/total_pages 把页号重新缩放：
---       first_page = ((page - 1) * pages) / total_pages + 1
---   只有两者相等时它才是恒等映射（first_page == page），
---   已读页数才不会被缩放放大或缩小。所以每次落库前都会把该书历史行的
---   total_pages 对齐成当前的 book.pages（幂等，失败不影响阅读）。
---
--- 注意：不能通过"把内存里的页码直接改成虚拟页号"来实现——onPageUpdate()
---   靠 curr_page ~= pageno 判定真实翻页，页码被改乱后章内翻页判定会失效，
---   阅读时长会丢失。因此映射只做在落库层，内存里仍按真实页累计时长。
+-- 阅读统计合并：同一本书的所有章节在 KOReader 统计里算一条记录，页数按真实页数跨章累加。
+-- 插件一章一个 .html，statistics 用 (title, authors, md5) 标识一本书，所以：
+--   1) 猴补 initData()，临时换成本书固定身份读写，结束后还原 doc_props（界面仍显示章节名）；
+--   2) 用跨章虚拟页号 (N-1)*CHAPTER_SPAN+P，避免各章的"第 3 页"互相覆盖。
+-- ⚠️ book.pages 必须等于该书所有行的 total_pages，否则 page_stat 视图会按比例缩放页号；
+-- ⚠️ 映射只做在落库层，内存页码保持真实值，否则 onPageUpdate 翻页判定失效、时长全丢。
 
 local M = {
     _mark = "_fanqie_stats_patch_v3",
 }
 
--- 每章预留的虚拟页槽位。只影响页号空间，不影响计数：
--- 已读页数是 distinct page 的个数，与页号本身多大无关。
--- 取 100 是为了保证再大的字号也不会把一章撑到溢出下一章的段（溢出会被截断）。
+-- 每章预留的虚拟页槽位（足够大，防止大字号把一章撑进下一章的页号段）
 local CHAPTER_SPAN = 100
 -- 还没观测到任何章页数时的兜底估计（一章约这么多页）
 local DEFAULT_CHAPTER_PAGES = 12
@@ -261,9 +238,7 @@ local function find_statistics(ui)
     return nil
 end
 
-----------------------------------------------------------------------
 -- 虚拟页号
-----------------------------------------------------------------------
 
 -- 第 N 章第 P 页 → 全局唯一页号
 function M.virtual_page(chapter_index, local_page)
@@ -298,10 +273,7 @@ function M.remap_page_stat(page_stat, chapter_index)
     return out
 end
 
-----------------------------------------------------------------------
--- 全书虚拟总页数：book.pages 必须与 page_stat_data.total_pages 相等，
--- 否则 page_stat 视图会缩放页号，已读页数就不准了。
-----------------------------------------------------------------------
+-- 全书虚拟总页数：必须与 page_stat_data.total_pages 相等（见文件头 ⚠️）
 
 local function with_db(fn)
     local ok_sq3, SQ3 = pcall(require, "lua-ljsqlite3/init")
@@ -372,9 +344,7 @@ local function chapter_page_count(s)
     return nil
 end
 
--- 全书页数估计 = 平均每章页数 × 章数。
--- 因为已读页数统计的是 distinct 页号的个数（与页号大小无关），
--- 所以这里的估计只影响"进度"分母，不影响已读页数和阅读时长。
+-- 全书页数估计 = 平均每章页数 × 章数；只影响进度分母，不影响已读页数与时长的统计
 function M.estimate_total_pages(id_book, total_chapters, chapter_pages)
     local n = tonumber(total_chapters)
     if not n or n <= 0 then return nil end
@@ -387,9 +357,7 @@ function M.estimate_total_pages(id_book, total_chapters, chapter_pages)
     return v
 end
 
-----------------------------------------------------------------------
 -- 安装补丁
-----------------------------------------------------------------------
 
 -- 给当前文档（一个 ReaderUI 实例）的 statistics 实例安装身份/页数补丁。
 -- 返回解析出的身份（table）表示"本文档是番茄章节且已知书名"；否则返回 nil。

@@ -207,7 +207,7 @@ function Settings:is_cookie_configured()
     return false
 end
 
--- === Book source management ===
+-- Book source management
 -- These accessors read/write `sources.<id>` (the unified config).
 
 function Settings:get_sources()

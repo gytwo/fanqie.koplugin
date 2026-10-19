@@ -80,7 +80,6 @@ function ReaderNavigation:navigateToChapter(book, chapters, chapter_index, opts)
     if existing_path and H and H.file_exists(existing_path) then
         _state.current_chapter_index = chapter_index
         _state.pre_download_triggered = false
-        -- 加载段评数据
         if review_enabled then
             local reviews = Content and Content.load_para_reviews_index(self.settings, book.book_id, item_id) or {}
             _state.setCurrentParaReviews(reviews)
@@ -148,7 +147,6 @@ function ReaderNavigation:navigateToChapter(book, chapters, chapter_index, opts)
             book.cached_chapters[item_id] = path
         end
 
-        -- 存储段评数据到全局状态
         if review_enabled and para_reviews then
             _state.setCurrentParaReviews(para_reviews)
         end
@@ -240,14 +238,12 @@ function ReaderNavigation:preDownloadChapters(book, chapters, current_index)
         local chapter = chapters[idx]
         local item_id = tostring(chapter.itemId)
 
-        -- 检查是否已缓存
         local cached_chapters = book.cached_chapters or Content.load_cache_index(settings, book.book_id) or {}
         local existing_path = cached_chapters[item_id]
 
         -- 已缓存正文直接跳过：段评数据缺失不触发重下
 
         if existing_path and H and H.file_exists(existing_path) then
-            -- 已缓存，跳过
             if Log then Log.info("pre-download: skipping cached chapter", idx) end
             UIManager:scheduleIn(0, function() download_one(idx + 1) end)
             return
@@ -299,7 +295,6 @@ function ReaderNavigation:preDownloadChapters(book, chapters, current_index)
             if not ok or type(result) ~= "table" or not result.path then
                 if Log then Log.warn("pre-download: failed chapter", idx, tostring(err or result)) end
             else
-                -- 更新缓存索引
                 cached_chapters[result.item_id] = result.path
                 book.cached_chapters = cached_chapters
                 if Content and Content.save_cache_index then
@@ -314,7 +309,6 @@ function ReaderNavigation:preDownloadChapters(book, chapters, current_index)
                 if Log then Log.info("pre-download: completed chapter", idx) end
             end
 
-            -- 继续下一章
             UIManager:scheduleIn(0.5, function() download_one(idx + 1) end)
         end
 

@@ -18,7 +18,7 @@ local ok_Content, Content = pcall(require, "fanqie.content")
 local ok_state, _state = pcall(require, "fanqie.state")
 local ok_Async, Async = pcall(require, "fanqie.async")
 
--- ===== 书架内存缓存：内存主源 + 文件后备 =====
+-- 书架内存缓存：内存主源 + 文件后备
 -- 存精简后的 books 数组（与 shelf_cache.lua 同构）。
 -- 与 client.lua 的 SHELF_CACHE 职责区分：
 --   - SHELF_MEM_CACHE（本变量）：显示层数据源，进程生命周期内有效，无 TTL
@@ -70,7 +70,6 @@ local function save_shelf_cache(settings, books)
     -- 写内存缓存（浅拷贝：调用方后续的 do_sort/showBookList 会原地修改 books，
     -- 存浅拷贝保持内存缓存的原始顺序不被污染）
     SHELF_MEM_CACHE = shallow_copy_books(books)
-    -- 写文件缓存（持久化后备）
     local path = get_shelf_cache_path(settings)
     local lines = { "return {" }
     for i, b in ipairs(books) do
@@ -108,11 +107,9 @@ end
 -- 未命中时读文件缓存，并回填内存，后续读取全部走内存。
 -- 返回浅拷贝：避免调用方 do_sort/showBookList 的 table.sort 原地排序污染内存缓存。
 local function load_shelf_cache(settings)
-    -- 1. 先查内存缓存
     if SHELF_MEM_CACHE and #SHELF_MEM_CACHE > 0 then
         return shallow_copy_books(SHELF_MEM_CACHE)
     end
-    -- 2. 未命中：读文件缓存
     local path = get_shelf_cache_path(settings)
     if not H or not H.file_exists or not H.file_exists(path) then
         if Log then Log.info("shelf cache: file not found at " .. path) end
@@ -145,13 +142,11 @@ local Bookshelf = {}
 --   2. client.SHELF_CACHE（API 短缓存）
 --   3. shelf_cache.lua（文件缓存）
 function Bookshelf:clearShelfCache()
-    -- 1. 清显示层内存缓存
     SHELF_MEM_CACHE = nil
     -- 2. 清 client 的 API 短缓存
     if self.client and self.client.clear_shelf_cache then
         self.client:clear_shelf_cache()
     end
-    -- 3. 删文件缓存
     local path = get_shelf_cache_path(self.settings)
     if H and H.file_exists and H.file_exists(path) then
         os.remove(path)
@@ -266,7 +261,6 @@ function Bookshelf:showBookshelf(opts)
                 return
             end
 
-            -- 获取成功：覆盖旧缓存
             save_shelf_cache(plugin.settings, result)
             do_sort(result)
             plugin:showBookList(result)
@@ -389,7 +383,6 @@ function Bookshelf:showBookList(books)
         -- 旧菜单存在：动态更新内容，避免关闭重开导致闪烁
         ShelfView.update(self.book_list_menu, books, opts)
     else
-        -- 首次显示：创建新菜单
         self.book_list_menu = ShelfView.show(opts)
     end
 end
@@ -468,7 +461,6 @@ function Bookshelf:showBookDetail(book)
                 UIManager:close(self.book_detail_menu)
                 self:showBusy(_("正在刷新进度..."))
                 fetch_chapters_async(function()
-                    -- 复用 get_shelf 异步
                     if ok_Async and Async_mod then
                         Async_mod.run(function()
                             return self_ref:get_shelf(true)
@@ -553,11 +545,9 @@ function Bookshelf:showChapterListing(book)
         end
     end
 
-    -- 检查是否有缓存目录
     local cached = Content.load_catalog_cache and Content.load_catalog_cache(self.settings, book_id) or nil
     if cached and #cached > 0 then
         self:_displayChapterListing(book, cached)
-        -- 后台刷新
         fetch_and_display()
     else
         fetch_and_display()

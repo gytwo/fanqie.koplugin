@@ -33,7 +33,6 @@ local FaceFactory = {
 
 -- Size variants (relative to the base size). quote/meta render one step
 -- smaller; meta is the author line.
---
 -- 二级评论（官方源的回复）用同一套字体，只把字号降半档：
 --   reply_meta / reply  = 0.85（一级 meta/content 是 0.9）
 -- 「展开 N 条回复」这个入口属于一级评论的附属行，字号与一级作者行完全一致
@@ -236,26 +235,11 @@ function FaceFactory:_getFallbackFace(path, size)
     return face
 end
 
---- Fallback chain, first hit wins (silently skipped when the font is not
---- installed). Mirrors KOReader's own UI fallback chain
---- (frontend/ui/font.lua Font.fallbacks): freefont/FreeSans.ttf + FreeSerif.ttf
---- cover symbols (▸ U+25B8, ♥, arrows) and rare math alphanumerics
---- (𝓕 U+1D4D5 is only covered by FreeSerif).
----
---- NotoEmoji MUST stay at the absolute chain end: xtext's fallback is
---- cluster-granular (xtext.cpp shapeSegment: when a cluster contains a .notdef
---- glyph, the whole cluster starting at the notdef is reshaped by the next
---- fallback font; only a last-chance font renders partial hits). Putting emoji
---- mid-chain degrades an emoji sharing a cluster with combining marks to
---- subsequent fonts, one box after another. At the chain end the emoji is
---- always drawn by it.
----
---- The other Noto fonts (Tibetan/Egyptian Hieroglyphs/Brahmi/Symbols2) are not
---- shipped with KOReader; when installed on the device or dropped into the
---- KOReader fonts directory they are resolved by name and extend coverage to
---- scripts such as ྀི (U+0F80, U+0F72) / 𓂃 (U+13083) / 𑁍 (U+1104D).
---- xtext supports at most 15 fallback fonts (MAX_FONT_NUM = 16); this chain
---- has 9 plus the primary face.
+--- 字体回退链（命中即用，缺字体则静默跳过）。对齐 KOReader 的 Font.fallbacks：
+--- FreeSans/FreeSerif 负责 ▸ U+25B8、♥、箭头与 𝓕 这类少见符号。
+--- ⚠️ NotoEmoji 必须放链尾：xtext 的回退是 cluster 级的，放在链中会让
+---    与组合符同簇的 emoji 逐级退化成一串豆腐块，放最后才由它兜住。
+--- xtext 最多 16 个字体（含主字体），本链 9 个。
 local FALLBACK_FONT_NAMES = {
     "FreeSans.ttf",
     "NotoSansCJKsc-Regular.otf",

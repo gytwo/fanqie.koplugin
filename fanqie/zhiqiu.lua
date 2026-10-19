@@ -1,17 +1,7 @@
--- FanQie Plugin — 知秋「番茄四合一」source (ZhiQiu)
--- =============================================================================
--- Protocol (fq.vv9v.cn), plain JSON, no encryption, no anti-crawl session:
---   Base:   https://fq.vv9v.cn
---   Auth:   headers  x-sec-token: <共享token>   and   x-android-id: <androidId>
---   Search: GET  /novel/search?keyword=<kw>&page=<n>
---   Catalog:GET  /novel/catalog?novelId=<book_id>
---   Content:GET  /novel/chap?novelId=<book_id>&chapId=<item_id>&tone=<tone>
---   Info:   GET  /novel/info?novelId=<book_id>
--- Response fields mirror the 番茄 app (book_name/author/item_id/...).
---
--- The 知秋 service uses the SAME book_id / item_id as 番茄官方 API, so books
--- added to the plugin via 官方 catalog can be read here by passing the same ids.
--- =============================================================================
+-- FanQie Plugin — 知秋「番茄四合一」(ZhiQiu)，https://fq.vv9v.cn，明文 JSON、无加密
+-- 鉴权：头部 x-sec-token + x-android-id
+-- 接口：GET /novel/search?keyword=&page= / novel/catalog?novelId= / novel/chap?novelId=&chapId=&tone= / novel/info?novelId=
+-- 返回字段与番茄 App 一致，book_id/item_id 也与官方接口通用，所以官方目录加的书能直接在这里读。
 
 local H = require("fanqie.helper")
 local FanQie = require("fanqie.fanqie")
@@ -229,11 +219,9 @@ function ZhiQiu._fetch_paragraph_info(client, settings, book_id, item_id, token,
     return d
 end
 
--- =============================================================================
 --  Token acquisition — matches the 知秋 登录页 "获取Token" button (getTempToken).
 --  GET {base}/user/temp?id=<androidId>&pw1=<源作者>&pw2=<官方反馈群>&pw3=<临时Token口令>
 --  → data = { token, id, left, createTime, ddlTime }   (token valid ~3 days, 6000/day)
--- =============================================================================
 
 -- 用指定 android_id 执行一次铸币请求，返回 (token, err)。err 为 nil 表示成功。
 -- err 可能是字符串（网络/解析错）或 { http_code = <数字> }（HTTP 状态异常，含400）。
@@ -277,15 +265,10 @@ local function rotate_android_id(settings)
     return aid
 end
 
--- Auto-mint (or refresh) the shared token from the three 知秋 credentials.
--- The android id used to mint MUST be the SAME hex id sent on content calls.
--- On success it persists { token, minted_at } back into the source config so it
--- survives restarts. Returns the token string; throws on failure.
---
--- 自愈：知秋服务对"同一设备 id"在 token 有效期内重复铸币返回 HTTP 400
--- "用户已存在"。旧 id 一旦卡死（token 曾铸造成功但本地丢失）只能等过期才能重用。
--- 因此遇到 400 / "用户已存在" 时自动更换一个全新 id 重新铸币，并把新 id 持久化，
--- 避免插件一直卡在同一个 id 上反复报 400。
+-- 用三件套换取共享 token，成功后把 { token, minted_at } 持久化；失败抛错。
+-- ⚠️ 铸币用的 android id 必须与后面取正文时发送的完全一致。
+-- 自愈：同一 id 在 token 有效期内重复铸币会返回 400「用户已存在」，
+--   此时自动换一个新 id 重新铸币并持久化，避免一直卡在同一个 id 上。
 function ZhiQiu.ensure_token(client, settings, force)
     local cfg = settings:get_source("zhiqiu") or {}
     local android_id = resolve_android_id(settings)
