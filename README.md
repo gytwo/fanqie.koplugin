@@ -77,13 +77,52 @@ koreader/plugins/fanqie.koplugin/fanqie.koplugin/main.lua   ← 错误
 
 借鉴或合并上游后续修复时，会保留可追踪的提交说明，不通过改名或打乱代码结构隐藏来源。
 
+上游自 v2.16.22 起以 **GPL-3.0-only** 分发，本分支同步采用同一许可（原因见[许可证](#许可证)）。
+
 ## 使用声明
 
 本项目仅用于个人学习和技术研究，不代表上游项目及相关内容平台的官方立场。本项目不存储、不分发任何书籍内容，所有正文均通过用户自行配置的书源获取。使用者应自行确认适用的授权条件并自行承担风险，请尊重版权、支持正版阅读。如涉及侵权请联系删除。
 
 ## 许可证
 
-MIT License
+本项目以 **GNU General Public License version 3 only（GPL-3.0-only）** 分发，
+全文见仓库根目录 [LICENSE](LICENSE)，逐文件的第三方来源与归属见
+[THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)。
+
+    fanqie.koplugin-fixed — 非官方增强版 Fork
+    Copyright (C) 2026 seaneasysaid (enhanced fork modifications)
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, version 3 of the License.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+### 为什么不是 MIT
+
+2026-10-20 之前本项目沿用上游的 MIT 声明，该声明**自始不成立**：
+
+- `fanqie/reading/` 与 `fanqie/reading.lua` 移植自**月读**
+  （[AnkioTomas/moon](https://github.com/AnkioTomas/moon)）的 KOReader 插件
+  `book.koplugin`，原作以 **GPLv3** 发布。GPLv3 是 copyleft 许可，
+  包含其代码的整体必须以同一许可分发，MIT 与之冲突；
+- 本插件运行在以 **AGPLv3** 发布的 KOReader 之内，并经 `patches/core.lua`
+  对 `ReaderLink` / `ReaderToc` / `ReaderPaging` / `ReaderRolling` 打补丁，
+  单方面声明 MIT 本身也不成立；
+- GPLv3 与 AGPLv3 相互兼容（AGPLv3 §13），故取 **GPL-3.0-only**。
+
+### 这对使用者意味着什么
+
+- **可以**自由使用、修改、再分发，包括商业使用；
+- 再分发时须**保留版权与许可声明**，并**提供对应源码**
+  （本仓库与每个发布包内均为完整 Lua 源码）；
+- 不能将本项目改为闭源，或改用与 GPLv3 不兼容的许可。
 
 ## 项目推荐
 

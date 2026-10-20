@@ -1,0 +1,88 @@
+fanqie.koplugin — 非官方增强版 Fork · 第三方代码与许可声明
+============================================================
+
+本插件整体以 GNU GPL version 3 only（GPL-3.0-only）分发，全文见同目录 LICENSE。
+下面列出本项目中「非本仓库原创」的部分及其来源，保留原有版权归属。
+
+本仓库是 hesan1232/fanqie.koplugin 的非官方增强版 Fork，在上游基础上重写了
+书源接入、段评弹窗、阅读统计等模块；上游自 v2.16.22 起同样以 GPL-3.0-only 分发。
+
+--------------------------------------------------------------------------------
+1. 月读 · moon（KOReader 插件 book.koplugin）— GPLv3
+--------------------------------------------------------------------------------
+作者：AnkioTomas（https://github.com/AnkioTomas/moon）
+版权：Copyright (C) 月读 (AnkioTomas/moon) contributors
+
+以下文件由月读的 KOReader 插件（插件目录名 book.koplugin）移植而来，
+文件头均保留上述版权声明：
+
+  fanqie/reading.lua              ← book.koplugin/source/fanqie/reading.lua
+  fanqie/reading/aes.lua          ← book.koplugin/crypto/aes.lua
+  fanqie/reading/crypto.lua       ← book.koplugin/source/fanqie/reading/crypto.lua
+  fanqie/reading/device.lua       ← book.koplugin/source/fanqie/reading/device.lua
+  fanqie/reading/sign.lua         ← book.koplugin/source/fanqie/reading/sign.lua
+  fanqie/reading/sm3.lua          ← book.koplugin/source/fanqie/reading/sm3.lua
+  fanqie/reading/text.lua         ← book.koplugin/utils/text.lua
+
+移植时的改动：模块路径改为 fanqie.*；异步回调改为本地 Client 同步调用；
+去掉与月读书库/桌面耦合的部分。协议算法本身未作改动。
+本 Fork 另在 crypto.lua 的 le64、device.lua 的设备注册回包处理里
+补了 19 位大整数的精度保护（纯 Lua 实现，未改变协议格式）。
+
+--------------------------------------------------------------------------------
+2. 番茄 App 协议逆向资料
+--------------------------------------------------------------------------------
+reading 协议（registerkey / batch_full / 内容解密）与四神签名
+（X-Khronos / X-Ladon / X-Helios / X-Argus）的算法细节，上游可追溯到
+fanqie-re 的 Python 实现（fanqie_crypto.py / fanqie_sign.py）。
+月读与本项目都是该协议实现的 Lua 移植。
+
+段评协议（/novel/commentapi/…）来自 kindle-forge 的
+backend/fanqie/app_api.py 与 backend/fanqie/api.py，
+地址：https://github.com/hesan1232/kindle-forge
+（fanqie/reading/comments.lua 为其 Lua 实现）
+
+段评二级回复（reply/list，comment_source=5）为本 Fork 新增，
+协议依据同样来自上述 kindle-forge 实现。
+
+--------------------------------------------------------------------------------
+3. 上游项目
+--------------------------------------------------------------------------------
+hesan1232/fanqie.koplugin
+  https://github.com/hesan1232/fanqie.koplugin
+本仓库的 Fork 基线。上游自 v2.16.22 起以 GPL-3.0-only 分发。
+本 Fork 保留其书源框架、缓存、书架、下载、扫码登录等模块，
+并做了大量修改，逐项差异见 README「与原版的主要区别」。
+
+--------------------------------------------------------------------------------
+4. 随包分发的第三方资源
+--------------------------------------------------------------------------------
+  fonts/NotoEmoji-Regular.ttf   ← Google Noto Emoji
+    许可：SIL Open Font License 1.1（全文见 fonts/LICENSE）
+    用途：段评界面中的 emoji 显示，随插件一并分发。
+
+--------------------------------------------------------------------------------
+5. 接入的第三方服务（非代码来源）
+--------------------------------------------------------------------------------
+  - 番茄小说官方 App 阅读接口：正文 / 目录 / 段评
+  - 书山聚合（v2.vossc.com）：用户自备账号，正文与段评代理
+  - 知秋四合一：用户自备 Token，正文与段评
+本插件不内置上述任何服务的账号、Token 或密钥，均由用户自行配置。
+服务的可用性、条款与内容授权由各服务提供方决定，与本项目无关。
+
+--------------------------------------------------------------------------------
+6. 运行宿主
+--------------------------------------------------------------------------------
+KOReader（https://github.com/koreader/koreader）以 GNU AGPLv3 发布。
+本插件通过 KOReader 的插件机制加载，并经 patches/core.lua 对
+ReaderLink / ReaderToc / ReaderPaging / ReaderRolling 打补丁，
+属于在 AGPLv3 程序内运行。GPLv3 与 AGPLv3 相互兼容（AGPLv3 §13），
+两者的源码要求均已满足：发布包内即为完整 Lua 源码。
+
+--------------------------------------------------------------------------------
+7. 关于此前版本中的 MIT 声明
+--------------------------------------------------------------------------------
+2026-10-20 之前，本仓库沿用上游的 MIT 声明并通过 README 与 LICENSE 分发。
+由于整体包含第 1 节的 GPLv3 代码，该声明自始不成立，本仓库不再主张，
+此前各版本所附的 MIT 文本亦不构成有效授权。
+自 2026-10-20 起，本仓库统一以 GPL-3.0-only 分发。
