@@ -164,13 +164,9 @@ function FaceFactory:getFontPaths(doc_font_name)
     return paths
 end
 
---- Hand-built FontFaceObj (modeled on Font:getAdjustedFace's clone).
---- xtext enumerates fallback fonts through face.getFallbackFont(num); a
---- prefilled fallbacks table short-circuits font.lua's name lookup.
---- Fonts are resolved through fontdir first, then a full FontList scan.
---- Faces are built by hand (not Font:getFace) because Font:getFace rescales
---- the size by DPI again; passing an already-scaled size would render glyphs
---- twice as large.
+--- Hand-built FontFaceObj (modeled on Font:getAdjustedFace's clone): fonts resolve via
+--- fontdir then a FontList scan, fallbacks prefilled so xtext skips the name lookup.
+--- Built by hand because Font:getFace rescales size by DPI again → glyphs 2x too large.
 local function resolveBundledFont(fontname)
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
     local path = FontList.fontdir and (FontList.fontdir .. "/" .. fontname)

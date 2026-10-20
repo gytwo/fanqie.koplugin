@@ -35,10 +35,6 @@ function FanQie.directory_url(book_id)
     return FanQie.BASE_URL .. "/api/reader/directory/detail?bookId=" .. H.url_encode(book_id)
 end
 
-function FanQie.chapter_content_url(book_id, item_id)
-    return FanQie.BASE_URL .. "/api/reader/chapter/content?book_id=" .. H.url_encode(book_id) .. "&item_id=" .. H.url_encode(item_id)
-end
-
 function FanQie.reader_url(item_id)
     return "https://fanqienovel.com/reader/" .. item_id
 end

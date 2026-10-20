@@ -1,10 +1,5 @@
--- FanQie Plugin Source Manager
--- Central registry + rate limiter + active-source resolution for book sources.
--- A generic scheduler that iterates user-configured sources in priority order.
--- Usage:
---   local SM = require("fanqie.sources")
---   local active = SM.get_active_sources(settings)
---   for _, src in ipairs(active) do ... end
+-- 书源管理器：注册表 + 滑动窗口限流 + 按优先级解析启用中的书源。
+-- 用法：SourceManager.get_active_sources(settings) → { {id=…, config=…}, … }
 
 local H = require("fanqie.helper")
 
@@ -119,7 +114,7 @@ end
 function SourceManager.is_configured(source_id, cfg, settings)
     cfg = cfg or {}
     if source_id == "official" then
-        -- Official chapter_content_url is public; always available as fallback.
+        -- 官方源走 App reading 协议，只需要设备身份（首次自动注册），不需要登录。
         return true
     elseif source_id == "zhiqiu" then
         -- 知秋四合一: usable if a stored token exists, OR the 源作者/官方反馈群/

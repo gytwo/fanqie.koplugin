@@ -517,14 +517,6 @@ function Client:fetch_chapter_directory(book_id)
     error(err_msg)
 end
 
--- 官方源是否使用 App reading 协议（默认开）。
--- 关掉后回到旧的网页正文接口（`/api/reader/chapter/content`，现已 404）。
-function Client:official_use_app_protocol()
-    local ok, value = pcall(function() return self.settings:get("official_use_app", true) end)
-    if not ok then return true end
-    return value ~= false
-end
-
 -- 清除本机注册的番茄 App 设备身份与章节密钥缓存，下次取正文时重新注册。
 -- 设备身份被风控（连续空响应/403）时用这个重置。
 function Client:official_app_reset_identity()
@@ -613,45 +605,24 @@ function Client:official_app_get_content(book_id, item_id, opts)
 end
 
 -- Fetch chapter content via the official FanQie API.
--- 优先走 App reading 协议；失败则回退到旧的
--- 网页接口（公共、无需登录，现多返回 404，仅作兜底）。
--- Returns {content, title, author} on success; errors on failure.
+-- 正文只走 App reading 协议（设备注册 + 四神签名 + 本地解密）。
+-- 旧网页接口 /api/reader/chapter/content 长期 404，已彻底移除，
+-- 失败时立刻抛错让上层切下一个书源，不再白等一轮超时。
+-- Returns {content, title, author, para_reviews} on success; errors on failure.
 function Client:official_get_content(book_id, item_id, opts)
-    if self:official_use_app_protocol() then
-        local ok, row, err = pcall(function()
-            return self:official_app_get_content(book_id, item_id, opts)
-        end)
-        if ok and type(row) == "table" and type(row.content) == "string" and #row.content > 0 then
-            return row
-        end
-        local reason = ok and tostring(err) or ("App协议异常: " .. tostring(row))
-        local ok_log, logger_mod = pcall(require, "fanqie.logger")
-        if ok_log and logger_mod and logger_mod.info then
-            pcall(logger_mod.info, "[FanQie][official] App协议失败，回退网页接口:", reason)
-        end
-        self._official_app_error = reason
+    local ok, row, err = pcall(function()
+        return self:official_app_get_content(book_id, item_id, opts)
+    end)
+    if ok and type(row) == "table" and type(row.content) == "string" and #row.content > 0 then
+        return row
     end
-
-    local url = FanQie.chapter_content_url(book_id, item_id)
-    local result = self:get_json(url)
-    if type(result) == "table" and result.data then
-        local content = result.data.content or ""
-        if content and #content > 50 then
-            return {
-                content = content,
-                title = result.data.title or "",
-                author = result.data.author or "",
-            }
-        end
-        error(string.format("官方API返回内容过短: itemId=%s, 长度=%s",
-            tostring(item_id), tostring(#content)))
-    elseif type(result) == "table" then
-        local keys = {}
-        for k, _ in pairs(result) do table.insert(keys, tostring(k)) end
-        error(string.format("官方API响应格式异常: itemId=%s, 缺少data字段, keys=%s",
-            tostring(item_id), table.concat(keys, ",")))
+    local reason = ok and tostring(err) or ("App协议异常: " .. tostring(row))
+    self._official_app_error = reason
+    local ok_log, logger_mod = pcall(require, "fanqie.logger")
+    if ok_log and logger_mod and logger_mod.warn then
+        pcall(logger_mod.warn, "[FanQie][official] 取正文失败:", reason)
     end
-    error(string.format("官方API响应无效: itemId=%s, type=%s", tostring(item_id), type(result)))
+    error("官方源取正文失败: " .. reason)
 end
 
 -- 官方 App 段评列表（/novel/commentapi/comment/list），ident = official:<bid>:<cid>:<pid>。

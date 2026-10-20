@@ -62,14 +62,10 @@ function Cookie.merge_set_cookie(cookies, set_cookie)
         return cookies
     end
     local sc = tostring(set_cookie)
-    -- LuaSocket 会把多个 Set-Cookie 响应头用 ", " 合并成一个字符串
-    -- （HTTP/1.1 允许同名头用逗号合并，但 Set-Cookie 是例外，不应合并）。
-    -- 但 Set-Cookie 的 Expires 属性值里合法含有逗号（"Mon, 01 Jan 2026 ..."），
-    -- 不能直接按逗号切分。策略：
-    -- 1. 先把 "Expires=值," 中的逗号用占位符保护（值里不含 ; 和 ,，到第一个逗号止）
-    -- 2. 按换行或逗号切分成多条
-    -- 3. 每条取第一个非属性的 name=value 作为 cookie
-    -- 4. 还原占位符
+    -- LuaSocket 会把多个 Set-Cookie 合并成一个字符串（HTTP/1.1 同名头可逗号合并，
+    -- 但 Set-Cookie 是例外），而 Expires 值里合法含逗号，不能直接按逗号切。
+    -- 折中：先给 "Expires=值," 的逗号打占位符 → 按换行/逗号切分 → 取首个非属性
+    -- name=value → 还原占位符。
     local PLACEHOLDER = "\x01"
     sc = sc:gsub("([Ee][Xx][Pp][Ii][Rr][Ee][Ss]=[^,;]-)%,", "%1" .. PLACEHOLDER)
     for seg in sc:gmatch("[^,\r\n]+") do

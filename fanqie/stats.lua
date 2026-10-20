@@ -1,9 +1,9 @@
--- 阅读统计合并：同一本书的所有章节在 KOReader 统计里算一条记录，页数按真实页数跨章累加。
--- 插件一章一个 .html，statistics 用 (title, authors, md5) 标识一本书，所以：
+-- 阅读统计合并：一本书的所有章节在 statistics 里算一条记录，页数用统一刻度跨章累加。
 --   1) 猴补 initData()，临时换成本书固定身份读写，结束后还原 doc_props（界面仍显示章节名）；
---   2) 用跨章虚拟页号 (N-1)*CHAPTER_SPAN+P，避免各章的"第 3 页"互相覆盖。
--- ⚠️ book.pages 必须等于该书所有行的 total_pages，否则 page_stat 视图会按比例缩放页号；
--- ⚠️ 映射只做在落库层，内存页码保持真实值，否则 onPageUpdate 翻页判定失效、时长全丢。
+--   2) 页号 = (N-1)*CHAPTER_SPAN+P，避免各章的"第 3 页"互相覆盖。
+-- ⚠️ book.pages 必须 = 总章数 × CHAPTER_SPAN = 该书所有行的 total_pages，否则要么
+--    进度分母与页号量纲不一致（990 章算成 769%），要么 page_stat 视图按比例缩放页号。
+-- ⚠️ 映射只做在落库层，内存页码保持真实值，否则翻页判定失效、时长全丢。
 
 local M = {
     _mark = "_fanqie_stats_patch_v3",
@@ -11,8 +11,6 @@ local M = {
 
 -- 每章预留的虚拟页槽位（足够大，防止大字号把一章撑进下一章的页号段）
 local CHAPTER_SPAN = 100
--- 还没观测到任何章页数时的兜底估计（一章约这么多页）
-local DEFAULT_CHAPTER_PAGES = 12
 
 local ok_H, H = pcall(require, "fanqie.helper")
 if not ok_H then H = nil end
@@ -273,7 +271,7 @@ function M.remap_page_stat(page_stat, chapter_index)
     return out
 end
 
--- 全书虚拟总页数：必须与 page_stat_data.total_pages 相等（见文件头 ⚠️）
+-- 全书虚拟总页数的落库读写：结果必须与 page_stat_data.total_pages 相等（见文件头 ⚠️）
 
 local function with_db(fn)
     local ok_sq3, SQ3 = pcall(require, "lua-ljsqlite3/init")
@@ -290,20 +288,18 @@ local function with_db(fn)
     return nil
 end
 
--- 库里已有记录按虚拟页段推算"平均每章记录了多少页"，用于校准全书页数估计
-local function avg_pages_from_db(id_book)
+-- 库里已落库的最大页号（目录缩水时用来兜底，避免进度 >100%）
+local function max_page_in_db(id_book)
     if not id_book then return nil end
     return with_db(function(db)
         local ok, row = pcall(function()
             return db:rowexec(string.format(
-                "SELECT count(DISTINCT ((page - 1) / %d)), count(*) FROM page_stat_data WHERE id_book = %d;",
-                CHAPTER_SPAN, tonumber(id_book)))
+                "SELECT max(page) FROM page_stat_data WHERE id_book = %d;", tonumber(id_book)))
         end)
         if not ok or type(row) ~= "table" then return nil end
-        local segs = tonumber(row[1]) or 0
-        local rows = tonumber(row[2]) or 0
-        if segs <= 0 then return nil end
-        return rows / segs
+        local v = tonumber(row[1])
+        if v and v > 0 then return v end
+        return nil
     end)
 end
 
@@ -334,26 +330,18 @@ function M.current_book_pages(id_book)
     end)
 end
 
-local function chapter_page_count(s)
-    local doc = s and s.ui and s.ui.document
-    if type(doc) == "table" and type(doc.getPageCount) == "function" then
-        local ok, n = pcall(doc.getPageCount, doc)
-        local num = tonumber(n)
-        if ok and num and num > 0 then return num end
-    end
-    return nil
-end
-
--- 全书页数估计 = 平均每章页数 × 章数；只影响进度分母，不影响已读页数与时长的统计
-function M.estimate_total_pages(id_book, total_chapters, chapter_pages)
+-- 全书页数 = 总章数 × CHAPTER_SPAN，与 M.virtual_page 同一把尺子。
+-- 只影响进度分母，不影响已读页数与时长。
+function M.estimate_total_pages(id_book, total_chapters)
     local n = tonumber(total_chapters)
     if not n or n <= 0 then return nil end
-    local avg = tonumber(chapter_pages)
-    if not avg or avg <= 0 then avg = DEFAULT_CHAPTER_PAGES end
-    local db_avg = avg_pages_from_db(id_book)
-    if db_avg and db_avg > 0 then avg = (avg + db_avg) * 0.5 end
-    local v = math.floor(avg * n + 0.5)
-    if v < n then v = n end -- 至少每章 1 页
+    local v = n * CHAPTER_SPAN
+    -- 目录条数变少（章节被删/目录只拉到一部分）时，历史页号可能已越过 v，
+    -- 进度会 >100%，按库里最大页号向上取整补足。
+    local maxp = max_page_in_db(id_book)
+    if maxp and maxp > v then
+        v = math.ceil(maxp / CHAPTER_SPAN) * CHAPTER_SPAN
+    end
     return v
 end
 
@@ -377,7 +365,7 @@ function M.sync(ui, settings)
         -- 页数只依赖"全书章数"：章数可得就能恢复全书页数，
         -- 不再要求 chapter_index（它只用于页号 remap）。
         if not idn or not idn.total_chapters then return nil end
-        local v = M.estimate_total_pages(s.id_curr_book, idn.total_chapters, chapter_page_count(s))
+        local v = M.estimate_total_pages(s.id_curr_book, idn.total_chapters)
         if not v then return nil end
         if type(s.data) == "table" then s.data.pages = v end
         if s.id_curr_book then align_total_pages(s.id_curr_book, v) end

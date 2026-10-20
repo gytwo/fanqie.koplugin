@@ -1196,23 +1196,8 @@ function FanQiePlugin:getSourceDetailMenuItems(source_id)
         })
     end
 
-    -- Official source: 正文走哪条协议（App reading 协议 / 老的网页接口）
+    -- Official source: 设备身份状态 / 重置（正文固定走 App reading 协议）
     if source_id == "official" then
-        table.insert(items, {
-            text_func = function()
-                if self.settings:get("official_use_app", true) ~= false then
-                    return _("正文协议: App协议（推荐）")
-                end
-                return _("正文协议: 网页接口（旧，多已失效）")
-            end,
-            keep_menu_open = true,
-            callback = function(touchmenu_instance)
-                local use_app = self.settings:get("official_use_app", true) ~= false
-                self.settings:set("official_use_app", not use_app)
-                self.settings:flush()
-                if touchmenu_instance then touchmenu_instance:updateItems() end
-            end,
-        })
         table.insert(items, {
             text_func = function()
                 local dev = self.settings:get("reading_device", nil)

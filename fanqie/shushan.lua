@@ -1,11 +1,9 @@
--- FanQie Plugin — 书山聚合 source (ShuShan)，https://v2.vossc.com
--- 协议：POST /login{email,password}        → data.user.api_key
---       POST /catalog{source,url,name,tab,bookid} → 带 book_id/item_id 的目录
---       POST /content{cid,source,book_id,item_id,version} → data.content 明文正文
---       头部 X-Api-Key / X-Device-Type / X-Device-Id
--- 书山 自己代理目标站（番茄/晋江…），同一 book_id/item_id 走它可取到官方接口拒给的 VIP 章。
--- ⚠️ 设备号由服务端校验：假 id 会被软封（429「设备码无效」），历史上还封过号，
---    所以绝不自动生成，只能由用户填真实 16 位十六进制 Android ID。
+-- 书山聚合 source (ShuShan)，https://v2.vossc.com：它自己代理目标站，
+-- 同一 book_id/item_id 走它可取到官方接口拒给的 VIP 章。
+-- 协议：POST /login → api_key；POST /catalog → 目录；POST /content → 明文正文；
+--       头部 X-Api-Key / X-Device-Type / X-Device-Id。
+-- ⚠️ 设备号由服务端校验，假 id 会被软封（429「设备码无效」），绝不自动生成，
+--    只能由用户填真实 16 位十六进制 Android ID。
 
 local H = require("fanqie.helper")
 local FanQie = require("fanqie.fanqie")
@@ -55,10 +53,8 @@ ShuShan.DEFAULT_BASE = "http://113.44.163.166:7001"
 -- 官方节点池：同一套账号/api_key/设备码在各节点通用（2026-09-14 实测同 key 可跨
 -- 节点访问）。Sean 指定 113.44.163.166 作首选，1.94.248.5 作第一备选，其余按延迟兜底。
 ShuShan.DEFAULT_NODES = {
-    -- 2026-09-18 Sean 实测延迟(ms)：v1 153 / v2 172 / 113.44.163.166:7001 199 /
-    --   1.94.248.5:7001 200 / v3 222 / v4 472。Sean 指定 113.44 置首为主，
-    --   1.94 排第一备选，其余域名按延迟升序兜底（v1,v2,v3,v4）。
-    --   两个 IP 直连节点均为 http 明文 + 7001 端口。
+    -- 延迟实测(ms)：v1 153 / v2 172 / 113.44.163.166 199 / 1.94.248.5 200 / v3 222 / v4 472。
+    -- Sean 指定两个 http:7001 直连 IP 置顶（主 + 备），其余域名按延迟升序兜底。
     "http://113.44.163.166:7001",
     "http://1.94.248.5:7001",
     "https://v1.vossc.com",
@@ -457,13 +453,10 @@ function ShuShan.get_content(client, settings, book_id, item_id, opts)
     -- 当前版本只做明文透传。解码函数 base64_decode 已内置供后续扩展。
 
     local para_reviews = {}
-    -- 段评（段落评论）：仅当 全局段评开关打开(opts.review) 且 当前书为番茄源 时启用。
-    -- 书山番茄段评链路：GET {host}/para?source=fq&chapter_id=<番茄item_id> →
-    --   { code:0, data:{ list:[{paragraph_id, comment_count, hot,...}] } }
-    --   paragraph_id 是 0-based 段落行号，与 /content 明文正文的非空行一一对应。
-    -- 这里只做「每段显示评论数气泡」的数据注入（含 para_reviews 表供点击时用
-    -- shushan: 前缀识别）；点击查看评论正文走书山自有段评通道
-    -- （ShuShan.get_para_review → /idea_comment?api=1），不再依赖知秋。
+    -- 段评气泡：仅当段评开关打开且当前为番茄源时启用。
+    -- GET {host}/para?source=fq&chapter_id=<item_id> → { data:{ list:[{paragraph_id, comment_count}] } }
+    -- paragraph_id 是 0-based 段落行号，与 /content 明文正文的非空行一一对应。
+    -- 这里只注入「每段几条评论」，查看正文走 ShuShan.get_para_review（/idea_comment?api=1）。
     if opts.review and is_fq_source then
         local ok_pr, pr_list = pcall(ShuShan._fetch_fq_para_reviews,
             client, settings, tostring(book_id), tostring(item_id))

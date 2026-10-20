@@ -1,12 +1,10 @@
 --[[--
 番茄 App reading 协议拉正文（同步版）：设备身份 → registerkey → batch_full → 解密。
-移植自 book.koplugin/source/fanqie/reading.lua，回调式异步改为本地 Client 同步调用，
 在子进程 work_func 内执行（与其它书源一致），不阻塞 UI。
 
 @module fanqie.reading
 
-⚠️ 文件内 local 函数的定义顺序是有意义的：Lua 的 local 作用域从声明语句之后才开始，
-被调用者必须定义在调用者之前（`now_ms` 曾因置于文件末尾导致整条链路报 nil）。
+⚠️ local 函数必须先定义后调用（`now_ms` 曾置于文件末尾，导致整条链路报 nil）。
 --]]
 
 local Crypto = require("fanqie.reading.crypto")
@@ -16,14 +14,12 @@ local Sign = require("fanqie.reading.sign")
 local Reading = {}
 
 local HOST = Crypto.HOST
-local TIMEOUT = 20
+-- 超时分级：换密钥（registerkey）可以多等一会儿；拉正文要快，失败就立刻换源。
+local TIMEOUT_CONTENT = 15
+local TIMEOUT_REGISTER = 30
 
--- 高精度毫秒时间戳（X-Ss-Req-Ticket 用；os.time() 只有秒级分辨率，
--- 同一秒内多个请求的 ticket 几乎相同，且 math.random 未播种时序列固定）。
--- 🔴 必须定义在 signed_call 之前：Lua 的 local 作用域从声明语句*之后*才开始，
--- 若把本块写在文件末尾，signed_call 里的 now_ms 会被解析成**全局 nil**，
--- 运行时报 "attempt to call global 'now_ms' (a nil value)"，
--- 正文与段评（comments.lua 复用 Reading.signed_call）两条链路会全断。
+-- 高精度毫秒时间戳（X-Ss-Req-Ticket 用）：os.time() 只有秒级，同秒请求的 ticket 会撞。
+-- 🔴 必须定义在 signed_call 之前，否则被解析成全局 nil。
 local ok_socket, socket = pcall(require, "socket")
 local function now_ms()
     if ok_socket and socket and socket.gettime then
@@ -39,7 +35,7 @@ end
 ---@param path string
 ---@param build_query fun(device: table, ts_ms: number): table
 ---@param build_body (fun(client: table, device: table): string)|nil 非 nil 时 POST
----@param opts table|nil { quote_bigints = bool } 见 Reading.quote_bigints
+---@param opts table|nil { quote_bigints = bool, timeout = number } 见 Reading.quote_bigints
 ---@return table|nil data, string|nil err
 local function signed_call(client, name, device, path, build_query, build_body, opts)
     local ts_ms = now_ms()
@@ -65,7 +61,7 @@ local function signed_call(client, name, device, path, build_query, build_body, 
         method = body and "POST" or "GET",
         headers = headers,
         body = body,
-        timeout = TIMEOUT,
+        timeout = (opts and tonumber(opts.timeout)) or TIMEOUT_CONTENT,
     })
     if not code then
         return nil, name .. " 请求失败"
@@ -90,19 +86,11 @@ local function signed_call(client, name, device, path, build_query, build_body, 
 end
 
 --[[--
-给 JSON 文本里的**超长整数**补引号，避免解码成 double 丢精度。
+给 JSON 里的超长整数补引号，避免解码成 double 丢精度。
 
-🔴 为什么必须做（2026-10-17 定性）：
-  番茄的 `comment_id` 是 **19 位**整数（如 7300000000000000001），远超
-  IEEE754 double 的 53 位尾数（精确上限 9007199254740992）。KOReader 的
-  rapidjson 解码数字走 `lua_pushnumber` ⇒ 拿到的 comment_id 末几位被抹平、
-  `tostring` 甚至输出 `7.3e+18`。段评**列表**是按段落序号（pid）请求的，
-  所以列表看着一切正常；可一旦「展开回复」，reply/list 的 URL 里塞的就是
-  这个失真的 ID ⇒ 服务端查不到该评论 ⇒ 200 + 空列表 ⇒ 用户看到「回复加载失败」。
-  症状与「签名不合规」一模一样，极易误判成风控。
-
-只处理**裸数字**（已被引号包起来的字符串不受影响），且只挑 ≥16 位的值
-（15 位以内仍在 double 精确范围内，保持原类型，不改坏调用方的算术）。
+⚠️ 番茄 comment_id 是 19 位，超过 double 的 53 位尾数，rapidjson 解码后末几位被抹平：
+reply/list 带着失真的 ID 请求 → 200 + 空列表 → 前端显示「回复加载失败」，
+症状与签名不合规一模一样。只处理裸数字，且只挑 ≥16 位的值（15 位以内仍精确）。
 --]]
 local BIGINT_FIELDS = {
     "comment_id", "reply_id", "reply_to_reply_id", "reply_to_comment_id",
@@ -143,7 +131,7 @@ local function register_key(client, device)
                 content = Crypto.build_register_content(d.device_id, 0),
                 keyver = 1,
             })
-        end)
+        end, { timeout = TIMEOUT_REGISTER })
     if not data then
         return nil, err
     end
@@ -168,7 +156,8 @@ local function batch_full(client, device, book_id, item_id, v1_key)
     local function query(d, ts_ms)
         return Crypto.build_batch_full_query(d, book_id, { item_id }, ts_ms)
     end
-    local data, err = signed_call(client, "batch_full", device, Crypto.BATCH_FULL_PATH, query, nil)
+    local data, err = signed_call(client, "batch_full", device, Crypto.BATCH_FULL_PATH, query, nil,
+        { timeout = TIMEOUT_CONTENT })
     if not data then
         return nil, err
     end

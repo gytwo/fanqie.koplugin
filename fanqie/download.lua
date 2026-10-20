@@ -1,10 +1,5 @@
--- fanqie/download.lua
--- 公共下载模块：书架 + 阅读界面共用同一套下载选项与执行逻辑。
--- 特性：
---   * 下载选项对话框（全部/前10章/当前阅读后N章/剩余全部/自定义范围）
---   * 严格按书源 rate_limit 配置主动等待（通过 rate_limit_peek 预检）
---   * 进度条显示预估剩余时间（实测滚动平均耗时）
---   * 跳过已缓存章节、取消、失败统计
+-- 公共下载模块：书架与阅读界面共用同一套选项与执行逻辑。
+-- 支持范围选择、按书源 rate_limit 主动等待、剩余时间预估、跳过已缓存、取消与失败统计。
 
 local ok_UIManager, UIManager = pcall(require, "ui/uimanager")
 local ok_ButtonDialog, ButtonDialog = pcall(require, "ui/widget/buttondialog")

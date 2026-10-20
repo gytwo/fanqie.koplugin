@@ -183,13 +183,9 @@ M.invalidateDirectoryCache = function(book_id)
     end
 end
 
--- 目录内存缓存：内存主源 + 文件后备
--- 结构：cached_directory[book_id] = { chapters = {...}, timestamp = os.time() }
--- 与 chapter_index 一致，采用 CACHE_EXPIRY_SECONDS (24h) TTL，避免进程长时间驻留后
--- 内存数据与文件/服务器严重脱节。
--- 注意：Async.run 的 work_func 在子进程执行，子进程内存不回传父进程。
---       因此 setDirectoryCache 只能在父进程（Async 回调 / 主线程）调用，
---       子进程内调用无效。当前所有写入点都在父进程，符合此约束。
+-- 目录内存缓存：cached_directory[book_id] = { chapters, timestamp }，TTL 24h。
+-- ⚠️ Async.run 的 work_func 跑在子进程，内存不回传父进程，所以
+--    setDirectoryCache 只能在父进程（Async 回调 / 主线程）调用。
 M.setDirectoryCache = function(book_id, chapters)
     if not book_id or not chapters then return end
     M.cached_directory = M.cached_directory or {}
