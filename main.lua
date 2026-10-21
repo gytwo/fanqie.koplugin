@@ -672,7 +672,7 @@ function FanQiePlugin:showParaReviewDetail(index)
         local is_official  = ident_str:find("official:", 1, true)
         local ok, result
         if is_official then
-            ok, result = pcall(function() return c:official_get_para_review(ident, { count = 20 }) end)
+            ok, result = pcall(function() return c:official_get_para_review(ident, { count = 40 }) end)
             if not ok then
                 error("官方段评获取失败：" .. tostring(result or ""))
             end
