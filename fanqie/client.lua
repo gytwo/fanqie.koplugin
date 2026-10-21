@@ -672,7 +672,7 @@ function Client:official_get_para_review(ident, opts)
     local Comments = require("fanqie.reading.comments")
     local data_list, info, err = Comments.list(self, self.settings, item_id, book_id,
         tonumber(pid), {
-            count = tonumber(opts.count) or 20,
+            count = tonumber(opts.count) or 40,
             cursor = tostring(opts.cursor or ""),
             sort = tonumber(opts.sort) or 0,
             item_version = opts.item_version,
