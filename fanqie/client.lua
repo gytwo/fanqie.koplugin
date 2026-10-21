@@ -814,8 +814,11 @@ function Client:zhiqiu_get_para_review(ident, opts)
         error("知秋段评 ident 无效: " .. tostring(ident):sub(1, 80))
     end
 
+    -- 注意：知秋 /novel/comment/paragraph_list 服务端固定每页 30 条，
+    -- size 参数被忽略（实测 size=30/40/100 均返回 30 条）。
+    -- 分页靠 page（页码），响应里的 common_list_info.cursor 是"已返回条数偏移量"。
     local page = tonumber(opts.page) or 1
-    local size = tonumber(opts.size) or 40
+    local size = tonumber(opts.size) or 30
     local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
         .. "&cid=" .. H.url_encode(cid)
         .. "&pid=" .. H.url_encode(pid)
