@@ -170,7 +170,10 @@ function Async.run(work_func, on_done, opts)
     -- 终止并清理子进程（避免僵尸），fd 也一并关闭。
     local function cleanup(pid_ref, fd_ref)
         if fd_ref then
-            pcall(ffiutil.readAllFromFD, fd_ref)
+            pcall(function()
+                local ffi_c = require("ffi")
+                ffi_c.C.close(fd_ref)
+            end)
         end
         if pid_ref and not ffiutil.isSubProcessDone(pid_ref) then
             pcall(ffiutil.terminateSubProcess, pid_ref)
@@ -189,7 +192,7 @@ function Async.run(work_func, on_done, opts)
 
         -- 超时检测
         if os.difftime(os.time(), start_clock) > timeout then
-            if ok_Log then Log.warn("[async] 子进程超时", timeout, "s，终止") end
+            if ok_Log then Log.debug("[async] 子进程超时", timeout, "s，终止") end
             cleanup(handle.pid, handle.fd)
             handle.fd = nil
             if on_done then on_done(false, nil, "async timeout") end
