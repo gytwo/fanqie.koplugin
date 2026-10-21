@@ -2181,7 +2181,10 @@ function FanQiePlugin:_doSearch(keyword, opts)
         })
         return
     end
-    self:showTransientInfo(_("正在搜索..."), 2)
+    UIManager:show(Notification:new{
+        text = _("正在搜索..."),
+        timeout = 2,
+    })
     local client = self.client
     Async.run(function()
         return client:search_with_fallback(keyword)
