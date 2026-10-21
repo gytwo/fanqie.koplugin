@@ -31,19 +31,17 @@ local FaceFactory = {
     fallback_cache = {}, -- path|size -> FontFaceObj (fallback faces shared across variants)
 }
 
--- Size variants (relative to the base size). quote/meta render one step
--- smaller; meta is the author line.
--- 二级评论（官方源的回复）用同一套字体，只把字号降半档：
---   reply_meta / reply  = 0.85（一级 meta/content 是 0.9）
--- 「展开 N 条回复」这个入口属于一级评论的附属行，字号与一级作者行完全一致
--- （0.9）—— 之前没有登记 variant，getFace 兜底成 1.0，反而比正文还大。
+-- Size variants (relative to the base size, which equals the body font size).
+-- 一级评论 0.95，二级评论 0.92（比一级略小一点）。
+-- 「展开 N 条回复」属于一级评论的附属行，与一级作者行同号 —— 未登记 variant
+-- 时 getFace 会兜底成 1.0，反而比一级正文还大。
 FaceFactory.VARIANTS = {
-    content      = 0.9,   -- thought body
-    quote        = 0.9,   -- quoted abstract (italic, gray)
-    meta         = 0.9,   -- author line; keep it as readable as the thought body
-    reply_meta   = 0.85,  -- 二级评论作者行：字体同 meta，字号小半档
-    reply        = 0.85,  -- 二级评论正文：字体同 content，字号小半档
-    reply_toggle = 0.9,   -- 「展开/收起 N 条回复」：与一级作者行同款同号
+    content      = 0.95,  -- thought body
+    quote        = 0.95,  -- quoted abstract (italic, gray)
+    meta         = 0.95,  -- author line; same size as the thought body
+    reply_meta   = 0.92,  -- 二级评论作者行：字体同 meta，字号略小
+    reply        = 0.92,  -- 二级评论正文：字体同 content，字号略小
+    reply_toggle = 0.95,  -- 「展开/收起 N 条回复」：与一级作者行同款同号
 }
 
 function FaceFactory:init()
