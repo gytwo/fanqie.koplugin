@@ -200,15 +200,13 @@ function Bookshelf:showBookshelf(opts)
         if cached_shelf and #cached_shelf > 0 then
             do_sort(cached_shelf)
             self:showBookList(cached_shelf)
-            -- 后台异步刷新
+            -- 后台异步刷新（静默，不显示提示）
             if self:checkNetwork() then
-                self:showBusy(_("正在刷新书架..."))
                 local plugin = self
                 if ok_Async and Async then
                     Async.run(function()
                         return plugin:get_shelf()
                     end, function(ok, result, err)
-                        plugin:closeBusy()
                         if ok and type(result) == "table" and #result > 0 then
                             save_shelf_cache(plugin.settings, result)
                             do_sort(result)
@@ -315,7 +313,14 @@ function Bookshelf:get_shelf(force_refresh)
                 progress = tonumber(item.read_progress) / 10000
             end
             local book = {
-                book_id = item.book_id or item.bookId or item.id,
+                book_id = (function()
+                    local v = item.book_id or item.bookId or item.id
+                    if type(v) == "number" then
+                        -- 大整数 book_id 转 string 时防精度丢失
+                        return string.format("%.0f", v)
+                    end
+                    return tostring(v or "")
+                end)(),
                 title = item.book_name or item.title or item.name or "未知",
                 author = item.author_name or item.author or "",
                 cover = item.thumb_url or item.coverUrl or item.cover or item.cover_url,
@@ -324,6 +329,7 @@ function Bookshelf:get_shelf(force_refresh)
                 item_id = item.item_id or item.itemId,
                 total_chapters = total_chapters,
                 read_chapters = read_chapters,
+                _fanqie_sync = true,   -- 书架书才同步番茄进度
             }
             if book.book_id then
                 table.insert(books, book)
