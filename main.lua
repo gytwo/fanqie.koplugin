@@ -638,7 +638,7 @@ function FanQiePlugin:showParaReviewDetail(index)
             if is_official then
                 -- 官方 App 段评通道（/novel/commentapi/comment/list），
                 -- 与官方正文同一条签名链路；ident 格式 official:<bid>:<cid>:<pid>。
-                ok, result = pcall(function() return c:official_get_para_review(ident, { count = 20 }) end)
+                ok, result = pcall(function() return c:official_get_para_review(ident, { count = 40 }) end)
                 if not ok then
                     error("官方段评获取失败：" .. tostring(result or "")
                         .. "（若持续失败可在书源管理里重置官方设备身份）")
