@@ -1,3 +1,4 @@
+local util = require("util")
 local function rshift(n, k)
     return math.floor(n / (2 ^ k))
 end
@@ -166,18 +167,55 @@ local function fix_svg_imgs_in_text(text)
 end
 
 local function basename_safe(value)
-    value = tostring(value or ""):gsub("[^%w%._-]", "_")
+    value = tostring(value or "")
+        :gsub("[/\\:%*%?\"<>|]", "_")
+        :gsub("%c", "")
+        :gsub("^%s+", ""):gsub("%s+$", "")
+        :gsub("^%.+", ""):gsub("%.+$", "")
     if value == "" then
         value = "fanqie"
+    end
+    local chars = require("util").splitToChars(value)
+    if #chars > 10 then
+        value = table.concat(chars, "", 1, 10)
     end
     return value
 end
 
-function Content.book_cache_dir(settings, book_id)
-    return settings.cache_dir .. "/" .. basename_safe(book_id)
+local function id_safe(value)
+    value = tostring(value or ""):gsub("[/\\:%*%?\"<>|]", "_")
+    if value == "" then value = "fanqie" end
+    return value
 end
 
--- Cache index: persists item_id → file path mapping across restarts
+local _book_dir_cache = {}
+
+function Content.book_cache_dir(settings, book_id)
+    local base = settings.cache_dir
+    local id = id_safe(book_id)
+
+    if _book_dir_cache[id] then
+        return _book_dir_cache[id]
+    end
+
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(base, "mode") == "directory" then
+        for entry in lfs.dir(base) do
+            if entry ~= "." and entry ~= ".." then
+                if entry == id or entry:sub(-(#id + 1)) == "-" .. id then
+                    local dir = base .. "/" .. entry
+                    _book_dir_cache[id] = dir
+                    return dir
+                end
+            end
+        end
+    end
+
+    local dir = base .. "/" .. id
+    _book_dir_cache[id] = dir
+    return dir
+end
+
 function Content.save_cache_index(settings, book_id, cached_chapters)
     local dir = Content.book_cache_dir(settings, book_id)
     H.make_dir(dir)
@@ -243,18 +281,42 @@ end
 
 -- Catalog (chapter directory) persistence: saves the full chapter list
 -- so we don't have to re-fetch it from the server every time.
-function Content.save_catalog_cache(settings, book_id, chapters)
+-- title / cover 为可选参数：首次落盘时若目录不存在，按「title-id」建目录，
+-- 并把封面下到该目录下的 cover.*（方便其他美化插件识别文件夹封面）。
+function Content.save_catalog_cache(settings, book_id, chapters, title, cover)
+    local id = id_safe(book_id)
     local dir = Content.book_cache_dir(settings, book_id)
+
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(dir, "mode") ~= "directory" and title and title ~= "" then
+        dir = settings.cache_dir .. "/" .. basename_safe(title) .. "-" .. id
+    end
     H.make_dir(dir)
+    _book_dir_cache[id] = dir
+
+    if cover and cover ~= "" then
+        local cover_path = dir .. "/cover.jpg"
+        if not H.file_exists(cover_path) then
+            local ok, data = pcall(function()
+                return require("fanqie.client"):new(settings):get_binary(cover)
+            end)
+            if ok and data and #data > 0 then
+                local ext = Content.detect_image_type(data) or ".jpg"
+                H.write_file(dir .. "/cover" .. ext, data)
+            else
+                if logger then logger.warn("cover download failed:", cover) end
+            end
+        end
+    end
+
     local path = H.join_path(dir, "catalog_cache.lua")
-    -- Serialize chapters as a Lua table. Only keep fields needed for display.
     local parts = { "return {" }
     for i, ch in ipairs(chapters or {}) do
         local item_id = tostring(ch.itemId or ch.item_id or "")
-        local title = tostring(ch.title or "")
-        -- Escape quotes/backslashes in title
-        title = title:gsub("\\", "\\\\"):gsub('"', '\\"')
-        table.insert(parts, string.format('  { itemId = "%s", title = "%s" },', item_id, title))
+        local t = tostring(ch.title or "")
+        t = t:gsub("\\", "\\\\"):gsub('"', '\\"')
+        table.insert(parts, string.format(
+            '  { itemId = "%s", title = "%s" },', item_id, t))
     end
     table.insert(parts, "}")
     H.write_file(path, table.concat(parts, "\n"))
@@ -1295,9 +1357,37 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     -- 不匹配（序章/后记/无"第X章"格式）则原样返回，不影响其他标题
     local function split_title_for_display(raw_title)
         local t = tostring(raw_title or "")
-        local num, rest = t:match("^(第[一二三四五六七八九十百千零〇%d]+[章卷节回部篇])%s*(.+)$")
-        if num and rest and rest ~= "" then
-            return '<span class="chap-num">' .. xml_escape(num) .. "</span><br/>" .. xml_escape(rest)
+        local chars = require("util").splitToChars(t)
+
+        local num_chars = {
+            ["一"]=true, ["二"]=true, ["三"]=true, ["四"]=true, ["五"]=true,
+            ["六"]=true, ["七"]=true, ["八"]=true, ["九"]=true, ["十"]=true,
+            ["百"]=true, ["千"]=true, ["零"]=true, ["〇"]=true, ["两"]=true,
+        }
+        local ending_chars = {
+            ["章"]=true, ["卷"]=true, ["节"]=true, ["回"]=true,
+            ["部"]=true, ["篇"]=true,
+        }
+
+        if chars[1] == "第" then
+            local i = 2
+            while i <= #chars do
+                local c = chars[i]
+                if num_chars[c] or c:match("^%d$") then
+                    i = i + 1
+                else
+                    break
+                end
+            end
+            if i >= 3 and ending_chars[chars[i]] then
+                local num = table.concat(chars, "", 1, i)
+                local rest = table.concat(chars, "", i + 1)
+                rest = rest:gsub("^%s+", "")
+                if rest ~= "" then
+                    return '<span class="chap-num">' .. xml_escape(num)
+                        .. "</span><br/>" .. xml_escape(rest)
+                end
+            end
         end
         return xml_escape(t)
     end
@@ -1443,6 +1533,7 @@ p{
    text-indent: 2em;
 }
 
+
 img {
   display: block;
   margin: 0 auto;
@@ -1544,6 +1635,120 @@ function Content.load_para_reviews_index(settings, book_id, item_id)
         return {}
     end
     return data
+end
+
+-- ============================================================================
+-- 本地书籍段评所需的扩展：单条评论缓存 + para_records
+-- ============================================================================
+
+-- Lua 原生序列化：用于把单条段评结果写成可 dofile 的 Lua 文件
+local function lua_serialize(v)
+    local t = type(v)
+    if t == "string" then
+        return string.format("%q", v)
+    elseif t == "number" or t == "boolean" then
+        return tostring(v)
+    elseif t == "nil" then
+        return "nil"
+    elseif t == "table" then
+        local parts = {}
+        for k, val in pairs(v) do
+            local ks
+            if type(k) == "string" then
+                ks = string.format("[%q]", k)
+            elseif type(k) == "number" then
+                ks = "[" .. tostring(k) .. "]"
+            end
+            if ks then
+                parts[#parts + 1] = ks .. "=" .. lua_serialize(val)
+            end
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+    return "nil"
+end
+
+local function one_comment_path(settings, book_id, item_id, pid)
+    local dir = Content.book_cache_dir(settings, book_id)
+    return H.join_path(dir,
+        "para_comments_" .. tostring(item_id) .. "_" .. tostring(pid) .. ".lua")
+end
+
+function Content.save_one_comment(settings, book_id, item_id, pid, result)
+    if not pid or not result then return end
+    local path = one_comment_path(settings, book_id, item_id, pid)
+    H.make_dir(path:match("^(.*)/[^/]+$"))
+    H.write_file(path, "return " .. lua_serialize(result))
+end
+
+function Content.load_one_comment(settings, book_id, item_id, pid)
+    if not pid then return nil end
+    local path = one_comment_path(settings, book_id, item_id, pid)
+    if not H.file_exists(path) then return nil end
+    local ok, data = pcall(dofile, path)
+    if ok and type(data) == "table" then return data end
+    return nil
+end
+
+function Content.has_one_comment(settings, book_id, item_id, pid)
+    if not pid then return false end
+    return H.file_exists(one_comment_path(settings, book_id, item_id, pid))
+end
+
+function Content.count_all_comments(settings, book_id)
+    local dir = Content.book_cache_dir(settings, book_id)
+    local lfs = require("libs/libkoreader-lfs")
+    local counts = {}
+    if lfs.attributes(dir, "mode") ~= "directory" then return counts end
+    for entry in lfs.dir(dir) do
+        local iid = entry:match("^para_comments_(%d+)_%d+%.lua$")
+        if iid then
+            counts[iid] = (counts[iid] or 0) + 1
+        end
+    end
+    return counts
+end
+
+function Content.delete_chapter_comments(settings, book_id, item_id)
+    local dir = Content.book_cache_dir(settings, book_id)
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(dir, "mode") ~= "directory" then return end
+    local prefix = "para_comments_" .. tostring(item_id) .. "_"
+    for entry in lfs.dir(dir) do
+        if entry:sub(1, #prefix) == prefix and entry:sub(-4) == ".lua" then
+            os.remove(dir .. "/" .. entry)
+        end
+    end
+end
+
+function Content.save_para_records(settings, book_id, item_id, records)
+    if not records or #records == 0 then return end
+    local dir = Content.book_cache_dir(settings, book_id)
+    H.make_dir(dir)
+    local path = H.join_path(dir, "para_records_" .. tostring(item_id) .. ".lua")
+
+    local parts = { "return {" }
+    for _, rec in ipairs(records) do
+        parts[#parts + 1] = string.format(
+            "{ pos0=%q, pos1=%q, count=%d, ident=%q, para_index=%d },",
+            tostring(rec.pos0 or ""),
+            tostring(rec.pos1 or ""),
+            tonumber(rec.count) or 0,
+            tostring(rec.ident or ""),
+            tonumber(rec.para_index) or 0
+        )
+    end
+    parts[#parts + 1] = "}"
+    H.write_file(path, table.concat(parts, "\n"))
+end
+
+function Content.load_para_records(settings, book_id, item_id)
+    local dir = Content.book_cache_dir(settings, book_id)
+    local path = H.join_path(dir, "para_records_" .. tostring(item_id) .. ".lua")
+    if not H.file_exists(path) then return nil end
+    local ok, data = pcall(dofile, path)
+    if ok and type(data) == "table" and #data > 0 then return data end
+    return nil
 end
 
 return Content
