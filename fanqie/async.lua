@@ -164,7 +164,7 @@ function Async.run(work_func, on_done, opts)
         return run_sync(work_func, on_done, delay)
     end
 
-    local handle = { pid = pid, fd = parent_read_fd, _cancelled = false }
+    local handle = { pid = pid, fd = parent_read_fd, _cancelled = false, _done = false }
     local start_clock = os.time()
 
     -- 终止并清理子进程（避免僵尸），fd 也一并关闭。
@@ -188,11 +188,11 @@ function Async.run(work_func, on_done, opts)
 
     -- 轮询函数：每次由 UIManager:scheduleIn 在 UI 线程唤醒。
     local function poll()
-        if handle._cancelled then return end
-
+        if handle._cancelled or handle._done then return end
         -- 超时检测
         if os.difftime(os.time(), start_clock) > timeout then
-            if ok_Log then Log.debug("[async] 子进程超时", timeout, "s，终止") end
+            if ok_Log then Log.warn("[async] 子进程超时", timeout, "s，终止") end
+            handle._done = true
             cleanup(handle.pid, handle.fd)
             handle.fd = nil
             if on_done then on_done(false, nil, "async timeout") end
@@ -249,6 +249,7 @@ function Async.run(work_func, on_done, opts)
                 UIManager:scheduleIn(1, collect)
             end
 
+            handle._done = true
             if on_done and not handle._cancelled then
                 if result_ok then
                     on_done(true, result_val, nil)
@@ -256,6 +257,7 @@ function Async.run(work_func, on_done, opts)
                     on_done(false, nil, result_err)
                 end
             end
+            return
         else
             -- 未完成，继续轮询
             UIManager:scheduleIn(poll_interval, poll)
