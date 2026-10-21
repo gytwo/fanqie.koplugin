@@ -1228,7 +1228,7 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
     end)
 
     if logger then
-        logger.warn(LOG_MODULE, "[图片] download_remote_images: found=" .. summary.total_found
+        logger.debug(LOG_MODULE, "[图片] download_remote_images: found=" .. summary.total_found
             .. " data_uri_skipped=" .. summary.data_uri
             .. " remote_total=" .. summary.total
             .. " downloaded=" .. summary.downloaded
