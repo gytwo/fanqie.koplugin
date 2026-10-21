@@ -41,7 +41,10 @@ local is_fanqie_path = function(file_path, instance)
     if instance and instance.document and instance.document.file then
         file_path = instance.document.file
     end
-    return H.is_str(file_path) and file_path:lower():find('/fanqie/', 1, true) or false
+    if not (H.is_str(file_path) and file_path:lower():find('/fanqie/', 1, true)) then
+        return false
+    end
+    return file_path:lower():match('/chapter_%d+%.html$') ~= nil
 end
 
 M.install = function()
