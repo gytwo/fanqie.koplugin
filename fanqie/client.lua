@@ -925,4 +925,153 @@ function Client:get_chapter_content_with_fallback(book_id, item_id, opts)
     error("所有书源均失败: " .. table.concat(errors, " | "))
 end
 
+-- ============================================================================
+-- 搜索（多书源回退）
+-- ============================================================================
+-- 按书源优先级顺序搜索。返回 (books, source_id)。
+-- books 里每项带 _search_source 和 _catalog_hint，供 get_catalog_for 锁定源取目录。
+function Client:search_with_fallback(keyword, opts)
+    opts = opts or {}
+    local SourceManager = require("fanqie.sources")
+    local sources = SourceManager.get_active_sources(self.settings)
+    if #sources == 0 then
+        error("无可用书源（请在「设置 → 书源管理」中启用并配置至少一个源）")
+    end
+
+    -- 书山搜索适配器
+    local function search_shushan(kw)
+        local ShuShan = require("fanqie.shushan")
+        local raw = ShuShan.search(self, self.settings, kw, { page = opts.page or 1 })
+        if type(raw) ~= "table" or #raw == 0 then return nil end
+
+        local books = {}
+        for _, item in ipairs(raw) do
+            if type(item) == "table" and item.title and item.title ~= "" then
+                -- 从 book_url(base64) 解出真实 book_id
+                local bid = ""
+                local b64 = tostring(item.book_url or "")
+                if b64 ~= "" then
+                    local ok_d, decoded = pcall(function()
+                        return ShuShan.base64_decode(b64)
+                    end)
+                    if ok_d and decoded then
+                        bid = decoded:match("book_id=(%d+)") or decoded:match("bookid=(%d+)") or ""
+                    end
+                end
+                table.insert(books, {
+                    book_id = bid,
+                    title = tostring(item.title),
+                    author = tostring(item.author or ""),
+                    cover = tostring(item.cover or ""),
+                    desc = tostring(item.desc or ""),
+                    kind = tostring(item.tags or ""),
+                    lastChapter = tostring(item.latestChapterTitle or ""),
+                    wordCount = tostring(item.wordCount or ""),
+                    source = tostring(item.source or "番茄小说"),
+                    book_url = tostring(item.book_url or ""),
+                    _search_source = "shushan",
+                    _catalog_hint = { book_url = tostring(item.book_url or "") },
+                })
+            end
+        end
+        return books
+    end
+
+    local searchers = {
+        shushan = search_shushan,
+        zhiqiu = function(kw)
+            local ZhiQiu = require("fanqie.zhiqiu")
+            local list = ZhiQiu.search(self, self.settings, kw, { page = opts.page or 1 })
+            if type(list) ~= "table" then return nil end
+            local books = {}
+            for _, item in ipairs(list) do
+                if type(item) == "table" and item.title and item.title ~= "" then
+                    table.insert(books, {
+                        book_id = tostring(item.book_id or ""),
+                        title = tostring(item.title),
+                        author = tostring(item.author or ""),
+                        cover = tostring(item.cover or ""),
+                        desc = tostring(item.intro or ""),
+                        kind = tostring(item.type or ""),
+                        lastChapter = tostring(item.last_chapter_title or ""),
+                        wordCount = tostring(item.word_number or ""),
+                        source = "番茄小说",
+                        _search_source = "zhiqiu",
+                        _catalog_hint = {
+                            book_url = "",
+                            source = "番茄小说",
+                            name = tostring(item.title),
+                            tab = "novel",
+                            bookid = tostring(item.book_id or ""),
+                        },
+                    })
+                end
+            end
+            return books
+        end,
+    }
+
+    local errors = {}
+    for _, src in ipairs(sources) do
+        local searcher = searchers[src.id]
+        if searcher then
+            local rl = src.config.rate_limit or {}
+            local ok_rl, wait = SourceManager.rate_limit_check(src.id, rl.max_requests, rl.window_seconds)
+            if not ok_rl then
+                table.insert(errors, src.id .. ": 限流中(需等" .. tostring(wait) .. "s)")
+            else
+                local ok, books = pcall(searcher, keyword)
+                if ok and type(books) == "table" and #books > 0 then
+                    return books, src.id
+                end
+                local err_msg = "未知错误"
+                if type(books) == "string" then err_msg = books
+                elseif type(books) == "table" and books.message then err_msg = books.message end
+                table.insert(errors, src.id .. ": " .. err_msg)
+            end
+        end
+    end
+
+    error("所有书源搜索均失败: " .. table.concat(errors, " | "))
+end
+
+-- ============================================================================
+-- 按 book._search_source 锁定源取目录
+-- ============================================================================
+-- 官方源分支保持网页目录接口（fetch_chapter_directory），不受 App reading 协议影响。
+function Client:get_catalog_for(book, opts)
+    opts = opts or {}
+    local src = book._search_source or "official"
+    local hint = book._catalog_hint or {}
+
+    if src == "shushan" then
+        local ShuShan = require("fanqie.shushan")
+        local book_url = hint.book_url or book.book_url or ""
+        -- book_url 是 base64 的 detail URL，解出来就是书山 /catalog 要的 url
+        local detail_url = ""
+        local ok_d, decoded = pcall(function() return ShuShan.base64_decode(book_url) end)
+        if ok_d and decoded and decoded ~= "" then
+            detail_url = decoded
+        else
+            detail_url = book_url   -- 兜底：可能已经是明文
+        end
+        return ShuShan.get_catalog(self, self.settings, detail_url, {
+            source = hint.source or book.source or "番茄小说",
+            name = hint.name or book.title or "",
+            tab = hint.tab or "novel",
+            bookid = hint.bookid or book.book_id or "",
+        })
+
+    elseif src == "zhiqiu" then
+        local ZhiQiu = require("fanqie.zhiqiu")
+        return ZhiQiu.get_catalog(self, self.settings, book.book_id, opts)
+
+    else
+        -- 官方：fetch_chapter_directory + 归一化
+        local raw = self:fetch_chapter_directory(book.book_id)
+        local Content = require("fanqie.content")
+        return Content.readable_chapters(Content.normalize_chapters(raw, book.book_id))
+    end
+end
+
 return Client
