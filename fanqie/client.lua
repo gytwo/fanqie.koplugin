@@ -638,7 +638,7 @@ function Client:official_get_para_replies(comment_id, opts)
     end
     local Comments = require("fanqie.reading.comments")
     local list, info, err = Comments.replies(self, self.settings, comment_id, {
-        count = tonumber(opts.count) or 20,
+        count = tonumber(opts.count) or 40,
         cursor = tostring(opts.cursor or ""),
     })
     if not list then
@@ -816,7 +816,7 @@ function Client:zhiqiu_get_para_review(ident)
     local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
         .. "&cid=" .. H.url_encode(cid)
         .. "&pid=" .. H.url_encode(pid)
-        .. "&page=1&size=30"
+        .. "&page=1&size=40"
 
     local ok_logger, logger_mod = pcall(require, "fanqie.logger")
     if ok_logger and logger_mod then
