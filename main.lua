@@ -653,7 +653,7 @@ function FanQiePlugin:showParaReviewDetail(index)
                         .. "（请确认书山账号已登录、Android ID 为真实设备）")
                 end
             elseif is_zhiqiu then
-                ok, result = pcall(function() return c:zhiqiu_get_para_review(ident) end)
+                ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 40, page_max = 1 }) end)
             else
                 -- 无法识别的 ident（多为旧缓存中已移除书源的历史段评）
                 error("无法识别段评来源: " .. ident_str:sub(1, 60))
@@ -684,7 +684,7 @@ function FanQiePlugin:showParaReviewDetail(index)
                     .. "（请确认书山账号已登录、Android ID 为真实设备）")
             end
         elseif is_zhiqiu then
-            ok, result = pcall(function() return c:zhiqiu_get_para_review(ident) end)
+            ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 40, page_max = 1 }) end)
         else
             -- 无法识别的 ident（多为旧缓存中已移除书源的历史段评）
             ok, result = false, "无法识别段评来源: " .. ident_str:sub(1, 60)
@@ -1033,10 +1033,10 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                 elseif idt:find("zhiqiu:", 1, true) then
                     -- 知秋按 page 翻页（不是 cursor），cursor 里存的是下一页页码
                     return c:zhiqiu_get_para_review(idt,
-                        { page = tonumber(st.cursor) or 2, size = 30, page_max = 1 })
+                        { page = tonumber(st.cursor) or 2, size = 40, page_max = 1 })
                 end
                 return c:shushan_get_para_review(idt,
-                    { cursor = st.cursor, count = 20, page_max = 1 })
+                    { cursor = st.cursor, count = 20, page_max = 2 })
             end, function(ok2, result2, err2)
                 st.busy = false
                 if ok2 and type(result2) == "table" then
