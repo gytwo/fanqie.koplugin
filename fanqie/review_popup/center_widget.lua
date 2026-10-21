@@ -53,6 +53,8 @@ local CenterThoughtPopupWidget = InputContainer:extend{
     height_ratio = 0.70,
     width_ratio = 0.8,
     contrast = 9,
+    doc_font_weight = 0,
+    doc_font_gamma = 0,
     tap_to_page = true,
     close_callback = nil,
     dialog = nil,
@@ -118,6 +120,8 @@ function CenterThoughtPopupWidget:init()
         height_ratio = self.height_ratio,
         content_width = self.width,
         contrast = self.contrast,
+        doc_font_weight = self.doc_font_weight,
+        doc_font_gamma = self.doc_font_gamma,
         skip_quote = true,
     }
     self:_buildLayout()
@@ -137,6 +141,8 @@ function CenterThoughtPopupWidget:_reopen(opts)
     if opts.height_ratio then self.height_ratio = opts.height_ratio end
     if opts.width_ratio then self.width_ratio = opts.width_ratio end
     if opts.contrast ~= nil then self.contrast = opts.contrast end
+    if opts.doc_font_weight ~= nil then self.doc_font_weight = opts.doc_font_weight end
+    if opts.doc_font_gamma ~= nil then self.doc_font_gamma = opts.doc_font_gamma end
     if opts.tap_to_page ~= nil then self.tap_to_page = opts.tap_to_page end
     if opts.dialog then self.dialog = opts.dialog end
     self.close_callback = opts.close_callback
@@ -146,7 +152,8 @@ function CenterThoughtPopupWidget:_reopen(opts)
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
 
     self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, self.width, self.contrast)
+        self.doc_margins, self.height_ratio, self.width, self.contrast,
+        self.doc_font_weight, self.doc_font_gamma)
     self:_buildLayout()
 end
 

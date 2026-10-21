@@ -67,6 +67,15 @@ local function adjustedGray(level, contrast)
     return grayForLevel(level - delta)
 end
 
+--- 阅读器的「对比度」(font_gamma) 为负时正文不再纯黑。cre 的 gamma 只作用于
+--- crengine 自己的字形栅格，弹框这套自绘字体读不到，只能在字色上近似；
+--- 正 gamma 表现为笔画变粗，由 face_factory 的仿粗档位负责。
+local function textColorForGamma(gamma)
+    local g = tonumber(gamma) or 0
+    if g >= 0 then return Blitbuffer.COLOR_BLACK end
+    return grayForLevel(math.min(4, math.floor(-g * 4 + 0.5)))
+end
+
 --- UTF-8-safe truncation with an ellipsis suffix.
 --- Character splitting uses koreader util.splitToChars (merges WTF-8 surrogate pairs).
 local function truncateRunes(str, max_runes)
@@ -173,6 +182,7 @@ function ContentBuilder.build(items, opts)
     if type(items) ~= "table" or #items == 0 then
         return blocks
     end
+    local text_fg = textColorForGamma(opts.gamma)
 
     local quote = not opts.skip_quote and buildQuoteText(items[1] and items[1].abstract)
     if quote then
@@ -180,7 +190,7 @@ function ContentBuilder.build(items, opts)
             kind = "paragraph",
             variant = "quote",
             text = quote,
-            fg = Blitbuffer.COLOR_BLACK,
+            fg = text_fg,
         }
     end
 
@@ -209,7 +219,7 @@ function ContentBuilder.build(items, opts)
                 kind = "paragraph",
                 variant = "content",
                 text = content,
-                fg = Blitbuffer.COLOR_BLACK,
+                fg = text_fg,
             }
         end
 
@@ -269,7 +279,7 @@ function ContentBuilder.build(items, opts)
                             kind = "paragraph",
                             variant = "reply",
                             text = rtext,
-                            fg = Blitbuffer.COLOR_BLACK,
+                            fg = text_fg,
                             indent_level = 1,
                             item_index = item_index,
                         }
