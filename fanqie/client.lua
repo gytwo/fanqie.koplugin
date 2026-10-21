@@ -782,7 +782,8 @@ end
 -- 解析出 bid/cid/pid，调用 GET /novel/comment/paragraph_list 取该段评论。
 -- 返回结构为番茄原生 { code, data:{ common_list_info:{total,..}, data_list:[{comment:{common,stat}}] } }，
 -- 与书山段评返回格式一致，main.lua 的 _displayParaReviewDetail 可直接解析。
-function Client:zhiqiu_get_para_review(ident)
+function Client:zhiqiu_get_para_review(ident, opts)
+    opts = opts or {}
     local cfg = self.settings:get_source("zhiqiu")
     local ZhiQiu = require("fanqie.zhiqiu")
     local base = H.trim(cfg.server_url or ZhiQiu.DEFAULT_BASE)
@@ -813,10 +814,13 @@ function Client:zhiqiu_get_para_review(ident)
         error("知秋段评 ident 无效: " .. tostring(ident):sub(1, 80))
     end
 
+    local page = tonumber(opts.page) or 1
+    local size = tonumber(opts.size) or 40
     local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
         .. "&cid=" .. H.url_encode(cid)
         .. "&pid=" .. H.url_encode(pid)
-        .. "&page=1&size=40"
+        .. "&page=" .. tostring(page)
+        .. "&size=" .. tostring(size)
 
     local ok_logger, logger_mod = pcall(require, "fanqie.logger")
     if ok_logger and logger_mod then
