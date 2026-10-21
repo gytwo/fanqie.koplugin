@@ -106,7 +106,7 @@ function Download.execute(parent, book, chapters, start_idx, end_idx, opts)
     end
 
     local dialog = DownloadProgress:new{
-        title = T(_("下载 %s"), book.title or book.book_id),
+        title = T(_("下载 %1"), book.title or book.book_id),
     }
     -- 设置后台运行回调（对话框关闭但下载继续）
     -- 关键：关闭后必须确保有 widget 显示，否则 UIManager 会退出，内存状态丢失
