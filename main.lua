@@ -1029,7 +1029,7 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                 local idt = st.ident
                 if idt:find("official:", 1, true) then
                     return c:official_get_para_review(idt,
-                        { cursor = st.cursor, count = 20 })
+                        { cursor = st.cursor, count = 40 })
                 elseif idt:find("zhiqiu:", 1, true) then
                     -- 知秋按 page 翻页（不是 cursor），cursor 里存的是下一页页码
                     return c:zhiqiu_get_para_review(idt,
