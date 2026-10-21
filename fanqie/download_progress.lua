@@ -147,6 +147,8 @@ function DownloadProgress:init()
 end
 
 function DownloadProgress:_redraw()
+    if self._backgrounded then return end
+    if not UIManager:isWidgetShown(self) then return end
     local target = (self.frame and self.frame.dimen) or self.dimen
     UIManager:setDirty(self, function()
         return "fast", target
