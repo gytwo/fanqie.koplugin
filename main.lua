@@ -653,7 +653,7 @@ function FanQiePlugin:showParaReviewDetail(index)
                         .. "（请确认书山账号已登录、Android ID 为真实设备）")
                 end
             elseif is_zhiqiu then
-                ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 40, page_max = 1 }) end)
+                ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 }) end)
             else
                 -- 无法识别的 ident（多为旧缓存中已移除书源的历史段评）
                 error("无法识别段评来源: " .. ident_str:sub(1, 60))
@@ -684,7 +684,7 @@ function FanQiePlugin:showParaReviewDetail(index)
                     .. "（请确认书山账号已登录、Android ID 为真实设备）")
             end
         elseif is_zhiqiu then
-            ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 40, page_max = 1 }) end)
+            ok, result = pcall(function() return c:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 }) end)
         else
             -- 无法识别的 ident（多为旧缓存中已移除书源的历史段评）
             ok, result = false, "无法识别段评来源: " .. ident_str:sub(1, 60)
@@ -1031,9 +1031,13 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                     return c:official_get_para_review(idt,
                         { cursor = st.cursor, count = 40 })
                 elseif idt:find("zhiqiu:", 1, true) then
-                    -- 知秋按 page 翻页（不是 cursor），cursor 里存的是下一页页码
+                    -- 知秋服务端固定每页 30 条（实测 size 参数被忽略），
+                    -- 且返回的 common_list_info.cursor 是"已返回条数偏移量"（30/60/…），
+                    -- 不是页码。按已加载条数换算下一页页码，避免 page=30 跳页。
+                    local loaded = #(st.rich_items or {})
+                    local next_page = math.floor(loaded / 30) + 1
                     return c:zhiqiu_get_para_review(idt,
-                        { page = tonumber(st.cursor) or 2, size = 40, page_max = 1 })
+                        { page = next_page, size = 30, page_max = 1 })
                 end
                 return c:shushan_get_para_review(idt,
                     { cursor = st.cursor, count = 20, page_max = 2 })
