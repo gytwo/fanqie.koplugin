@@ -88,10 +88,23 @@ function ZhiQiu.get_content(client, settings, book_id, item_id, opts)
     end
 
     local url = base .. "/novel/chap?" .. table.concat(q, "&")
-    local text, code = http_get(client, url, {
-        ["x-sec-token"]  = token,
-        ["x-android-id"] = android_id,
-    })
+    local function request_chap(tok, aid)
+        return http_get(client, url, {
+            ["x-sec-token"]  = tok,
+            ["x-android-id"] = aid,
+        })
+    end
+
+    local text, code = request_chap(token, android_id)
+
+    if code == 401 then
+        local ok_mint, new_token = pcall(ZhiQiu.ensure_token, client, settings, true)
+        if ok_mint and new_token and new_token ~= "" then
+            android_id = resolve_android_id(settings)
+            text, code = request_chap(new_token, android_id)
+        end
+    end
+
     if not text or not code then
         error("知秋正文请求失败（网络错误）")
     end
