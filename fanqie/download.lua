@@ -253,7 +253,7 @@ function Download.execute(parent, book, chapters, start_idx, end_idx, opts)
         if cancelled and state.downloaded < state.total then
             self_ref:showInfo(T(_("已取消下载\n已保存 %1/%2 章"), state.downloaded, state.total))
         else
-            local msg = T(_("下载完成!\n《%s》共 %1/%2 章"), book.title or book.book_id, state.downloaded, state.total)
+            local msg = T(_("下载完成!\n《%1》共 %2/%3 章"), book.title or book.book_id, state.downloaded, state.total)
             if state.skipped > 0 then msg = msg .. T(_(" (跳过已缓存 %d 章)"), state.skipped) end
             if state.failed > 0 then msg = msg .. T(_(" (失败 %d 章)"), state.failed) end
             self_ref:showInfo(msg)
