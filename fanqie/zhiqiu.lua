@@ -396,4 +396,31 @@ function ZhiQiu.is_configured(cfg)
     return pw1 ~= "" and pw2 ~= "" and pw3 ~= ""
 end
 
+-- 知秋搜索：GET {base}/{type}/search?keyword=<kw>&page=<n>
+-- 返回 data 数组：{ { title, author, cover, intro, type, last_chapter_title, word_number, book_id }, ... }
+-- type 取值：novel（小说）/ comic（漫画）/ audio（听书）/ video（短剧），默认 novel。
+function ZhiQiu.search(client, settings, keyword, opts)
+    opts = opts or {}
+    local cfg = settings:get_source("zhiqiu") or {}
+    local base = H.trim(cfg.server_url or ZhiQiu.DEFAULT_BASE)
+    if base:sub(-1) == "/" then base = base:sub(1, -2) end
+    local token = H.trim(cfg.token or "")
+    if token == "" then token = ZhiQiu.ensure_token(client, settings, false) end
+    if token == "" then error("知秋 Token 未配置") end
+    local aid = ZhiQiu.resolve_android_id(settings)
+    local type_ = opts.type_ or "novel"
+    local url = base .. "/" .. type_ .. "/search?keyword=" .. H.url_encode(keyword)
+        .. "&page=" .. tostring(opts.page or 1)
+    local text, code = http_get(client, url, {
+        ["x-sec-token"]  = token,
+        ["x-android-id"] = aid,
+    })
+    if not text or not code or code < 200 or code >= 300 then
+        error("知秋搜索失败: HTTP " .. tostring(code or "nil"))
+    end
+    local ok, obj = pcall(function() return client:json_decode(text) end)
+    if not ok or type(obj) ~= "table" then error("知秋搜索响应非 JSON") end
+    return obj.data or {}
+end
+
 return ZhiQiu
