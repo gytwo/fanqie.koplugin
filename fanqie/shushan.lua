@@ -399,9 +399,9 @@ function ShuShan.get_content(client, settings, book_id, item_id, opts)
     local api_key = ShuShan.ensure_api_key(client, settings, false)
     local aid = ShuShan.resolve_android_id(cfg)
     local ok_aid, aid_norm = ShuShan.validate_android_id(aid)
-    if not ok_aid then
-        error("书山正文需要真实的 Android ID（16/32位hex）。请在书山设置中填写你已登录书山的那台安卓设备的 Android ID，插件不会自动生成（防封号）。")
-    end
+    --if not ok_aid then
+    --   error("书山正文需要真实的 Android ID（16/32位hex）。请在书山设置中填写你已登录书山的那台安卓设备的 Android ID，插件不会自动生成（防封号）。")
+    --end
     local dev_type = ShuShan.resolve_device_type(cfg)
     local source = H.trim(opts.source or cfg.source or ShuShan.DEFAULT_SOURCE)
     -- 书山段评目前只支持番茄聚合源（/para?source=fq 用番茄 item_id 作 chapter_id）。
@@ -533,14 +533,15 @@ function ShuShan._fetch_fq_para_reviews(client, settings, book_id, item_id)
     ShuShan.ensure_api_key(client, settings, false)
     local aid = ShuShan.resolve_android_id(cfg)
     local ok_aid, aid_norm = ShuShan.validate_android_id(aid)
-    if not ok_aid then
+    --if not ok_aid then
         -- 无设备码则无法拉段评（与正文同源校验）：降级但必须留痕
-        warn("[FanQie] 书山段评跳过: 未配置真实 Android ID, itemId=" .. tostring(item_id))
-        return nil
-    end
+        -- warn("[FanQie] 书山段评跳过: 未配置真实 Android ID, itemId=" .. tostring(item_id))
+        -- return nil
+    --end
     local dev_type = ShuShan.resolve_device_type(cfg)
     local obj = request_json_multi(client, settings, cfg, {
-        path = "/para?source=fq&chapter_id=" .. H.url_encode(tostring(item_id)),
+        path = "/para?source=fq&book_id=" .. H.url_encode(tostring(book_id))
+            .. "&chapter_id=" .. H.url_encode(tostring(item_id)),
         method = "GET",
         headers = {
             ["X-Api-Key"] = ShuShan.secret_key_header(cfg),
@@ -589,9 +590,9 @@ function ShuShan.get_para_review(client, settings, book_id, item_id, para_id, op
     ShuShan.ensure_api_key(client, settings, false)
     local aid = ShuShan.resolve_android_id(cfg)
     local ok_aid, aid_norm = ShuShan.validate_android_id(aid)
-    if not ok_aid then
-        error("书山段评需要真实的 Android ID（16/32位hex）。请在书山设置中填写已登录书山的安卓设备 ID。")
-    end
+    --if not ok_aid then
+    --    error("书山段评需要真实的 Android ID（16/32位hex）。请在书山设置中填写已登录书山的安卓设备 ID。")
+    --end
     local dev_type = ShuShan.resolve_device_type(cfg)
 
     local COUNT    = tonumber(opts.count) or 20
