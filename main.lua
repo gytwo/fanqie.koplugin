@@ -423,6 +423,12 @@ function FanQiePlugin:onDispatcherRegisterActions()
         title = _("番茄-拉取段评"),
         reader = true,
     })
+    Dispatcher:registerAction("fanqie_review_cache_manager", {
+        category = "none",
+        event = "FanQieReviewCacheManager",
+        title = _("番茄-段评缓存管理"),
+        reader = true,
+    })
 end
 
 function FanQiePlugin:safeCallback(label, callback)
@@ -4125,6 +4131,27 @@ end
 
 -- Book opening (from bookshelf or direct)
 
+-- 在书籍缓存目录下查找已生成的完本 EPUB。
+-- EPUB 由 epub_builder.build 生成，路径为 <book_cache_dir>/<书名>.epub。
+-- 返回第一个找到的 .epub 路径，没有则 nil。
+function FanQiePlugin:_findBookEpub(book)
+    if not book or not book.book_id then return nil end
+    local ok_content, Content = pcall(require, "fanqie.content")
+    if not ok_content or not Content then return nil end
+    local book_dir = Content.book_cache_dir(self.settings, book.book_id)
+    if not book_dir or not H.dir_exists(book_dir) then return nil end
+    local lfs = require("libs/libkoreader-lfs")
+    for entry in lfs.dir(book_dir) do
+        if entry ~= "." and entry ~= ".." and entry:lower():match("%.epub$") then
+            local path = book_dir .. "/" .. entry
+            if H.file_exists(path) then
+                return path
+            end
+        end
+    end
+    return nil
+end
+
 -- 用缓存目录进入阅读（离线模式或网络获取失败时的回退路径）
 function FanQiePlugin:_openBookWithCache(book, cached_chapters)
     if not cached_chapters or #cached_chapters == 0 then return end
@@ -4166,6 +4193,18 @@ function FanQiePlugin:openBook(book)
         Patches.install()
         self.patches_ok = true
     end
+
+    -- 优先打开已生成的完本 EPUB（存在则直接读，不再走章节缓存）
+    local epub_path = self:_findBookEpub(book)
+    if epub_path then
+        if Log then Log.info("openBook: found local EPUB, open it:", epub_path) end
+        local ReaderUI = require("apps/reader/readerui")
+        UIManager:nextTick(function()
+            ReaderUI:showReader(epub_path)
+        end)
+        return
+    end
+
     _state.current_book = book
 
     -- 先尝试目录缓存（本地 IO，不阻塞）
@@ -4396,6 +4435,11 @@ function FanQiePlugin:onFanQieFetchLocalReview(retry)
         return true
     end
     LocalReview.run(self)
+    return true
+end
+
+function FanQiePlugin:onFanQieReviewCacheManager()
+    self:showReviewCacheManager()
     return true
 end
 
