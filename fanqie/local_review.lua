@@ -868,11 +868,11 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
                             local ok_r, result_r
                             if is_official then
                                 ok_r, result_r = pcall(function()
-                                    return client:official_get_para_review(ident, { count = 20 })
+                                    return client:official_get_para_review(ident, { count = 40 })
                                 end)
                             elseif is_shushan then
                                 ok_r, result_r = pcall(function()
-                                    return client:shushan_get_para_review(ident, { count = 30, page_max = 1 })
+                                    return client:shushan_get_para_review(ident, { page_max = 2 })
                                 end)
                             else
                                 ok_r, result_r = pcall(function()
