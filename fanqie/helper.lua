@@ -144,17 +144,29 @@ M.delete_file = function(path)
     return true
 end
 
+-- 原子写：先写同目录下的 .tmp，再 rename 覆盖目标。
+-- 目的：Async 子进程写 para_comments_*.lua / para_records_*.lua 时，
+-- 父进程可能同时在 dofile 读同一个文件；非原子写会让父进程读到半截
+-- Lua（dofile 失败 → 段评"数据无效" → 触发重试链路）。
+-- 同目录 rename 在 POSIX / FAT32 / exFAT 上均为原子操作。
 M.write_file = function(path, data)
     local dir = path:match("^(.*)/[^/]+$")
     if dir then
         M.make_dir(dir)
     end
-    local file, err = io.open(path, "wb")
+    local tmp = path .. ".tmp"
+    local file, err = io.open(tmp, "wb")
     if not file then
         error(err)
     end
     file:write(data)
     file:close()
+    os.remove(path)
+    local ok, rerr = os.rename(tmp, path)
+    if not ok then
+        os.remove(tmp)
+        error(rerr)
+    end
 end
 
 M.delete_dir = function(path)
