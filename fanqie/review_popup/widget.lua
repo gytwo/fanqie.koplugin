@@ -48,6 +48,8 @@ local ThoughtPopupWidget = InputContainer:extend{
     },
     height_ratio = 0.70,
     contrast = 9,
+    doc_font_weight = 0,
+    doc_font_gamma = 0,
     -- When true, tapping the left/right half of the bar pages up/down through
     -- the review list (handled in onTapClose, like the weread centered popup).
     tap_to_page = true,
@@ -121,6 +123,8 @@ function ThoughtPopupWidget:init()
         doc_margins = self.doc_margins,
         height_ratio = self.height_ratio,
         contrast = self.contrast,
+        doc_font_weight = self.doc_font_weight,
+        doc_font_gamma = self.doc_font_gamma,
     }
     self._pages:ensureLayout()
     self:_buildLayout()
@@ -147,6 +151,8 @@ function ThoughtPopupWidget:_reopen(opts)
     if opts.doc_margins then self.doc_margins = opts.doc_margins end
     if opts.height_ratio then self.height_ratio = opts.height_ratio end
     if opts.contrast ~= nil then self.contrast = opts.contrast end
+    if opts.doc_font_weight ~= nil then self.doc_font_weight = opts.doc_font_weight end
+    if opts.doc_font_gamma ~= nil then self.doc_font_gamma = opts.doc_font_gamma end
     if opts.tap_to_page ~= nil then self.tap_to_page = opts.tap_to_page end
     if opts.dialog then self.dialog = opts.dialog end
     self.close_callback = opts.close_callback
@@ -158,7 +164,8 @@ function ThoughtPopupWidget:_reopen(opts)
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
 
     self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, nil, self.contrast)
+        self.doc_margins, self.height_ratio, nil, self.contrast,
+        self.doc_font_weight, self.doc_font_gamma)
     self:_buildLayout()
 end
 
@@ -385,7 +392,8 @@ function ThoughtPopupWidget:_refreshAfterReplyChange()
     local offset = (self._scroll_container and self._scroll_container.scroll_offset) or 0
     self._restore_offset = offset
     self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, nil, self.contrast)
+        self.doc_margins, self.height_ratio, nil, self.contrast,
+        self.doc_font_weight, self.doc_font_gamma)
     self:_buildLayout()
     UIManager:setDirty(self, function()
         return "partial", self.container.dimen

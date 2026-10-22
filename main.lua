@@ -926,12 +926,19 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             local doc = self.ui.document
             local doc_font_size = (doc and doc.configurable and doc.configurable.font_size) or 18
             if Screen and Screen.scaleBySize then
-                -- 弹框字号比正文小一号（KOReader 每档 = 整数值 ±1，见 readerfont）
-                opts.doc_font_size = Screen:scaleBySize(math.max(doc_font_size - 1, 10))
+                -- 弹框基础字号 = 正文字号（各 variant 再按 face_factory 的比例缩放）
+                opts.doc_font_size = Screen:scaleBySize(math.max(doc_font_size, 10))
             end
             if doc and doc.getPageMargins then
                 local okm, margins = pcall(function() return doc:getPageMargins() end)
                 if okm and margins then opts.doc_margins = margins end
+            end
+            -- 继承阅读器的「字重」与「对比度」：弹框自建 face，cre 的
+            -- font.face.base.weight / gamma 对它无效，得自己换算
+            local conf = doc and doc.configurable
+            if conf then
+                opts.doc_font_weight = tonumber(conf.font_base_weight) or 0
+                opts.doc_font_gamma = tonumber(conf.font_gamma) or 0
             end
         end
 

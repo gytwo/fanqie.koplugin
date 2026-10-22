@@ -144,6 +144,9 @@ function Paginator.renderTextPiece(piece)
 
     local y = piece.baseline or math.floor(line_h * 0.8)
     local face = piece.face
+    -- 字重跟随正文：piece.bold 由 FaceFactory 按阅读器的字重/对比度算出。
+    -- 真粗体文件的 is_real_bold 为真时，getGlyphByIndex 内部会自动跳过仿粗。
+    local bold = piece.bold == true
     for i = 1, #piece.lines do
         local line = piece.lines[i]
         shapeLineCached(piece.xtext, line)
@@ -152,7 +155,7 @@ function Paginator.renderTextPiece(piece)
                 if not xglyph.no_drawing then
                     local glyph_face = face.getFallbackFont(xglyph.font_num)
                     if glyph_face then
-                        local glyph = RenderText:getGlyphByIndex(glyph_face, xglyph.glyph, false, false)
+                        local glyph = RenderText:getGlyphByIndex(glyph_face, xglyph.glyph, bold, false)
                         if glyph and glyph.bb then
                             local dx = xglyph.x0 + glyph.l + xglyph.x_offset
                             local dy = y - glyph.t - xglyph.y_offset

@@ -31,20 +31,44 @@ local FaceFactory = {
     fallback_cache = {}, -- path|size -> FontFaceObj (fallback faces shared across variants)
 }
 
--- Size variants (relative to the base size). quote/meta render one step
--- smaller; meta is the author line.
--- 二级评论（官方源的回复）用同一套字体，只把字号降半档：
---   reply_meta / reply  = 0.85（一级 meta/content 是 0.9）
--- 「展开 N 条回复」这个入口属于一级评论的附属行，字号与一级作者行完全一致
--- （0.9）—— 之前没有登记 variant，getFace 兜底成 1.0，反而比正文还大。
+-- Size variants (relative to the base size, which equals the body font size).
+-- 一级评论 0.93，二级评论 0.90（比一级略小一点）。
+-- 「展开 N 条回复」属于一级评论的附属行，与一级作者行同号 —— 未登记 variant
+-- 时 getFace 会兜底成 1.0，反而比一级正文还大。
 FaceFactory.VARIANTS = {
-    content      = 0.9,   -- thought body
-    quote        = 0.9,   -- quoted abstract (italic, gray)
-    meta         = 0.9,   -- author line; keep it as readable as the thought body
-    reply_meta   = 0.85,  -- 二级评论作者行：字体同 meta，字号小半档
-    reply        = 0.85,  -- 二级评论正文：字体同 content，字号小半档
-    reply_toggle = 0.9,   -- 「展开/收起 N 条回复」：与一级作者行同款同号
+    content      = 0.93,  -- thought body
+    quote        = 0.93,  -- quoted abstract (italic, gray)
+    meta         = 0.93,  -- author line; same size as the thought body
+    reply_meta   = 0.90,  -- 二级评论作者行：字体同 meta，字号略小
+    reply        = 0.90,  -- 二级评论正文：字体同 content，字号略小
+    reply_toggle = 0.93,  -- 「展开/收起 N 条回复」：与一级作者行同款同号
 }
+
+-- 仿粗强度（对应 KOReader Font.lua 的 bold_strength_factor = 3/8）。
+-- 档位 1 用更轻的强度，只够补上「对比度调高」那点笔画差异。
+local SYNTH_BOLD_FACTORS = { [1] = 0.18, [2] = 3 / 8 }
+
+--- 把阅读器的「字重 + 对比度」映射成弹框的字重档位：
+---   0 常规 / 1 轻仿粗 / 2 标准仿粗
+--- cre 的 font.face.base.weight（400/500/350）与 setGammaIndex 只作用于
+--- crengine 排版，弹框是自建 FreeType face，必须自己换算。
+--- 字重「加粗」= cre 的 500（中等），不是 700，所以用仿粗而不是直接换成
+--- 粗体文件——后者会明显比正文重。
+function FaceFactory.resolveBoldLevel(weight, gamma)
+    weight = tonumber(weight) or 0
+    gamma = tonumber(gamma) or 0
+    local level = 0
+    if weight >= 0.5 then
+        level = 2
+    end
+    -- 对比度调高时正文字缘被压深，视觉上等于笔画变粗；负数则靠字色变浅表现
+    if gamma >= 1.25 then
+        level = math.max(level, 2)
+    elseif gamma > 0.25 then
+        level = math.max(level, 1)
+    end
+    return level
+end
 
 function FaceFactory:init()
     if self.initialized then return end
@@ -184,27 +208,40 @@ local function resolveBundledFont(fontname)
     return nil
 end
 
-function FaceFactory:_buildFace(path, size)
+--- @param embolden_factor number|nil 仿粗强度；nil 表示常规字重
+function FaceFactory:_buildFace(path, size, embolden_factor)
     if not path or not size or size <= 0 then return nil end
     local ok, ftsize = pcall(Freetype.newFaceSize, path, size)
     if not ok or not ftsize then
         logger.warn("thought popup failed to open font:", path, ftsize)
         return nil
     end
-    -- 仿粗体的加粗强度（上游 Font:getAdjustedFace 同款）；老版本 FreeType
+    -- 仿粗的加粗强度（上游 Font:getAdjustedFace 同款）；老版本 FreeType
     -- 包装没有这个方法，取不到就留空（xtext 会退回普通仿粗）。
-    local ok_emb, half = pcall(function()
-        return ftsize:getEmboldenHalfStrength(3 / 8)
-    end)
+    local half
+    if embolden_factor then
+        local ok_emb, v = pcall(function()
+            return ftsize:getEmboldenHalfStrength(embolden_factor)
+        end)
+        half = ok_emb and v or nil
+    end
+    -- ⚠️ hash 必须带仿粗强度：RenderText:getGlyphByIndex 的字形缓存键是
+    --    face.hash + bold 布尔值，轻仿粗和标准仿粗都是 bold=true，不带强度
+    --    就会互相串用（轻档拿到粗档的字形）。
+    local hash = path .. "|" .. size
+    if embolden_factor then
+        hash = string.format("%s|emb%.3f", hash, embolden_factor)
+    end
     local face_obj = {
         orig_font = path,
         realname = path,
         size = size,
         orig_size = size,
         ftsize = ftsize,
-        hash = path .. "|" .. size,
+        hash = hash,
         is_real_bold = false,
-        embolden_half_strength = (ok_emb and half) or nil,
+        embolden_half_strength = half,
+        synth_bold = half ~= nil,
         hb_features = { "+kern", "+liga" },
     }
     face_obj.fallbacks = {}
@@ -218,13 +255,14 @@ function FaceFactory:_buildFace(path, size)
     return face_obj
 end
 
---- Fallback faces are shared process-wide: one FT face per (path, size).
-function FaceFactory:_getFallbackFace(path, size)
+--- Fallback faces are shared process-wide: one FT face per (path, size, 仿粗强度).
+--- 仿粗链要跟着主字体走，否则中文全落在回退字体上，加粗会失效。
+function FaceFactory:_getFallbackFace(path, size, embolden_factor)
     if not path or not size or size <= 0 then return nil end
-    local key = path .. "|" .. size
+    local key = string.format("%s|%d|%s", path, size, tostring(embolden_factor))
     local cached = self.fallback_cache[key]
     if cached then return cached end
-    local face = self:_buildFace(path, size)
+    local face = self:_buildFace(path, size, embolden_factor)
     if face then
         self.fallback_cache[key] = face
     end
@@ -248,7 +286,7 @@ local FALLBACK_FONT_NAMES = {
     "NotoEmoji-Regular.ttf", -- special: resolved via self.emoji_path; must stay last
 }
 
-function FaceFactory:_addFallbacks(face, size)
+function FaceFactory:_addFallbacks(face, size, embolden_factor)
     local fallbacks = {}
     local n = 0
     for _, fontname in ipairs(FALLBACK_FONT_NAMES) do
@@ -260,7 +298,7 @@ function FaceFactory:_addFallbacks(face, size)
             path = resolveBundledFont(fontname)
         end
         if path then
-            local fb = self:_getFallbackFace(path, size)
+            local fb = self:_getFallbackFace(path, size, embolden_factor)
             if fb then
                 n = n + 1
                 fallbacks[n] = fb
@@ -275,9 +313,11 @@ end
 --- @param doc_font_name string|nil document font name (nil -> Noto Sans family)
 --- @param size number DPI-scaled base size (i.e. doc_font_size)
 --- @param variant string key of VARIANTS
-function FaceFactory:getFace(doc_font_name, size, variant)
+--- @param bold_level number|nil 0..3, see resolveBoldLevel
+function FaceFactory:getFace(doc_font_name, size, variant, bold_level)
     variant = variant or "content"
-    local key = string.format("%s|%d|%s", doc_font_name or "", size or 0, variant)
+    bold_level = tonumber(bold_level) or 0
+    local key = string.format("%s|%d|%s|%d", doc_font_name or "", size or 0, variant, bold_level)
     local cached = self.face_cache[key]
     if cached then return cached end
 
@@ -288,6 +328,7 @@ function FaceFactory:getFace(doc_font_name, size, variant)
     local paths = self:getFontPaths(doc_font_name)
     local regular, italic
     for _, fp in ipairs(paths) do
+        -- 仿粗统一走常规字形：cre 的「加粗」是 500（中等），换成真粗体会过重
         if not fp.bold then
             if fp.italic then
                 if not italic then italic = fp.path end
@@ -296,12 +337,16 @@ function FaceFactory:getFace(doc_font_name, size, variant)
             end
         end
     end
+
     local prefer_italic = variant == "quote"
     local path = prefer_italic and (italic or regular) or (regular or italic)
+    local synth = bold_level > 0
+    local factor = synth and SYNTH_BOLD_FACTORS[bold_level >= 2 and 2 or 1] or nil
+
     if path then
-        face = self:_buildFace(path, v_size)
+        face = self:_buildFace(path, v_size, factor)
         if face then
-            self:_addFallbacks(face, v_size)
+            self:_addFallbacks(face, v_size, factor)
         end
     end
 
@@ -312,9 +357,9 @@ function FaceFactory:getFace(doc_font_name, size, variant)
             prefer_italic and "NotoSans-Italic.ttf" or "NotoSans-Regular.ttf")
             or resolveBundledFont("NotoSansCJKsc-Regular.otf")
         if fallback_path then
-            face = self:_buildFace(fallback_path, v_size)
+            face = self:_buildFace(fallback_path, v_size, factor)
             if face then
-                self:_addFallbacks(face, v_size)
+                self:_addFallbacks(face, v_size, factor)
             end
         end
     end

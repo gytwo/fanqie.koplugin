@@ -88,14 +88,17 @@ local function itemsKey(items)
     return table.concat(parts, "\n")
 end
 
-local function geomKey(doc_font_name, doc_font_size, margins, height_ratio, content_width, contrast)
+local function geomKey(doc_font_name, doc_font_size, margins, height_ratio, content_width, contrast,
+                       weight, gamma)
     local m = margins or {}
-    return string.format("%s|%d|%d_%d_%d_%d|%.4f|%d|%d",
+    return string.format("%s|%d|%d_%d_%d_%d|%.4f|%d|%d|%s|%s",
         doc_font_name or "", doc_font_size or 0,
         m.left or 0, m.right or 0, m.top or 0, m.bottom or 0,
         height_ratio or 0.35,
         content_width or 0,
-        tonumber(contrast) or 0)
+        tonumber(contrast) or 0,
+        tostring(tonumber(weight) or 0),
+        tostring(tonumber(gamma) or 0))
 end
 
 local PageRenderer = {}
@@ -120,6 +123,9 @@ function PageRenderer:new(opts)
     self_obj.height_ratio = opts.height_ratio or 0.35
     self_obj.content_width = opts.content_width
     self_obj.contrast = tonumber(opts.contrast) or 0
+    -- 阅读器的「字重」与「对比度」：弹框自建 face，得自己换算成字重档位/字色
+    self_obj.doc_font_weight = tonumber(opts.doc_font_weight) or 0
+    self_obj.doc_font_gamma = tonumber(opts.doc_font_gamma) or 0
     self_obj.skip_quote = opts.skip_quote == true
     self_obj._layout_cache = newLayoutCache()
     self_obj._page_bbs = newPageCache()
@@ -127,7 +133,7 @@ function PageRenderer:new(opts)
     self_obj._items_key = itemsKey(self_obj.items)
     self_obj._geom_key = geomKey(self_obj.doc_font_name, self_obj.doc_font_size,
         self_obj.doc_margins, self_obj.height_ratio, self_obj.content_width,
-        self_obj.contrast)
+        self_obj.contrast, self_obj.doc_font_weight, self_obj.doc_font_gamma)
     self_obj._bb_key = self_obj._items_key .. "|" .. self_obj._geom_key
     self_obj._page_pieces = {}
     self_obj._page_pieces_key = nil
@@ -144,7 +150,8 @@ end
 --- the centered popup passes its frame width so a width change re-paginates.
 --- contrast (optional) shifts every block's gray level; a change re-lays out
 --- because the colors are baked into the pieces.
-function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margins, height_ratio, content_width, contrast)
+function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margins, height_ratio, content_width, contrast,
+                                 doc_font_weight, doc_font_gamma)
     self.items = items or {}
     if doc_font_name ~= nil then self.doc_font_name = doc_font_name end
     if doc_font_size ~= nil then self.doc_font_size = doc_font_size end
@@ -152,9 +159,12 @@ function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margin
     if height_ratio ~= nil then self.height_ratio = height_ratio end
     if content_width ~= nil then self.content_width = content_width end
     if contrast ~= nil then self.contrast = tonumber(contrast) or 0 end
+    if doc_font_weight ~= nil then self.doc_font_weight = tonumber(doc_font_weight) or 0 end
+    if doc_font_gamma ~= nil then self.doc_font_gamma = tonumber(doc_font_gamma) or 0 end
     local new_items_key = itemsKey(self.items)
     local new_geom_key = geomKey(self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, self.content_width, self.contrast)
+        self.doc_margins, self.height_ratio, self.content_width, self.contrast,
+        self.doc_font_weight, self.doc_font_gamma)
     local new_bb_key = new_items_key .. "|" .. new_geom_key
     if new_bb_key ~= self._bb_key then
         self._items_key = new_items_key
@@ -166,7 +176,11 @@ end
 
 function PageRenderer:paginate()
     local t0 = now_ms()
-    local blocks = ContentBuilder.build(self.items, { contrast = self.contrast, skip_quote = self.skip_quote })
+    local blocks = ContentBuilder.build(self.items, {
+        contrast = self.contrast,
+        gamma = self.doc_font_gamma,
+        skip_quote = self.skip_quote,
+    })
     local t1 = now_ms()
 
     local item_width = math.min(math.ceil(self.doc_margins.right * 2 / 5), Screen:scaleBySize(10))
@@ -174,13 +188,14 @@ function PageRenderer:paginate()
     local text_w = inner_w - self.doc_margins.left - self.doc_margins.right - item_width
     if text_w < 10 then text_w = 10 end
     local base_size = math.max(8, math.floor(self.doc_font_size or 0))
+    local bold_level = FaceFactory.resolveBoldLevel(self.doc_font_weight, self.doc_font_gamma)
 
     local pieces = {}
     local boundaries = {}
     local y = 0
 
     local function addTextPiece(variant, text, fg, width, x, keep_next)
-        local face = FaceFactory:getFace(self.doc_font_name, base_size, variant)
+        local face = FaceFactory:getFace(self.doc_font_name, base_size, variant, bold_level)
         if not face then return false end
         local line_h, extra, baseline = Paginator.textPieceMetrics(face)
         local paginated = Paginator.paginateText(text, face, width)
@@ -190,6 +205,7 @@ function PageRenderer:paginate()
         pieces[#pieces + 1] = {
             kind = "text", variant = variant, text = text, fg = fg,
             face = face, width = width, x = x, y = piece_y,
+            bold = face.synth_bold == true,
             n_lines = n_lines, line_h = line_h, piece_h = piece_h,
             baseline = baseline, xtext = paginated.xtext, lines = paginated.lines,
         }
