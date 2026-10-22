@@ -789,7 +789,6 @@ function Client:zhiqiu_get_para_review(ident, opts)
     local base = H.trim(cfg.server_url or ZhiQiu.DEFAULT_BASE)
     if base:sub(-1) == "/" then base = base:sub(1, -2) end
 
-    -- token（可能过期，ensure_token 自动续期/铸造）
     local token = H.trim(cfg.token or "")
     if token == "" then
         token = ZhiQiu.ensure_token(self, self.settings, false)
@@ -798,7 +797,6 @@ function Client:zhiqiu_get_para_review(ident, opts)
         error("知秋书源未配置共享 Token，无法加载段评")
     end
     local android_id = ""
-    -- 复用 zhiqiu 模块的 android id（持久化到 settings，与正文请求一致）
     local ok_aid, aid_val = pcall(function()
         return ZhiQiu.resolve_android_id(self.settings)
     end)
@@ -808,27 +806,15 @@ function Client:zhiqiu_get_para_review(ident, opts)
         android_id = H.trim(cfg.android_id or "")
     end
 
-    -- 解析 ident: zhiqiu:BID:CID:PID
     local bid, cid, pid = tostring(ident):match("^zhiqiu:([^:]+):([^:]+):([^:]+)$")
     if not bid then
         error("知秋段评 ident 无效: " .. tostring(ident):sub(1, 80))
     end
 
-    -- 注意：知秋 /novel/comment/paragraph_list 服务端固定每页 30 条，
-    -- size 参数被忽略（实测 size=30/40/100 均返回 30 条）。
-    -- 分页靠 page（页码），响应里的 common_list_info.cursor 是"已返回条数偏移量"。
-    local page = tonumber(opts.page) or 1
-    local size = tonumber(opts.size) or 30
-    local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
-        .. "&cid=" .. H.url_encode(cid)
-        .. "&pid=" .. H.url_encode(pid)
-        .. "&page=" .. tostring(page)
-        .. "&size=" .. tostring(size)
-
-    local ok_logger, logger_mod = pcall(require, "fanqie.logger")
-    if ok_logger and logger_mod then
-        logger_mod.info("[FanQie] 知秋段评请求:", "pid=" .. tostring(pid), "url=" .. url:sub(1, 150))
-    end
+    -- 知秋用 page 翻页（不是 cursor/offset）。size 服务端固定 30 条/页，不认。
+    local PAGE     = tonumber(opts.page) or 1
+    local SIZE     = tonumber(opts.size) or 30
+    local PAGE_MAX = tonumber(opts.page_max) or 1
 
     local headers = {
         ["User-Agent"]       = FanQie.MOBILE_UA,
@@ -838,24 +824,75 @@ function Client:zhiqiu_get_para_review(ident, opts)
         ["Accept-Encoding"]  = "identity",
         ["Content-Type"]     = "application/json",
     }
-    local ok_req, text, code = pcall(function()
-        return self:request({ url = url, method = "GET", headers = headers, timeout = 15 })
-    end)
-    if not ok_req or not code or code < 200 or code >= 300 then
-        error("知秋段评请求失败: HTTP " .. tostring(code or "nil") .. " " .. tostring(ok_req and "" or text))
+
+    local merged = {}
+    local last_total, last_has_more = nil, nil
+    local page = PAGE
+    local pages_done = 0
+    while pages_done < PAGE_MAX do
+        pages_done = pages_done + 1
+        local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
+            .. "&cid=" .. H.url_encode(cid)
+            .. "&pid=" .. H.url_encode(pid)
+            .. "&page=" .. tostring(page)
+            .. "&size=" .. tostring(SIZE)
+
+        local ok_logger, logger_mod = pcall(require, "fanqie.logger")
+        if ok_logger and logger_mod then
+            logger_mod.info("[FanQie] 知秋段评请求:", "pid=" .. tostring(pid)
+                .. " page=" .. tostring(page), "url=" .. url:sub(1, 160))
+        end
+
+        local ok_req, text, code = pcall(function()
+            return self:request({ url = url, method = "GET", headers = headers, timeout = 15 })
+        end)
+        if not ok_req or not code or code < 200 or code >= 300 then
+            error("知秋段评请求失败: HTTP " .. tostring(code or "nil") .. " " .. tostring(ok_req and "" or text))
+        end
+
+        local ok_decode, result = pcall(function()
+            return self:json_decode(text)
+        end)
+        if not ok_decode or type(result) ~= "table" then
+            error("知秋段评响应解析失败: " .. tostring(text or ""):sub(1, 200))
+        end
+        if result.code and result.code ~= 0 then
+            error(string.format("知秋段评错误: code=%s %s",
+                tostring(result.code), tostring(result.error or result.msg or "")))
+        end
+
+        local data = result.data or {}
+        local list = data.data_list
+        if type(list) ~= "table" or #list == 0 then break end
+        for _, item in ipairs(list) do merged[#merged + 1] = item end
+
+        local clinfo = data.common_list_info
+        if type(clinfo) == "table" then
+            last_total = tonumber(clinfo.total) or last_total
+            last_has_more = clinfo.has_more
+        end
+
+        if #list < SIZE then break end
+        if last_has_more == false then break end
+        page = page + 1
     end
 
-    local ok_decode, result = pcall(function()
-        return self:json_decode(text)
-    end)
-    if not ok_decode or type(result) ~= "table" then
-        error("知秋段评响应解析失败: " .. tostring(text or ""):sub(1, 200))
-    end
-    if result.code and result.code ~= 0 then
-        error(string.format("知秋段评错误: code=%s %s",
-            tostring(result.code), tostring(result.error or result.msg or "")))
-    end
-    return result
+    -- cursor 语义：下一页页码。循环里 has_more=true 时已 page=page+1，
+    -- 所以这里直接用 page，不能再 +1（否则会跳过一页）。
+    local has_more_out = (last_has_more == true)
+    local next_page = page
+    return {
+        code = 0,
+        msg = "susscess",
+        data = {
+            data_list = merged,
+            common_list_info = {
+                total = last_total or #merged,
+                has_more = has_more_out,
+                cursor = next_page,
+            },
+        },
+    }
 end
 
 -- Generic source scheduler: iterate enabled+configured sources in priority
