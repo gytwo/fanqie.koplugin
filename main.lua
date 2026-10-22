@@ -730,6 +730,7 @@ local function _parseParaReviewResult(result)
                     comment_id = c.comment_id,
                     username = base_info.user_name or common.user_name or "匿名",
                     text = content.text or common.text or "",
+                    image_data_list = content.image_data_list,
                     like_count = stat.digg_count or 0,
                     reply_count = stat.reply_count or 0,
                     create_time = common.create_timestamp or common.create_time,
@@ -757,6 +758,10 @@ end
 -- 归一化为富排版 items：{ abstract, author, content, likes_count }
 -- supports_replies 为真时额外携带 comment_id / reply_count / 展开状态，
 -- 供弹窗渲染「展开 N 条回复」入口（目前只有官方源支持）。
+-- 归一化为富排版 items：{ abstract, author, content, likes_count }
+-- supports_replies 为真时额外携带 comment_id / reply_count / 展开状态，
+-- 供弹窗渲染「展开 N 条回复」入口（目前只有官方源支持）。
+-- 纯图片评论（content_text 为空但有 image_data_list）也保留，避免计数丢失。
 local function _normParaRichItems(comments, abstract, supports_replies)
     local rich_items = {}
     for _, comment in ipairs(comments or {}) do
@@ -767,13 +772,20 @@ local function _normParaRichItems(comments, abstract, supports_replies)
         local content_text = tostring(comment.text or comment.content or "")
         local like_count = tonumber(comment.like_count or comment.likeCount
             or comment.digg_count) or 0
-        if content_text ~= "" then
+        local img = comment.image_data_list
+        local has_image = type(img) == "table"
+            and type(img.image_data) == "table"
+            and #img.image_data > 0
+        if content_text ~= "" or has_image then
             local item = {
                 abstract = abstract,
                 author = username,
                 content = content_text,
                 likes_count = like_count,
             }
+            if has_image then
+                item.image_data_list = img
+            end
             if supports_replies then
                 item.comment_id = comment.comment_id
                 item.reply_count = tonumber(comment.reply_count) or 0
@@ -1060,6 +1072,11 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                     end
                     st.cursor = cursor2
                     if has_more2 ~= nil then st.has_more = has_more2 end
+                    -- 兜底：服务端 total 虚高 / 最后一页不满时，强制收尾，避免按钮卡住
+                    if #comments2 == 0 or #comments2 < 30 then
+                        st.has_more = false
+                        st.total = #st.rich_items
+                    end
                     if Log then
                         Log.info("[段评] 继续加载成功: +" .. tostring(#new_items)
                             .. " 已加载=" .. tostring(#st.rich_items)
