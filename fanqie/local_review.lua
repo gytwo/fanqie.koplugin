@@ -22,6 +22,17 @@ local Screen = Device.screen
 
 local LocalReview = {}
 
+local function abort_all(plugin)
+    plugin._local_review_abort = true
+    if plugin._local_review_handle then
+        pcall(function() plugin._local_review_handle:cancel() end)
+        plugin._local_review_handle = nil
+    end
+    -- ★ 不掐 _bg_handle，后台缓存队列跨章继续跑
+    plugin._local_review_prefetching = {}
+end
+LocalReview.abort = abort_all
+
 -- 后台下载队列（模块级，跨 plugin 实例共享）
 local _bg_queue = {}
 local _bg_active = false
@@ -624,7 +635,7 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
     }
 
     local Async = require("fanqie.async")
-    Async.run(function()
+    plugin._local_review_handle = Async.run(function()
         local Content = require("fanqie.content")
         local ok, xhtml, para_reviews = pcall(function()
             return Content.fetch_chapter_content(
@@ -648,6 +659,7 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
         end
         return { ok = true, body = body, list = list }
     end, function(ok, result, err)
+        plugin._local_review_handle = nil
         if not ok or type(result) ~= "table" or result.ok == false then
             log_warn("拉段评失败: " .. tostring(result and result.err or err or result))
             if on_done then on_done(nil) end
@@ -679,7 +691,10 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
         local is_prefetch = opts.is_prefetch == true
 
         local function finish()
-            if saved_xp then pcall(doc.gotoXPointer, doc, saved_xp) end
+            -- ★ 跨章 abort 时不恢复 xpointer，避免把新章视图拉回旧章
+            if not plugin._local_review_abort and saved_xp then
+                pcall(doc.gotoXPointer, doc, saved_xp)
+            end
 
             local ok_content, Content = pcall(require, "fanqie.content")
 
@@ -723,6 +738,11 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
         end
 
         local function locate_one(i)
+            -- ★ 跨章 abort：停止定位循环
+            if plugin._local_review_abort then
+                if on_done then on_done(nil) end
+                return
+            end
             if i > total then
                 finish()
                 return
@@ -739,7 +759,7 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
                     finish()
                     return
                 end
-                UIManager:scheduleIn(0, function() locate_one(i + 1) end)
+                UIManager:scheduleIn(0.05, function() locate_one(i + 1) end)
                 return
             end
 
@@ -782,7 +802,7 @@ function LocalReview.fetch_chapter_records(plugin, book, item_id, chapter_start_
                 end
             end
 
-            UIManager:scheduleIn(0, function() locate_one(i + 1) end)
+            UIManager:scheduleIn(0.05, function() locate_one(i + 1) end)
         end
 
         locate_one(1)
@@ -815,6 +835,7 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
 
     local Async = require("fanqie.async")
     local Client = require("fanqie.client")
+    local Content = require("fanqie.content")
 
     plugin._comment_cache_running = plugin._comment_cache_running or {}
     local running_key = tostring(book_id) .. ":" .. tostring(item_id)
@@ -823,9 +844,14 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
         return
     end
 
-    -- =========================================================================
-    -- 全局队列：同一时间只跑一个后台下载，多个任务排队
-    -- =========================================================================
+    local function finish_bg()
+        plugin._comment_cache_running[running_key] = nil
+        _bg_active = false
+        local next_task = table.remove(_bg_queue, 1)
+        if next_task then
+            UIManager:scheduleIn(0.1, next_task)
+        end
+    end
 
     local function start_task()
         _bg_active = true
@@ -833,113 +859,76 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
         dbg("启动任务：" .. running_key .. " list_count=" .. tostring(#list))
 
         UIManager:scheduleIn(1.0, function()
-            dbg("启动子进程：" .. running_key)
+            local settings = plugin.settings
 
-            Async.run(function()
-                -- ============================================================
-                -- 子进程：循环拉该章所有 pid，拉一条存一条（单条文件）
-                -- ============================================================
-                local Content = require("fanqie.content")
-                local settings = plugin.settings
-                local client = Client:new(settings)
-
-                local function cdbg(...)
-                    if ok_log and Log and Log.debug then Log.debug("[本地段评][后台落盘][子进程]", ...) end
+            local function cache_one(i)
+                if i > #list or plugin._local_review_abort_bg then
+                    finish_bg()
+                    return
+                end
+                local pr = list[i]
+                local pid = tonumber(tostring(pr.ident):match("(%d+)$"))
+                if not pid then
+                    UIManager:scheduleIn(0, function() cache_one(i + 1) end)
+                    return
+                end
+                if Content.has_one_comment(settings, book_id, item_id, pid) then
+                    UIManager:scheduleIn(0, function() cache_one(i + 1) end)
+                    return
                 end
 
-                local saved_count = 0
-                local fail_count = 0
-                local skip_count = 0
+                local ident = pr.ident
+                local is_official = ident:find("official:", 1, true)
+                local is_shushan  = ident:find("shushan:", 1, true)
+                local is_zhiqiu   = ident:find("zhiqiu:", 1, true)
+                if not (is_official or is_shushan or is_zhiqiu) then
+                    UIManager:scheduleIn(0, function() cache_one(i + 1) end)
+                    return
+                end
 
-                for idx, pr in ipairs(list) do
-                    local pid = tonumber(tostring(pr.ident):match("(%d+)$"))
-                    if not pid then
-                        cdbg("跳过 idx=" .. tostring(idx) .. " 无法解析 pid")
-                    elseif Content.has_one_comment(settings, book_id, item_id, pid) then
-                        skip_count = skip_count + 1
+                local work = function()
+                    local c = Client:new(settings)
+                    local ok_r, result_r
+                    if is_official then
+                        ok_r, result_r = pcall(function()
+                            return c:official_get_para_review(ident, { count = 40 })
+                        end)
+                    elseif is_shushan then
+                        ok_r, result_r = pcall(function()
+                            return c:shushan_get_para_review(ident, { page_max = 2 })
+                        end)
                     else
-                        local ident = pr.ident
-                        local is_shushan = ident:find("shushan:", 1, true)
-                        local is_zhiqiu = ident:find("zhiqiu:", 1, true)
-                        local is_official = ident:find("official:", 1, true)
-                        if not is_shushan and not is_zhiqiu and not is_official then
-                            cdbg("跳过 idx=" .. tostring(idx) .. " 未知来源")
-                        else
-                            local ok_r, result_r
-                            if is_official then
-                                ok_r, result_r = pcall(function()
-                                    return client:official_get_para_review(ident, { count = 40 })
-                                end)
-                            elseif is_shushan then
-                                ok_r, result_r = pcall(function()
-                                    return client:shushan_get_para_review(ident, { page_max = 2 })
-                                end)
-                            else
-                                ok_r, result_r = pcall(function()
-                                    return client:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 })
-                                end)
-                            end
-
-                            if ok_r and result_r then
-                                -- ★ 拉一条立刻落一条（单条文件）
-                                pcall(Content.save_one_comment,
-                                    settings, book_id, item_id, pid, result_r)
-                                saved_count = saved_count + 1
-                                cdbg("成功 pid=" .. tostring(pid)
-                                    .. " 已拉=" .. tostring(saved_count))
-                            else
-                                fail_count = fail_count + 1
-                                cdbg("失败 pid=" .. tostring(pid)
-                                    .. " err=" .. tostring(result_r):sub(1, 200))
-                            end
-                        end
+                        ok_r, result_r = pcall(function()
+                            return c:zhiqiu_get_para_review(ident, { page = 1, size = 30, page_max = 1 })
+                        end)
                     end
+                    if not ok_r then error(tostring(result_r), 0) end
+                    return result_r
                 end
 
-                cdbg("汇总 saved=" .. tostring(saved_count)
-                    .. " skip=" .. tostring(skip_count)
-                    .. " fail=" .. tostring(fail_count)
-                    .. " total=" .. tostring(#list))
-
-                return { saved = saved_count, skipped = skip_count, failed = fail_count }
-            end, function(ok, result, err)
-                plugin._comment_cache_running[running_key] = nil
-                _bg_active = false
-
-                local ok2, err2 = pcall(function()
+                plugin._bg_handle = Async.run(work, function(ok, result, err)
+                    plugin._bg_handle = nil
                     if ok and result then
-                        dbg("完成：" .. running_key
-                            .. " saved=" .. tostring(result.saved or 0)
-                            .. " skipped=" .. tostring(result.skipped or 0)
-                            .. " failed=" .. tostring(result.failed or 0))
+                        pcall(Content.save_one_comment, settings, book_id, item_id, pid, result)
+                        dbg("成功 pid=" .. tostring(pid) .. " idx=" .. tostring(i))
                     else
-                        dbg("失败：" .. running_key
-                            .. " err=" .. tostring(err))
+                        dbg("失败 pid=" .. tostring(pid) .. " err=" .. tostring(err or result):sub(1, 120))
                     end
-                end)
-                if not ok2 and ok_log and Log and Log.warn then
-                    Log.warn("[本地段评][后台落盘] on_done 异常: " .. tostring(err2))
-                end
+                    UIManager:scheduleIn(0.3, function() cache_one(i + 1) end)
+                end, { poll_interval = 0.2, timeout = 20 })
+            end
 
-                -- ★ 启动队列里下一个任务
-                local next_task = table.remove(_bg_queue, 1)
-                if next_task then
-                    dbg("队列下一个任务启动")
-                    next_task()
-                end
-            end, { poll_interval = 0.3, timeout = 120 })
+            cache_one(1)
         end)
     end
 
     if _bg_active then
-        -- 已有任务在跑 → 排队
         dbg("排队：" .. running_key .. " 队长=" .. tostring(#_bg_queue + 1))
-        plugin._comment_cache_running[running_key] = true   -- 占位，让 UI 显示"下载中"
+        plugin._comment_cache_running[running_key] = true
         table.insert(_bg_queue, start_task)
         return
     end
 
-    -- 无任务在跑 → 立即启动
     start_task()
 end
 
@@ -1012,6 +1001,11 @@ function LocalReview._prefetch_next(plugin, planned, i)
                     plugin._local_review_prefetching[plan.key] = nil
                     if records then
                         plugin._local_review_cache[cloud_key] = records
+                        -- ★ 预取命中当前显示的章：直接 apply，避免主路径再拉一次
+                        if plugin._local_review_current_cloud_key == cloud_key
+                            and plugin._local_review_apply_records then
+                            plugin._local_review_apply_records(records, cloud_key)
+                        end
                     end
                     UIManager:scheduleIn(0.5, function()
                         LocalReview._prefetch_next(plugin, planned, i + 1)
@@ -1173,6 +1167,16 @@ function LocalReview.on_page_update(plugin)
     if type(toc) ~= "table" or #toc == 0 then return end
 
     local toc_idx = current_toc_index(doc, toc)
+
+    -- ★ 跨章：中止上一章所有在跑的定位循环 / 子进程 / 后台落盘
+    if plugin._local_review_abort_toc ~= toc_idx then
+        abort_all(plugin)
+        plugin._local_review_abort_toc = toc_idx
+        plugin._local_review_abort = false
+        plugin._local_review_current_local_key = nil
+        plugin._local_review_current_cloud_key = nil
+    end
+
     local chapter_title = toc[toc_idx] and toc[toc_idx].title or ""
     local chapter_start_page = tonumber(toc[toc_idx] and toc[toc_idx].page) or 1
     local local_key = "local:" .. tostring(toc_idx) .. ":" .. tostring(chapter_start_page)
@@ -1204,6 +1208,8 @@ function LocalReview.on_page_update(plugin)
             _state4.setCurrentParaReviews(reviews)
         end
     end
+    -- 暴露给 _prefetch_next：预取命中当前章时直接 apply，避免主路径重复拉
+    plugin._local_review_apply_records = apply_records
 
     local function try_disk_records(cloud_key, item_id)
         if not (ok_content and Content and Content.load_para_records) then return false end
@@ -1226,6 +1232,19 @@ function LocalReview.on_page_update(plugin)
         return true
     end
 
+    -- ★ 预取正在拉这一章：等它完成，别新开子进程重复拉
+    local function is_prefetching_key(key)
+        local pref = plugin._local_review_prefetching or {}
+        if pref[key] then return true end
+        -- 预取正在给这个 toc_idx 定位章节（拉目录/匹配标题）
+        for k in pairs(pref) do
+            if type(k) == "string" and k:match("^local:" .. toc_idx .. ":") then
+                return true
+            end
+        end
+        return false
+    end
+
     local mapped_item_id = book and book.chapter_map and book.chapter_map[tostring(toc_idx)]
     if mapped_item_id and mapped_item_id ~= "" then
         local cloud_key = "cloud:" .. tostring(mapped_item_id)
@@ -1239,8 +1258,17 @@ function LocalReview.on_page_update(plugin)
             LocalReview.trigger_prefetch(plugin, toc_idx)
             return
         end
+        if is_prefetching_key(cloud_key) then
+            -- 预取正在拉本章，等它的 on_done → apply_records
+            return
+        end
         LocalReview.dump_current_chapter(plugin, book,
             tostring(mapped_item_id), chapter_start_page, cloud_key, toc_idx)
+        return
+    end
+
+    if is_prefetching_key("local:" .. tostring(toc_idx) .. ":") then
+        -- 预取正在给本章定位章节，等它 set_chapter_map 后由下一次 on_page_update 接手
         return
     end
 
@@ -1261,6 +1289,9 @@ function LocalReview.on_page_update(plugin)
                 LocalReview.trigger_prefetch(plugin, toc_idx)
                 return
             end
+            if is_prefetching_key(cloud_key) then
+                return
+            end
             LocalReview.dump_current_chapter(plugin, book,
                 item_id, chapter_start_page, cloud_key, toc_idx)
         end,
@@ -1272,6 +1303,10 @@ function LocalReview.on_pos_update(plugin, pos, pageno)
 end
 
 function LocalReview.on_close_document(plugin)
+    abort_all(plugin)
+    plugin._local_review_abort_toc = nil
+    plugin._bg_queue = {}
+    _bg_active = false
     if plugin.ui then
         pcall(function() plugin.ui:unRegisterTouchZones({{ id = TOUCH_ID }}) end)
         if plugin.ui.view and plugin.ui.view.view_modules then
