@@ -1,9 +1,8 @@
 --[[--
-Thought popup pagination and page rendering (shared by both popup positions).
+Thought popup pagination and page rendering.
 
-The bottom bar (widget.lua) and the centered dialog (center_widget.lua) render
-the same review content with the same fonts and size settings; this module
-owns the pipeline they share:
+The bottom bar (widget.lua) renders the review content with the document font
+and size settings; this module owns the pipeline behind it:
 
   * one-shot pagination of the review blocks (ContentBuilder + Paginator),
     cached in a koreader Cache keyed by (items, font, margins, height_ratio);
@@ -74,7 +73,7 @@ local function itemsKey(items)
     for _, item in ipairs(items or {}) do
         -- 回复展开状态必须进 key：否则「展开」后内容变了、key 没变，
         -- setContent 会认为无需重排，弹窗永远看不到新加载的回复。
-        parts[#parts + 1] = string.format("%s|%s|%s|%d|%s|%s|%d|%s|%s",
+        parts[#parts + 1] = string.format("%s|%s|%s|%d|%s|%s|%d|%s|%s|%s",
             tostring(item.abstract or ""),
             tostring(item.author or ""),
             tostring(item.content or ""),
@@ -83,19 +82,20 @@ local function itemsKey(items)
             tostring(item.replies_expanded and 1 or 0),
             (type(item.replies) == "table") and #item.replies or 0,
             tostring(item.replies_more and 1 or 0),
-            tostring(item.replies_loading and 1 or 0))
+            tostring(item.replies_loading and 1 or 0),
+            -- 「还有 N 条」的文案取自 replies_total，不进 key 会显示旧数字
+            tostring(tonumber(item.replies_total) or 0))
     end
     return table.concat(parts, "\n")
 end
 
-local function geomKey(doc_font_name, doc_font_size, margins, height_ratio, content_width, contrast,
+local function geomKey(doc_font_name, doc_font_size, margins, height_ratio, contrast,
                        weight, gamma)
     local m = margins or {}
-    return string.format("%s|%d|%d_%d_%d_%d|%.4f|%d|%d|%s|%s",
+    return string.format("%s|%d|%d_%d_%d_%d|%.4f|%d|%s|%s",
         doc_font_name or "", doc_font_size or 0,
         m.left or 0, m.right or 0, m.top or 0, m.bottom or 0,
         height_ratio or 0.35,
-        content_width or 0,
         tonumber(contrast) or 0,
         tostring(tonumber(weight) or 0),
         tostring(tonumber(gamma) or 0))
@@ -104,10 +104,7 @@ end
 local PageRenderer = {}
 
 --- @param opts table { items, doc_font_name, doc_font_size, doc_margins,
----                    height_ratio, content_width? }
---- content_width (optional) is the full inner column width before margins
---- (defaults to the screen width, which is what the bottom popup uses; the
---- centered popup passes its narrower frame width).
+---                    height_ratio }
 function PageRenderer:new(opts)
     opts = opts or {}
     local self_obj = setmetatable({}, { __index = PageRenderer })
@@ -121,7 +118,6 @@ function PageRenderer:new(opts)
         bottom = Screen:scaleBySize(10),
     }
     self_obj.height_ratio = opts.height_ratio or 0.35
-    self_obj.content_width = opts.content_width
     self_obj.contrast = tonumber(opts.contrast) or 0
     -- 阅读器的「字重」与「对比度」：弹框自建 face，得自己换算成字重档位/字色
     self_obj.doc_font_weight = tonumber(opts.doc_font_weight) or 0
@@ -132,8 +128,8 @@ function PageRenderer:new(opts)
     self_obj._piece_cache = newPieceCache()
     self_obj._items_key = itemsKey(self_obj.items)
     self_obj._geom_key = geomKey(self_obj.doc_font_name, self_obj.doc_font_size,
-        self_obj.doc_margins, self_obj.height_ratio, self_obj.content_width,
-        self_obj.contrast, self_obj.doc_font_weight, self_obj.doc_font_gamma)
+        self_obj.doc_margins, self_obj.height_ratio, self_obj.contrast,
+        self_obj.doc_font_weight, self_obj.doc_font_gamma)
     self_obj._bb_key = self_obj._items_key .. "|" .. self_obj._geom_key
     self_obj._page_pieces = {}
     self_obj._page_pieces_key = nil
@@ -146,24 +142,21 @@ function PageRenderer:new(opts)
 end
 
 --- Reload content/geometry; re-layout only when the cache key changed.
---- content_width (optional) is the full inner column width before margins;
---- the centered popup passes its frame width so a width change re-paginates.
 --- contrast (optional) shifts every block's gray level; a change re-lays out
 --- because the colors are baked into the pieces.
-function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margins, height_ratio, content_width, contrast,
+function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margins, height_ratio, contrast,
                                  doc_font_weight, doc_font_gamma)
     self.items = items or {}
     if doc_font_name ~= nil then self.doc_font_name = doc_font_name end
     if doc_font_size ~= nil then self.doc_font_size = doc_font_size end
     if doc_margins ~= nil then self.doc_margins = doc_margins end
     if height_ratio ~= nil then self.height_ratio = height_ratio end
-    if content_width ~= nil then self.content_width = content_width end
     if contrast ~= nil then self.contrast = tonumber(contrast) or 0 end
     if doc_font_weight ~= nil then self.doc_font_weight = tonumber(doc_font_weight) or 0 end
     if doc_font_gamma ~= nil then self.doc_font_gamma = tonumber(doc_font_gamma) or 0 end
     local new_items_key = itemsKey(self.items)
     local new_geom_key = geomKey(self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, self.content_width, self.contrast,
+        self.doc_margins, self.height_ratio, self.contrast,
         self.doc_font_weight, self.doc_font_gamma)
     local new_bb_key = new_items_key .. "|" .. new_geom_key
     if new_bb_key ~= self._bb_key then
@@ -184,7 +177,7 @@ function PageRenderer:paginate()
     local t1 = now_ms()
 
     local item_width = math.min(math.ceil(self.doc_margins.right * 2 / 5), Screen:scaleBySize(10))
-    local inner_w = self.content_width or Screen:getWidth()
+    local inner_w = Screen:getWidth()
     local text_w = inner_w - self.doc_margins.left - self.doc_margins.right - item_width
     if text_w < 10 then text_w = 10 end
     local base_size = math.max(8, math.floor(self.doc_font_size or 0))
@@ -228,7 +221,21 @@ function PageRenderer:paginate()
     end
 
     for _, block in ipairs(blocks) do
-        if block.kind == "paragraph" then
+        if block.kind == "separator" then
+            -- 分隔线只占位不产生 boundary：分页仍由文字行驱动，页缝落在
+            -- 线的留白里视觉无感。piece_h = 线宽，供 renderPage 画矩形。
+            y = y + math.floor(base_size * (block.spacing_before or 0) + 0.5)
+            local thickness = math.max(1, Screen:scaleBySize(1))
+            pieces[#pieces + 1] = {
+                kind = "separator",
+                fg = block.fg,
+                x = 0,
+                y = y,
+                width = text_w,
+                piece_h = thickness,
+            }
+            y = y + thickness + math.floor(base_size * (block.spacing_after or 0) + 0.5)
+        elseif block.kind == "paragraph" then
             y = y + math.floor(base_size * (block.spacing_before or 0) + 0.5)
             -- 回复块缩进：层级 * 约 1.15 个字宽，正文宽度同步收窄
             local level = tonumber(block.indent_level) or 0
@@ -334,15 +341,25 @@ function PageRenderer:renderPage(page_idx, page_starts)
     bb:fill(Blitbuffer.COLOR_WHITE)
 
     for _, piece in ipairs(self._page_pieces[page_idx] or {}) do
-        local r = Paginator.pieceVisibleRange(piece, p0, p1)
-        if r and piece.kind == "text" then
-            local text_bb = self:_getPieceTextBB(piece)
-            if text_bb then
-                bb:blitFrom(text_bb, piece.x, r.dest_y, 0, r.src_y, piece.width, r.src_h)
-            else
-                logger.warn("thought popup text render failed:",
-                    "y=", piece.y, "n_lines=", piece.n_lines,
-                    "text=", tostring(piece.text):sub(1, 40))
+        -- 分隔线必须在 pieceVisibleRange 之前分流：那个函数对 piece.line_h /
+        -- piece.n_lines 做算术，separator 这两个字段为 nil，直接算会崩。
+        if piece.kind == "separator" then
+            local top = math.max(piece.y, p0)
+            local bottom = math.min(piece.y + piece.piece_h, p1)
+            if bottom > top then
+                bb:paintRect(piece.x, top - p0, piece.width, bottom - top, piece.fg)
+            end
+        else
+            local r = Paginator.pieceVisibleRange(piece, p0, p1)
+            if r and piece.kind == "text" then
+                local text_bb = self:_getPieceTextBB(piece)
+                if text_bb then
+                    bb:blitFrom(text_bb, piece.x, r.dest_y, 0, r.src_y, piece.width, r.src_h)
+                else
+                    logger.warn("thought popup text render failed:",
+                        "y=", piece.y, "n_lines=", piece.n_lines,
+                        "text=", tostring(piece.text):sub(1, 40))
+                end
             end
         end
     end
@@ -361,8 +378,8 @@ function PageRenderer:_freePageBBs()
     self._page_pieces_key = nil
 end
 
---- Drop every cached bitmap and layout (called on document close / position
---- switch); the next use re-paginates from scratch.
+--- Drop every cached bitmap and layout (called on document close); the next
+--- use re-paginates from scratch.
 function PageRenderer:freeContentCaches()
     self:_freePageBBs()
     self:_freePieceCache()

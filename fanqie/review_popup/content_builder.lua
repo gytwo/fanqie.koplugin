@@ -195,6 +195,17 @@ function ContentBuilder.build(items, opts)
     end
 
     for item_index, item in ipairs(items) do
+        -- 一级评论之间加分隔线（与自己的回复树之间、回复彼此之间不加）：
+        -- 只有新的一条一级评论开始前才插。间距全交给 separator，
+        -- 所以下面 meta 不再设 spacing_before（否则双重叠加显得过松）。
+        if item_index > 1 then
+            blocks[#blocks + 1] = {
+                kind = "separator",
+                fg = grayForLevel(10),   -- 灰阶约 #AAA
+                spacing_before = 0.54,
+                spacing_after = 0.54,
+            }
+        end
         -- 一级评论的作者行用中点（与点赞数前的分隔点同一个字符），名字前后
         -- 各一个点：`· 张三 · ♥ 2`。下面「▸ 展开 N 条回复」仍用三角：
         -- 两者符号相同会让读者分不清哪行是作者、哪行是可点的开关。
@@ -209,7 +220,6 @@ function ContentBuilder.build(items, opts)
             variant = "meta",
             text = meta,
             fg = grayForLevel(5),
-            spacing_before = item_index > 1 and 0.45 or nil,
             spacing_after = 0.18,
         }
 
@@ -224,10 +234,9 @@ function ContentBuilder.build(items, opts)
         end
 
         -- ── 二级评论（官方源）──────────────────────────────────────────
-        -- 入口单独占一行且可点（弹窗整体是「点左/右半屏翻页」，所以不能把
-        -- 整条评论做成开关，否则翻页就没了）。展开后回复按接口顺序平铺，
-        -- 用「回复 @某人」表达层级：接口里 sub_reply 恒空，层级只靠
-        -- reply_to_reply_id，平铺展示不会丢条，也不会无限缩进。
+        -- 入口单独占一行且可点。展开后回复按接口顺序平铺，用「回复 @某人」
+        -- 表达层级：接口里 sub_reply 恒空，层级只靠 reply_to_reply_id，
+        -- 平铺展示不会丢条，也不会无限缩进。
         if item.can_replies and (tonumber(item.reply_count) or 0) > 0 then
             local reply_count = tonumber(item.reply_count) or 0
             local toggle_text
@@ -238,10 +247,8 @@ function ContentBuilder.build(items, opts)
             else
                 toggle_text = "▸ 展开 " .. tostring(reply_count) .. " 条回复"
             end
-            -- ⚠️ 不用 `cond and nil or x`：Lua 里 X 为 nil 时该表达式恒得 x，
-            --    会让「加载中」的行仍然可点（点下去重复发请求）。
-            local toggle_action = "toggle_replies"
-            if item.replies_loading then toggle_action = nil end
+            -- 加载中不挂 action：piece.action 为空即不可点，避免重复发请求
+            local toggle_action = not item.replies_loading and "toggle_replies" or nil
             blocks[#blocks + 1] = {
                 kind = "paragraph",
                 variant = "reply_toggle",
@@ -299,8 +306,7 @@ function ContentBuilder.build(items, opts)
                     if item.replies_loading then
                         more_text = "… 正在加载更多回复…"
                     end
-                    local more_action = "more_replies"
-                    if item.replies_loading then more_action = nil end
+                    local more_action = not item.replies_loading and "more_replies" or nil
                     blocks[#blocks + 1] = {
                         kind = "paragraph",
                         variant = "reply_toggle",

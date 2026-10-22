@@ -507,7 +507,8 @@ function FanQiePlugin:showParaReviewDetail(index)
             if is_official then
                 -- 官方 App 段评通道（/novel/commentapi/comment/list），
                 -- 与官方正文同一条签名链路；ident 格式 official:<bid>:<cid>:<pid>。
-                ok, result = pcall(function() return c:official_get_para_review(ident, { count = 20 }) end)
+                -- 首屏取 30 条（接口单次上限 50，见 reading/comments.lua 的 COMMENT_MAX_COUNT）。
+                ok, result = pcall(function() return c:official_get_para_review(ident, { count = 30 }) end)
                 if not ok then
                     error("官方段评获取失败：" .. tostring(result or "")
                         .. "（若持续失败可在书源管理里重置官方设备身份）")
@@ -541,7 +542,8 @@ function FanQiePlugin:showParaReviewDetail(index)
         local is_official  = ident_str:find("official:", 1, true)
         local ok, result
         if is_official then
-            ok, result = pcall(function() return c:official_get_para_review(ident, { count = 20 }) end)
+            -- 首屏 30 条，与异步分支保持一致
+            ok, result = pcall(function() return c:official_get_para_review(ident, { count = 30 }) end)
             if not ok then
                 error("官方段评获取失败：" .. tostring(result or ""))
             end
@@ -751,10 +753,8 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
 
         local opts = {
             pages = rich_items,
-            position = "bottom",
             height_ratio = 0.7,
             contrast = 7,
-            tap_to_page = true,
             para_nav = function(dir)
                 if dir == "prev" then navigate_para(-1)
                 else navigate_para(1) end
@@ -950,13 +950,15 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
         end
 
         _para_more_state.ui_opts = {
-            position = "bottom",
             height_ratio = opts.height_ratio,
             contrast = opts.contrast,
-            tap_to_page = opts.tap_to_page,
             doc_font_name = opts.doc_font_name,
             doc_font_size = opts.doc_font_size,
             doc_margins = opts.doc_margins,
+            -- 字重/对比度必须一起带过来：refresh_popup 只从这里取参数，
+            -- 漏掉就会退化成默认值，弹框永远不跟随阅读器设置。
+            doc_font_weight = opts.doc_font_weight,
+            doc_font_gamma = opts.doc_font_gamma,
         }
         refresh_popup()
     else
@@ -3250,6 +3252,11 @@ function FanQiePlugin:onCloseDocument()
     _state.last_page_number = nil
     _state.document_opened = false
     _state.setChapterNavigating(false)
+    -- 段评弹窗是常驻单例，关闭文档时把它的位图缓存一起放掉
+    local ok_rp, ReviewPopup = pcall(require, "fanqie.review_popup")
+    if ok_rp and ReviewPopup and ReviewPopup.cleanup then
+        pcall(ReviewPopup.cleanup)
+    end
 end
 
 function FanQiePlugin:onClose()

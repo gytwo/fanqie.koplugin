@@ -1,20 +1,12 @@
 --[[--
-Native WeRead thought dialog.
+Native WeRead thought dialog (bottom bar).
 
-Renders a thought's review items as a popup in one of two positions:
+Renders a thought's review items in the bottom bar (widget.lua), with long
+reviews painted through a bitmap viewport and scrolled inside it
+(scroll_container.lua). All sizing/layout comes from pages.lua.
 
-  * "center" (default): a TextViewer-style centered window with a title bar
-    and explicit Previous/Next page buttons; long reviews — including a single
-    long thought — are paginated across pages instead of scrolling
-    (center_widget.lua);
-  * "bottom": the bottom bar with a solid top border; long reviews scroll
-    inside a bitmap viewport (widget.lua + scroll_container.lua).
-
-Both positions share the same rendering pipeline (pages.lua: layout, page and
-piece caches) and the same font/height settings. Implementation lives in
-fanqie/review_popup/: this module is the public entry point; the widget
-for the active position is pooled and reused across opens so reopening the
-same thought rebuilds nothing.
+The widget is pooled: reopening the popup reuses the same instance and only
+the content is replaced, so the piece/layout caches survive.
 
 @module fanqie.review_popup
 --]]
@@ -25,77 +17,38 @@ local UIManager = require("ui/uimanager")
 FaceFactory:init()
 
 local M = {}
-local _pool = {}  -- position ("bottom" | "center") -> pooled widget
+local _popup
 
-local function normalizePosition(position)
-    return position == "bottom" and "bottom" or "center"
-end
-
---- The widget class for a position; required lazily so the entry can be
---- loaded without instantiating UI (and so tests can mock either widget).
-local function widgetClassFor(position)
-    if position == "center" then
-        return require("fanqie.review_popup.center_widget")
-    end
-    return require("fanqie.review_popup.widget")
-end
-
---- Show (or reopen the pooled instance for the position) a thought popup.
---- @param opts table { pages, position?, doc_font_name, doc_font_size,
----                    doc_margins, height_ratio, dialog, close_callback }
+--- Show (or reopen) the thought popup.
+--- @param opts table { pages, doc_font_name, doc_font_size, doc_margins,
+---                    height_ratio, contrast, doc_font_weight,
+---                    doc_font_gamma, dialog, close_callback, more_text,
+---                    on_more, on_replies, para_nav }
 function M.show(opts)
     opts = opts or {}
-    do
-        local ok_log, FLog = pcall(require, "fanqie.logger")
-        if ok_log and FLog and FLog.debug then
-            FLog.debug("[段评] show入口: more_text=" .. tostring(opts.more_text)
-                .. " on_more=" .. tostring(opts.on_more ~= nil)
-                .. " position=" .. tostring(opts.position)
-                .. " pooled=" .. tostring(_pool[normalizePosition(opts.position)] ~= nil))
-        end
-    end
-    if type(opts.pages) ~= "table" or #opts.pages == 0 then
+    -- 公共契约用 "pages"，widget 内部叫 "items"。
+    opts.items = opts.items or opts.pages
+    if type(opts.items) ~= "table" or #opts.items == 0 then
         error("thought popup: invalid pages")
     end
 
-    -- The widget stores the records under "items" (its field name); the
-    -- public contract uses "pages". Normalize once so the initial construction
-    -- and the pooled reopen below both receive the items.
-    opts.items = opts.items or opts.pages
-
-    local position = normalizePosition(opts.position)
-
-    -- Only the active position stays resident: drop the other pool so its
-    -- page/piece/layout caches (bitmaps) are not held for the whole session.
-    for other_position, pooled in pairs(_pool) do
-        if other_position ~= position then
-            pcall(function()
-                if UIManager:isWidgetShown(pooled) then
-                    UIManager:close(pooled)
-                end
-            end)
-            pooled:clear()
-            pooled:_freeContentCaches()
-            _pool[other_position] = nil
-        end
+    if _popup then
+        _popup:_reopen(opts)
+        UIManager:show(_popup)
+        return _popup
     end
 
-    local pooled = _pool[position]
-    if pooled then
-        pooled:_reopen(opts)
-        UIManager:show(pooled)
-        return pooled
-    end
-
-    local popup = widgetClassFor(position):new{
+    local Widget = require("fanqie.review_popup.widget")
+    _popup = Widget:new{
         items = opts.items,
         doc_font_name = opts.doc_font_name,
         doc_font_size = opts.doc_font_size,
         doc_margins = opts.doc_margins,
         height_ratio = opts.height_ratio,
-        width_ratio = opts.width_ratio,
         contrast = opts.contrast,
-        tap_to_page = opts.tap_to_page,
+        -- 字重/对比度：首屏用构造函数，续拉走 _reopen —— 两条路径都得带。
+        doc_font_weight = opts.doc_font_weight,
+        doc_font_gamma = opts.doc_font_gamma,
         dialog = opts.dialog,
         close_callback = opts.close_callback,
         para_nav = opts.para_nav,
@@ -103,58 +56,23 @@ function M.show(opts)
         on_more = opts.on_more,
         on_replies = opts.on_replies,
     }
-    _pool[position] = popup
-    UIManager:show(popup)
-    return popup
+    UIManager:show(_popup)
+    return _popup
 end
 
 function M.closeVisible()
-    for _, pooled in pairs(_pool) do
-        pcall(function()
-            UIManager:close(pooled)
-        end)
-    end
+    if not _popup then return end
+    pcall(function() UIManager:close(_popup) end)
 end
 
-function M.isShowing()
-    for _, pooled in pairs(_pool) do
-        local ok, shown = pcall(function()
-            return UIManager:isWidgetShown(pooled)
-        end)
-        if ok and shown == true then
-            return true
-        end
-    end
-    return false
-end
-
-function M.getPoolStats()
-    local count = 0
-    for _, pooled in pairs(_pool) do
-        if pooled then
-            count = count + 1
-        end
-    end
-    return {
-        pool_size = count,
-        max_size = 1,
-        has_active = count > 0,
-    }
-end
-
+--- 文档关闭时释放弹窗子树与位图缓存（由 main.lua 的 onCloseDocument 调用）。
 function M.cleanup()
-    if not next(_pool) then
-        return
-    end
-    for _, pooled in pairs(_pool) do
-        pcall(function()
-            UIManager:close(pooled)
-        end)
-        -- clear() frees the subtree; bitmaps are freed by _freeContentCaches.
-        pooled:clear()
-        pooled:_freeContentCaches()
-    end
-    _pool = {}
+    if not _popup then return end
+    pcall(function() UIManager:close(_popup) end)
+    -- clear() 释放子树，位图由 _freeContentCaches 释放。
+    _popup:clear()
+    _popup:_freeContentCaches()
+    _popup = nil
 end
 
 return M

@@ -6,15 +6,13 @@ fallback chain) and paginating once; pages are blitted into a bitmap viewport
 that scrolls. Long content scrolls directly, with no button navigation.
 
 Pagination, layout, page and piece caches live in fanqie/review_popup/
-pages.lua (PageRenderer), shared with the centered popup
-(center_widget.lua). This module composes the renderer into the bottom bar:
-a solid top border, a scrollable page viewport (scroll_container.lua), and
-bottom/tap/Back gestures.
+pages.lua (PageRenderer). This module composes the renderer into the bottom
+bar: a solid top border, a scrollable page viewport (scroll_container.lua),
+and bottom/tap/Back gestures.
 --]]
 
 local Blitbuffer = require("ffi/blitbuffer")
 local BottomContainer = require("ui/widget/container/bottomcontainer")
-local ButtonDialog = require("ui/widget/buttondialog")
 local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
@@ -29,12 +27,12 @@ local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
-local PluginUtil = require("fanqie.review_popup.i18n")
-local _ = PluginUtil.tr
+-- 日志模块缺失时静默降级（测试环境 / 精简安装）
+local ok_log, Log = pcall(require, "fanqie.logger")
+if not ok_log then Log = nil end
 
 local TOP_BORDER_SIZE = Size.line.thick
-local PADDING_TOP = Size.padding.large
-local PADDING_BOTTOM = Size.padding.large
+local PADDING = Size.padding.large
 
 local ThoughtPopupWidget = InputContainer:extend{
     items = nil,
@@ -50,9 +48,6 @@ local ThoughtPopupWidget = InputContainer:extend{
     contrast = 9,
     doc_font_weight = 0,
     doc_font_gamma = 0,
-    -- When true, tapping the left/right half of the bar pages up/down through
-    -- the review list (handled in onTapClose, like the weread centered popup).
-    tap_to_page = true,
     close_callback = nil,
     dialog = nil,
     -- Optional fanqie navigation: when set, a horizontal swipe calls
@@ -77,10 +72,15 @@ local ThoughtPopupWidget = InputContainer:extend{
     covers_footer = true,
 }
 
-function ThoughtPopupWidget:init()
+--- 高度比例钳制 + 尺寸换算（init 与 _reopen 共用）。
+function ThoughtPopupWidget:_clampHeight()
     self.height_ratio = math.max(0.1, math.min(0.9, self.height_ratio or 0.70))
     self.width = Screen:getWidth()
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
+end
+
+function ThoughtPopupWidget:init()
+    self:_clampHeight()
 
     if Device:isTouchDevice() then
         local range = Geom:new{
@@ -98,12 +98,6 @@ function ThoughtPopupWidget:init()
             SwipeClose = {
                 GestureRange:new{
                     ges = "swipe",
-                    range = range,
-                }
-            },
-            HoldThought = {
-                GestureRange:new{
-                    ges = "hold",
                     range = range,
                 }
             },
@@ -153,18 +147,16 @@ function ThoughtPopupWidget:_reopen(opts)
     if opts.contrast ~= nil then self.contrast = opts.contrast end
     if opts.doc_font_weight ~= nil then self.doc_font_weight = opts.doc_font_weight end
     if opts.doc_font_gamma ~= nil then self.doc_font_gamma = opts.doc_font_gamma end
-    if opts.tap_to_page ~= nil then self.tap_to_page = opts.tap_to_page end
     if opts.dialog then self.dialog = opts.dialog end
     self.close_callback = opts.close_callback
     self.para_nav = opts.para_nav
     self.more_text = opts.more_text
     self.on_more = opts.on_more
     self.on_replies = opts.on_replies
-    self.height_ratio = math.max(0.1, math.min(0.9, self.height_ratio or 0.70))
-    self.height = math.floor(Screen:getHeight() * self.height_ratio)
+    self:_clampHeight()
 
     self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, nil, self.contrast,
+        self.doc_margins, self.height_ratio, self.contrast,
         self.doc_font_weight, self.doc_font_gamma)
     self:_buildLayout()
 end
@@ -177,7 +169,7 @@ function ThoughtPopupWidget:_buildLayout()
     local content_h = self._pages.content_h
 
     local ratio_h = math.floor(Screen:getHeight() * self.height_ratio)
-    local chrome = TOP_BORDER_SIZE + PADDING_TOP + PADDING_BOTTOM
+    local chrome = TOP_BORDER_SIZE + 2 * PADDING
 
     -- 「继续加载」按钮：先建好并量高度，把占的纵向空间一起计进 chrome，
     -- 否则视口会把按钮挤出屏幕
@@ -198,17 +190,10 @@ function ThoughtPopupWidget:_buildLayout()
         local btn_h = (ok_size and btn_size and btn_size.h) or Screen:scaleBySize(36)
         chrome = chrome + btn_h + Screen:scaleBySize(14)
     end
-    -- 渲染层诊断：仅 DEBUG 级（需开启 developer_logs）
-    do
-        local ok_log, FLog = pcall(require, "fanqie.logger")
-        if ok_log and FLog and FLog.debug then
-            FLog.debug("[段评] 布局: has_btn=" .. tostring(more_btn ~= nil)
-                .. " more_text=" .. tostring(self.more_text)
-                .. " on_more=" .. tostring(self.on_more ~= nil)
-                .. " ratio_h=" .. tostring(ratio_h)
-                .. " content_h=" .. tostring(content_h)
-                .. " chrome=" .. tostring(chrome))
-        end
+    -- 布局诊断（仅 DEBUG 级，需开启 developer_logs）
+    if Log and Log.debug then
+        Log.debug(string.format("[段评] 布局 btn=%s ratio_h=%d content_h=%d chrome=%d",
+            tostring(more_btn ~= nil), ratio_h, content_h, chrome))
     end
     local blank_tolerance = math.ceil((self.doc_font_size or Screen:scaleBySize(18)) * 1.2)
 
@@ -231,10 +216,6 @@ function ThoughtPopupWidget:_buildLayout()
         dialog = self,
         -- 续拉重开时恢复滚动位置（init 内会按新的 max_offset 自动钳制）
         scroll_offset = self._restore_offset or 0,
-        -- Tap paging is handled by ThoughtPopupWidget.onTapClose (it owns the
-        -- tap gesture, so the ScrollContainer's own TapScrollText would never
-        -- fire). Keep it disabled here to avoid a dead gesture registration.
-        tap_to_page = false,
         boundaries = self._pages.boundaries,
         page_bb_getter = function(page_idx)
             local pages = self._scroll_container and self._scroll_container.pages
@@ -248,9 +229,9 @@ function ThoughtPopupWidget:_buildLayout()
         LineWidget:new{
             dimen = Geom:new{ w = self.width, h = TOP_BORDER_SIZE },
         },
-        VerticalSpan:new{ width = PADDING_TOP },
+        VerticalSpan:new{ width = PADDING },
         scroll,
-        VerticalSpan:new{ width = PADDING_BOTTOM },
+        VerticalSpan:new{ width = PADDING },
     }
 
     if more_btn then
@@ -297,25 +278,13 @@ function ThoughtPopupWidget:onTapClose(_, ges)
         UIManager:close(self)
         return true
     end
-    -- 二级评论入口优先于翻页：只有「展开/收起/继续加载」这几行会拦截点击
+    -- 只有「展开/收起/继续加载」这几行会拦截点击；未命中就什么都不做
     local scroll = self._scroll_container
     if scroll and scroll.dimen and ges.pos:intersectWith(scroll.dimen) then
         local content_y = (ges.pos.y - scroll.dimen.y) + (scroll.scroll_offset or 0)
         local piece = self:_findActionPieceAtContentY(content_y)
         if piece and self:_handleReplyAction(piece) then
             return true
-        end
-    end
-    -- Optional tap-to-page: tapping the left/right half of the bar pages
-    -- up/down through the review list (same feel as the weread centered popup).
-    -- When everything fits on one page, scrollToPage is a no-op.
-    if self.tap_to_page then
-        local BD = require("ui/bidi")
-        local dimen = self.container.dimen
-        if BD.flipIfMirroredUILayout(ges.pos.x < dimen.x + dimen.w / 2) then
-            self._scroll_container:scrollToPage(-1)
-        else
-            self._scroll_container:scrollToPage(1)
         end
     end
     return true
@@ -339,39 +308,6 @@ function ThoughtPopupWidget:onSwipeClose(_, ges)
     return false
 end
 
-function ThoughtPopupWidget:onHoldThought(_, ges)
-    local scroll = self._scroll_container
-    if scroll and scroll.dimen and ges.pos:intersectWith(scroll.dimen) then
-        local content_y = (ges.pos.y - scroll.dimen.y) + (scroll.scroll_offset or 0)
-        local item = self:_findItemAtContentY(content_y)
-        if item then
-            self:_showThoughtActionMenu(item)
-        end
-    end
-    return true
-end
-
-function ThoughtPopupWidget:_findItemAtContentY(y)
-    local pieces = self._pages and self._pages.layout and self._pages.layout.pieces
-    if not pieces then return nil end
-    local item_idx = 0
-    for _, piece in ipairs(pieces) do
-        if piece.variant == "meta" then
-            item_idx = item_idx + 1
-        end
-        if piece.y and piece.piece_h and piece.y <= y and y < piece.y + piece.piece_h then
-            if piece.variant == "quote" then
-                return self.items and self.items[1]
-            end
-            if item_idx >= 1 and self.items and item_idx <= #self.items then
-                return self.items[item_idx]
-            end
-            return nil
-        end
-    end
-    return nil
-end
-
 --- 命中测试：只找带 action 的行（展开/收起/继续加载回复）。
 --- 返回 piece（含 action / item_index）。
 function ThoughtPopupWidget:_findActionPieceAtContentY(y)
@@ -392,7 +328,7 @@ function ThoughtPopupWidget:_refreshAfterReplyChange()
     local offset = (self._scroll_container and self._scroll_container.scroll_offset) or 0
     self._restore_offset = offset
     self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, nil, self.contrast,
+        self.doc_margins, self.height_ratio, self.contrast,
         self.doc_font_weight, self.doc_font_gamma)
     self:_buildLayout()
     UIManager:setDirty(self, function()
@@ -460,15 +396,13 @@ function ThoughtPopupWidget:_fetchReplies(item, cursor)
             -- 信息直接决定用户该重试还是该换节点，藏在日志里等于没给。
             local brief = reason:gsub("%s+", " ")
             if #brief > 60 then brief = brief:sub(1, 60) .. "…" end
-            local ok_msg = pcall(function()
+            pcall(function()
                 UIManager:show(require("ui/widget/infomessage"):new{
                     text = "回复加载失败：" .. brief,
                 })
             end)
-            _ = ok_msg
-            local ok_log, log_mod = pcall(require, "fanqie.logger")
-            if ok_log and log_mod and log_mod.warn then
-                pcall(log_mod.warn, "[段评] 回复加载失败: " .. reason)
+            if Log and Log.warn then
+                pcall(Log.warn, "[段评] 回复加载失败: " .. reason)
             end
         end
         widget:_refreshAfterReplyChange()
@@ -480,54 +414,6 @@ function ThoughtPopupWidget:_fetchReplies(item, cursor)
         item.replies_expanded = false
         self:_refreshAfterReplyChange()
     end
-end
-
-function ThoughtPopupWidget:_showThoughtActionMenu(item)
-    local popup = self
-    local action_dialog
-    action_dialog = ButtonDialog:new{
-        buttons = {
-            {
-                {
-                    text = _("Copy"),
-                    callback = function()
-                        UIManager:close(action_dialog)
-                        popup:_copyThoughtContent(item)
-                    end,
-                },
-                {
-                    text = _("Generate QR code"),
-                    callback = function()
-                        UIManager:close(action_dialog)
-                        popup:_generateQRCode(item)
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(action_dialog)
-end
-
-function ThoughtPopupWidget:_copyThoughtContent(item)
-    local text = tostring(item and item.content or "")
-    if text == "" then return end
-    if Device.hasClipboard and Device:hasClipboard() then
-        Device.input.setClipboardText(text)
-    end
-end
-
-function ThoughtPopupWidget:_generateQRCode(item)
-    local text = tostring(item and item.content or "")
-    if text == "" then return end
-    if Device.hasClipboard and Device:hasClipboard() then
-        Device.input.setClipboardText(text)
-    end
-    local QRMessage = require("ui/widget/qrmessage")
-    UIManager:show(QRMessage:new{
-        text = text,
-        width = Screen:getWidth(),
-        height = Screen:getHeight(),
-    })
 end
 
 function ThoughtPopupWidget:free(full)

@@ -313,7 +313,7 @@ end
 --- @param doc_font_name string|nil document font name (nil -> Noto Sans family)
 --- @param size number DPI-scaled base size (i.e. doc_font_size)
 --- @param variant string key of VARIANTS
---- @param bold_level number|nil 0..3, see resolveBoldLevel
+--- @param bold_level number|nil 0/1/2, see resolveBoldLevel
 function FaceFactory:getFace(doc_font_name, size, variant, bold_level)
     variant = variant or "content"
     bold_level = tonumber(bold_level) or 0
