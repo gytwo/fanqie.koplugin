@@ -2102,7 +2102,6 @@ end
 function FanQiePlugin:checkNetwork()
     local NetworkMgr = require("ui/network/manager")
     if NetworkMgr and NetworkMgr.isOnline and not NetworkMgr:isOnline() then
-        self:showInfo(_("未连接网络，请先开启 WiFi"))
         return false
     end
     return true
