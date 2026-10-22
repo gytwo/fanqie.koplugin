@@ -7,6 +7,7 @@ local Screen = ok_device and device.screen or nil
 local ok_UIManager, UIManager = pcall(require, "ui/uimanager")
 local ok_Menu, Menu = pcall(require, "ui/widget/menu")
 local ok_InfoMessage, InfoMessage = pcall(require, "ui/widget/infomessage")
+local ok_Notification, Notification = pcall(require, "ui/widget/notification")
 local ok_ConfirmBox, ConfirmBox = pcall(require, "ui/widget/confirmbox")
 local ok_InputDialog, InputDialog = pcall(require, "ui/widget/inputdialog")
 
@@ -200,7 +201,7 @@ function Bookshelf:showBookshelf(opts)
         if cached_shelf and #cached_shelf > 0 then
             do_sort(cached_shelf)
             self:showBookList(cached_shelf)
-            -- 后台异步刷新（静默，不显示提示）
+            -- 后台异步刷新：失败时弹 toast，不再静默
             if self:checkNetwork() then
                 local plugin = self
                 if ok_Async and Async then
@@ -211,9 +212,19 @@ function Bookshelf:showBookshelf(opts)
                             save_shelf_cache(plugin.settings, result)
                             do_sort(result)
                             plugin:showBookList(result)
+                        else
+                            UIManager:show(Notification:new{
+                                text = _("无网络，仅显示缓存"),
+                                timeout = 2,
+                            })
                         end
-                    end, { poll_interval = 0.3, timeout = 60 })
+                    end, { poll_interval = 0.3, timeout = 8 })
                 end
+            else
+                UIManager:show(Notification:new{
+                    text = _("无网络，仅显示缓存"),
+                    timeout = 2,
+                })
             end
             return
         end
@@ -223,7 +234,10 @@ function Bookshelf:showBookshelf(opts)
     -- 获取成功后 save_shelf_cache 覆盖旧缓存；失败时回退到旧缓存
     if not self:checkNetwork() then
         if force_refresh and fallback_to_cache() then
-            self:showInfo(_("无网络，显示缓存数据"))
+            UIManager:show(Notification:new{
+                text = _("无网络，仅显示缓存"),
+                timeout = 2,
+            })
             return
         end
         self:showError(_("无网络且无书架缓存，请先联网获取书架"))
