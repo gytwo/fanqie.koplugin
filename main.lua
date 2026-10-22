@@ -785,11 +785,13 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                 if okm and margins then opts.doc_margins = margins end
             end
             -- 继承阅读器的「字重」与「对比度」：弹框自建 face，cre 的
-            -- font.face.base.weight / gamma 对它无效，得自己换算
+            -- font.face.base.weight / gamma 对它无效，得自己换算。
+            -- ⚠️ font_gamma 存的是**索引**（15 = gamma 1.0，默认值），
+            --    0 是最低对比度，不能当默认值用。
             local conf = doc and doc.configurable
             if conf then
                 opts.doc_font_weight = tonumber(conf.font_base_weight) or 0
-                opts.doc_font_gamma = tonumber(conf.font_gamma) or 0
+                opts.doc_font_gamma = tonumber(conf.font_gamma) or 15
             end
         end
 

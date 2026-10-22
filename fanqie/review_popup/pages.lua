@@ -119,9 +119,10 @@ function PageRenderer:new(opts)
     }
     self_obj.height_ratio = opts.height_ratio or 0.35
     self_obj.contrast = tonumber(opts.contrast) or 0
-    -- 阅读器的「字重」与「对比度」：弹框自建 face，得自己换算成字重档位/字色
+    -- 阅读器的「字重」与「对比度」：弹框自建 face，得自己换算成字重档位/字色。
+    -- 对比度存的是索引（15 = gamma 1.0），渲染时再经 gammaIndexToValue 换算。
     self_obj.doc_font_weight = tonumber(opts.doc_font_weight) or 0
-    self_obj.doc_font_gamma = tonumber(opts.doc_font_gamma) or 0
+    self_obj.doc_font_gamma = tonumber(opts.doc_font_gamma) or 15
     self_obj.skip_quote = opts.skip_quote == true
     self_obj._layout_cache = newLayoutCache()
     self_obj._page_bbs = newPageCache()
@@ -153,7 +154,7 @@ function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margin
     if height_ratio ~= nil then self.height_ratio = height_ratio end
     if contrast ~= nil then self.contrast = tonumber(contrast) or 0 end
     if doc_font_weight ~= nil then self.doc_font_weight = tonumber(doc_font_weight) or 0 end
-    if doc_font_gamma ~= nil then self.doc_font_gamma = tonumber(doc_font_gamma) or 0 end
+    if doc_font_gamma ~= nil then self.doc_font_gamma = tonumber(doc_font_gamma) or 15 end
     local new_items_key = itemsKey(self.items)
     local new_geom_key = geomKey(self.doc_font_name, self.doc_font_size,
         self.doc_margins, self.height_ratio, self.contrast,
@@ -169,9 +170,12 @@ end
 
 function PageRenderer:paginate()
     local t0 = now_ms()
+    -- 设置里存的是对比度索引（默认 15），渲染要的是 gamma 值（默认 1.0）。
+    -- 不换算会恒命中「高对比」→ 全篇多一层仿粗，段评比正文还黑。
+    local gamma_value = FaceFactory.gammaIndexToValue(self.doc_font_gamma)
     local blocks = ContentBuilder.build(self.items, {
         contrast = self.contrast,
-        gamma = self.doc_font_gamma,
+        gamma = gamma_value,
         skip_quote = self.skip_quote,
     })
     local t1 = now_ms()
@@ -181,7 +185,7 @@ function PageRenderer:paginate()
     local text_w = inner_w - self.doc_margins.left - self.doc_margins.right - item_width
     if text_w < 10 then text_w = 10 end
     local base_size = math.max(8, math.floor(self.doc_font_size or 0))
-    local bold_level = FaceFactory.resolveBoldLevel(self.doc_font_weight, self.doc_font_gamma)
+    local bold_level = FaceFactory.resolveBoldLevel(self.doc_font_weight, gamma_value)
 
     local pieces = {}
     local boundaries = {}

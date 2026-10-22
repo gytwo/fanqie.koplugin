@@ -58,22 +58,19 @@ local function grayForLevel(level)
     return GRAY_LEVELS[level] or Blitbuffer.COLOR_GRAY_5
 end
 
---- Apply the contrast delta to a base gray level. Level 0 is pure black and
---- 15 the lightest, so a positive delta (higher contrast) darkens the text
---- linearly and a negative delta lightens it. The maximum delta (9) pushes
---- every block down to pure black.
-local function adjustedGray(level, contrast)
-    local delta = tonumber(contrast) or 0
-    return grayForLevel(level - delta)
-end
-
---- 阅读器的「对比度」(font_gamma) 为负时正文不再纯黑。cre 的 gamma 只作用于
---- crengine 自己的字形栅格，弹框这套自绘字体读不到，只能在字色上近似；
---- 正 gamma 表现为笔画变粗，由 face_factory 的仿粗档位负责。
+--- 阅读器的「对比度」低于标准（gamma < 1.0）时正文不再是纯黑。cre 的 gamma
+--- 只作用于 crengine 自己的字形栅格，弹框这套自绘字体读不到，只能在字色上近似；
+--- 高于标准则表现为笔画变粗，由 face_factory 的仿粗档位负责。
+--- 传入的是**换算后的 gamma 值**（1.0 = 标准），不是设置里的索引。
+--- 基准用 1 档(#11)而不是纯黑：同样的字重下，纯黑在墨水屏上比正文更「实」，
+--- 略淡一档的观感才和正文齐平。
+local BODY_BASE_LEVEL = 1
 local function textColorForGamma(gamma)
-    local g = tonumber(gamma) or 0
-    if g >= 0 then return Blitbuffer.COLOR_BLACK end
-    return grayForLevel(math.min(4, math.floor(-g * 4 + 0.5)))
+    local g = tonumber(gamma) or 1
+    -- 0.95 与 1.0 在纸上几乎看不出差别，按标准处理，避免一点点调低就整片发灰
+    if g >= 0.95 then return grayForLevel(BODY_BASE_LEVEL) end
+    -- 0.9 → 2 档(#22)，0.8 → 3 档(#33)，0.7 → 5 档；封顶 10 档(#AA)
+    return grayForLevel(math.min(10, BODY_BASE_LEVEL + math.floor((1 - g) * 12 + 0.5)))
 end
 
 --- UTF-8-safe truncation with an ellipsis suffix.

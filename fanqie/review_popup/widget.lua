@@ -47,7 +47,7 @@ local ThoughtPopupWidget = InputContainer:extend{
     height_ratio = 0.70,
     contrast = 9,
     doc_font_weight = 0,
-    doc_font_gamma = 0,
+    doc_font_gamma = 15,  -- 对比度索引，15 = gamma 1.0（阅读器默认值）
     close_callback = nil,
     dialog = nil,
     -- Optional fanqie navigation: when set, a horizontal swipe calls

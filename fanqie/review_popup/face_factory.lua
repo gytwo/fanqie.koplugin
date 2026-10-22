@@ -54,20 +54,42 @@ local SYNTH_BOLD_FACTORS = { [1] = 0.18, [2] = 3 / 8 }
 --- crengine 排版，弹框是自建 FreeType face，必须自己换算。
 --- 字重「加粗」= cre 的 500（中等），不是 700，所以用仿粗而不是直接换成
 --- 粗体文件——后者会明显比正文重。
+---
+--- ⚠️ 第二个参数 gamma 必须是**换算后的 gamma 值**（1.0 = 标准），
+---    不是设置里存的索引 —— 索引请先过 gammaIndexToValue()。
 function FaceFactory.resolveBoldLevel(weight, gamma)
     weight = tonumber(weight) or 0
-    gamma = tonumber(gamma) or 0
+    gamma = tonumber(gamma) or 1.0
     local level = 0
     if weight >= 0.5 then
         level = 2
     end
-    -- 对比度调高时正文字缘被压深，视觉上等于笔画变粗；负数则靠字色变浅表现
+    -- 对比度调高时正文字缘被压深，视觉上等于笔画变粗；低对比度则不加粗。
     if gamma >= 1.25 then
         level = math.max(level, 2)
-    elseif gamma > 0.25 then
+    elseif gamma >= 1.1 then
         level = math.max(level, 1)
     end
     return level
+end
+
+--- crengine 的「对比度」在设置里存的是**索引**（0 起，对应 GammaGen 表），
+--- 不是 gamma 值：0 → 0.3，15 → 1.0（默认），25 → 1.45，56 → 15。
+--- 直接把索引当 gamma 值判断会永远命中「高对比」（15 >= 1.25），
+--- 段评就会全篇多一层标准仿粗，比正文还黑。
+local GAMMA_BY_INDEX = {
+    0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9,
+    0.95, 0.98, 1, 1.02, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45,
+    1.5, 1.6, 1.7, 1.8, 1.9, 2, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9,
+    3, 3.5, 4, 4.5, 5, 5.5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+}
+
+--- 对比度索引 -> gamma 值。默认索引 15（= 1.0）对应「不调对比度」。
+function FaceFactory.gammaIndexToValue(index)
+    index = math.floor(tonumber(index) or 15)
+    if index < 0 then index = 0 end
+    if index > #GAMMA_BY_INDEX - 1 then index = #GAMMA_BY_INDEX - 1 end
+    return GAMMA_BY_INDEX[index + 1]
 end
 
 function FaceFactory:init()
