@@ -36,6 +36,7 @@ LocalReview.abort = abort_all
 -- 后台下载队列（模块级，跨 plugin 实例共享）
 local _bg_queue = {}
 local _bg_active = false
+local _offline_notified = false   -- 离线提示去重：连续多章排队时只弹一次
 
 local MODULE_NAME = "fanqie_local_review"
 local TOUCH_ID = "fanqie_local_review_tap"
@@ -862,10 +863,31 @@ function LocalReview._background_cache_comments(plugin, book, item_id, list, opt
             local settings = plugin.settings
 
             local function cache_one(i)
-                if i > #list or plugin._local_review_abort_bg then
+                if i > #list then
                     finish_bg()
                     return
                 end
+                
+                -- 网络检查：离线则暂停整章缓存，不空转撞超时。
+                -- 已落盘的条保留，下次进本章时 has_one_comment 跳过，从断点继续。
+                -- isOnline() 是本地系统调用（微秒级），每条查一次可忽略。
+                local NetworkMgr = require("ui/network/manager")
+                if NetworkMgr and NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+                    dbg("网络断开，暂停后台缓存 " .. running_key
+                        .. " 已处理 " .. tostring(i - 1) .. "/" .. tostring(#list))
+                    if not _offline_notified then
+                        _offline_notified = true
+                        UIManager:show(Notification:new{
+                            text = _("网络已断开，段评缓存已暂停"),
+                            timeout = 2,
+                        })
+                    end
+                    _bg_queue = {}          -- 直接清空排队任务，避免逐个自旋抢 UI
+                    finish_bg()
+                    return
+                end
+                _offline_notified = false   -- 在线了，复位
+    
                 local pr = list[i]
                 local pid = tonumber(tostring(pr.ident):match("(%d+)$"))
                 if not pid then
