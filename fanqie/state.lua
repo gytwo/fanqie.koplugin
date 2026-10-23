@@ -133,6 +133,39 @@ M.getPendingProgress = function()
     return M.pending_progress
 end
 
+--- 从章节缓存路径反查 book_id：<cache_dir>/<book_id>/chapter_<item_id>.html
+-- 用于判断「本次会话的阅读位置」属于哪本书——openBook 一进来就把 current_book
+-- 换成新书，不反查会拿上一本书的章号去定位这一本（串书）。
+M.bookIdFromPath = function(file_path)
+    if type(file_path) ~= "string" or file_path == "" then return nil end
+    return file_path:gsub("\\", "/"):match("/([^/]+)/chapter_[^/]+%.html$")
+end
+
+--- 本书「实际读到的最新章号」（1-based），两个来源取最大：
+--   ① pending_progress 里本书待补传的进度（chapter_idx 是 0-based，+1 转章号）；
+--   ② 本次会话已读位置（current_chapter_index），仅当文档路径反查出的 book_id 匹配。
+-- 返回 nil 表示没有任何本地信息。越界条目直接忽略（目录缩短时不误跳）。
+M.localLatestChapterIndex = function(book_id, total)
+    if not book_id then return nil end
+    local bid = tostring(book_id)
+    local best = nil
+    local function consider(idx)
+        idx = tonumber(idx)
+        if not idx or idx < 1 then return end
+        if total and idx > total then return end
+        if not best or idx > best then best = idx end
+    end
+    for _, item in pairs(M.pending_progress or {}) do
+        if type(item) == "table" and tostring(item.book_id or "") == bid then
+            consider((tonumber(item.chapter_idx) or 0) + 1)
+        end
+    end
+    if M.current_document_path and M.bookIdFromPath(M.current_document_path) == bid then
+        consider(M.current_chapter_index)
+    end
+    return best
+end
+
 M.removePendingProgress = function(book_id, item_id)
     local key = book_id .. "_" .. item_id
     M.pending_progress[key] = nil

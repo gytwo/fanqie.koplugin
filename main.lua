@@ -88,6 +88,9 @@ local Info = safe_require("fanqie.info")
 -- 异步子进程模块：把进度上传 / 预下载等阻塞网络操作移出 UI 线程，消除卡顿。
 local Async = safe_require("fanqie.async")
 
+-- 封面缓存：命名规则（book_id 优先）、存在性查找、统计与清理
+local CoverCache = safe_require("fanqie.cover_cache")
+
 local unpack_args = unpack or table.unpack
 
 -- 菜单排序：让番茄书架紧跟在「微信读书」之后（工具菜单第二位）。
@@ -1939,9 +1942,10 @@ function FanQiePlugin:showBookList(books)
 
     for _, book in ipairs(books) do
         if book.cover then
-            local cover_filename = string.gsub(book.title, "[/\\:%*%?\"<>|]", "_") .. ".jpg"
-            local cover_path = cover_cache_dir .. "/" .. cover_filename
-            if H.file_exists(cover_path) then
+            -- 命名规则统一交给 cover_cache：新名 <book_id>.jpg，
+            -- 找不到时回退旧名 <书名>.jpg（兼容已下载的旧缓存，不强制重下）
+            local cover_path = CoverCache and CoverCache.find(self.settings, book) or nil
+            if cover_path then
                 book.cover_path = cover_path
             end
         end
@@ -2010,10 +2014,17 @@ function FanQiePlugin:_cacheShelfPageCovers(books, view, page, first, last, gene
 
     local cover_cache_dir = self.settings:get_download_dir() .. "/covers"
     if H then H.make_dir(cover_cache_dir) end
-    local cover_filename = string.gsub(book.title, "[/\\:%*%?\"<>|]", "_") .. ".jpg"
-    local cover_path = cover_cache_dir .. "/" .. cover_filename
+    local cover_path = CoverCache and CoverCache.path(self.settings, book) or nil
+    if not cover_path then
+        UIManager:scheduleIn(0.1, function()
+            self:_cacheShelfPageCovers(books, view, page, first, last, generation, index + 1)
+        end)
+        return
+    end
 
-    if H.file_exists(cover_path) then
+    local existing = CoverCache.find(self.settings, book)
+    if existing then
+        cover_path = existing
         book.cover_path = cover_path
         local changed = false
         for _, entry in ipairs(view.item_table or {}) do
@@ -2112,13 +2123,18 @@ function FanQiePlugin:_preloadAllCovers(books)
             return
         end
 
-        local cover_filename = string.gsub(book.title, "[/\\:%*%?\"<>|]", "_") .. ".jpg"
-        local cover_path = cover_cache_dir .. "/" .. cover_filename
         local book_id = book.book_id or book.bookId
+        local cover_path = CoverCache and CoverCache.path(self.settings, book) or nil
+        if not cover_path then
+            UIManager:scheduleIn(0.05, function() preload_one(idx + 1) end)
+            return
+        end
 
-        if H.file_exists(cover_path) then
-            book.cover_path = cover_path
-            update_ui_cover(book_id, cover_path)
+        -- 已有缓存：新名 <book_id>.jpg 优先，回退旧名 <书名>.jpg
+        local existing = CoverCache.find(self.settings, book)
+        if existing then
+            book.cover_path = existing
+            update_ui_cover(book_id, existing)
             UIManager:scheduleIn(0.05, function() preload_one(idx + 1) end)
             return
         end
@@ -3643,6 +3659,15 @@ function FanQiePlugin:_openBookWithCache(book, cached_chapters)
             end
         end
     end
+    -- 与本地实际读到的最新章号取 max：离线/弱网时进度还在 pending 里排队，
+    -- 云端（= book.item_id）会停在旧位置，不取 max 重开书会往回跳。
+    local local_latest = _state.localLatestChapterIndex
+        and _state.localLatestChapterIndex(book.book_id, #cached_chapters)
+    if local_latest and local_latest > start_index then
+        if Log then Log.info("openBookWithCache: local progress ahead, " ..
+            start_index .. " -> " .. local_latest) end
+        start_index = local_latest
+    end
     -- 如果上次阅读的章节没有缓存，向后找第一个有缓存的章节
     local chapter_cache = Content.load_cache_index(self.settings, book.book_id)
     if chapter_cache then
@@ -3774,6 +3799,16 @@ function FanQiePlugin:openBook(book)
 
         if start_index > #chapters then
             start_index = 1
+        end
+
+        -- 与本地实际读到的最新章号取 max：云端 100 / 本地 pending 103 ⇒ 进 103；
+        -- 云端 105（App 上读过）⇒ 仍 105。两头都不丢。
+        local local_latest = _state.localLatestChapterIndex
+            and _state.localLatestChapterIndex(book_id, #chapters)
+        if local_latest and local_latest > start_index then
+            if Log then Log.info("openBook: local progress ahead, " ..
+                start_index .. " -> " .. local_latest) end
+            start_index = local_latest
         end
 
         self:openChapter(book, chapters, start_index)

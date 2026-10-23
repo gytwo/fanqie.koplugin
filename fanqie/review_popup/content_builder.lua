@@ -67,10 +67,11 @@ end
 local BODY_BASE_LEVEL = 1
 local function textColorForGamma(gamma)
     local g = tonumber(gamma) or 1
-    -- 0.95 与 1.0 在纸上几乎看不出差别，按标准处理，避免一点点调低就整片发灰
-    if g >= 0.95 then return grayForLevel(BODY_BASE_LEVEL) end
-    -- 0.9 → 2 档(#22)，0.8 → 3 档(#33)，0.7 → 5 档；封顶 10 档(#AA)
-    return grayForLevel(math.min(10, BODY_BASE_LEVEL + math.floor((1 - g) * 12 + 0.5)))
+    -- 标准对比度：纯黑，与正文一致（weread 的想法弹窗也是纯黑）。
+    if g >= 0.95 then return Blitbuffer.COLOR_BLACK end
+    -- 对比度调低时正文笔画变细。弹框这条自建渲染链只能改字色，
+    -- 改多了就整片发虚（0.8 就灰成 #33 是明显过头），所以最多淡一档。
+    return grayForLevel(BODY_BASE_LEVEL)
 end
 
 --- UTF-8-safe truncation with an ellipsis suffix.

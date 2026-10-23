@@ -185,7 +185,7 @@ function PageRenderer:paginate()
     local text_w = inner_w - self.doc_margins.left - self.doc_margins.right - item_width
     if text_w < 10 then text_w = 10 end
     local base_size = math.max(8, math.floor(self.doc_font_size or 0))
-    local bold_level = FaceFactory.resolveBoldLevel(self.doc_font_weight, gamma_value)
+    local bold_level = FaceFactory.resolveBoldLevel(self.doc_font_weight)
 
     local pieces = {}
     local boundaries = {}

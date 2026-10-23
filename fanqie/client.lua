@@ -532,13 +532,28 @@ end
 -- <comment ident="official:<book>/<item>/<pid>" count="N" /> 插到该段落 </p> 前，
 -- 后续交给 content.lua 既有的气泡清洗管线处理。
 -- 返回 (注入后的正文, para_reviews)，para_reviews 顺序与气泡序号一致。
+--- 把段评统计注入正文气泡，并回报「命中率异常」。
+-- 返回 content, para_reviews, anomaly
+--   anomaly = { expected=, injected=, blk_seen=, kind="none"|"partial" }
+-- 为什么要回报：泡泡依赖正文里的 `<blk p_idx="N">` 段落标记。番茄前端一改版
+-- （去掉 blk 或改属性名），气泡会全部消失且**零报错**——用户以为这本书本来
+-- 没段评，插件以为一切正常。这里把静默失效变成一条可查的 WARN。
 local function inject_comment_tags(content, book_id, item_id, stats)
     local para_reviews = {}
     if type(content) ~= "string" or type(stats) ~= "table" then
         return content, para_reviews
     end
+    -- 期望命中段数：stats 里 count > 0 的段
+    local expected = 0
+    for _, info in pairs(stats) do
+        if type(info) == "table" and (tonumber(info.count) or 0) > 0 then
+            expected = expected + 1
+        end
+    end
+    local blk_seen = 0
     local out = content:gsub("(<p%s[^>]*>[%s%S]-</p>)", function(seg)
         local pid = tonumber(seg:match('<blk[^>]*p_idx="(%d+)"'))
+        if pid then blk_seen = blk_seen + 1 end
         local info = pid and stats[pid]
         local n = info and (tonumber(info.count) or 0) or 0
         if n > 0 and not seg:find("<comment", 1, true) then
@@ -549,7 +564,15 @@ local function inject_comment_tags(content, book_id, item_id, stats)
         end
         return seg
     end)
-    return out, para_reviews
+
+    local anomaly = nil
+    local injected = #para_reviews
+    if expected > 0 and injected == 0 then
+        anomaly = { expected = expected, injected = 0, blk_seen = blk_seen, kind = "none" }
+    elseif expected >= 10 and injected * 2 < expected then
+        anomaly = { expected = expected, injected = injected, blk_seen = blk_seen, kind = "partial" }
+    end
+    return out, para_reviews, anomaly
 end
 
 -- 通过番茄 App reading 协议取正文：设备注册 → registerkey → batch_full → 本地解密。
@@ -579,11 +602,19 @@ function Client:official_app_get_content(book_id, item_id, opts)
             stats, stats_err = nil, stats
         end
         if type(stats) == "table" then
-            local ok_inject, content2, reviews = pcall(inject_comment_tags,
+            local ok_inject, content2, reviews, inject_anomaly = pcall(inject_comment_tags,
                 row.content or "", tostring(book_id), tostring(item_id), stats)
             if ok_inject then
                 row.content = content2
                 para_reviews = reviews or {}
+                if inject_anomaly then
+                    -- 命中率异常：大概率是番茄正文结构改版（blk 标记没了/改名了）。
+                    -- 这条 WARN 是「气泡为什么全没了」的唯一线索。
+                    log_warn(string.format(
+                        "[FanQie][official] 段评气泡注入异常(%s)：stats 命中 %d 段，实际注入 %d 个，正文 blk 标记 %d 处 —— 番茄正文结构可能已改版",
+                        tostring(inject_anomaly.kind), inject_anomaly.expected,
+                        inject_anomaly.injected, inject_anomaly.blk_seen))
+                end
             else
                 log_warn("[FanQie][official] 段评气泡注入失败:",
                     tostring(content2))

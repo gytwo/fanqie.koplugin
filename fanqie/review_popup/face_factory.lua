@@ -44,33 +44,27 @@ FaceFactory.VARIANTS = {
     reply_toggle = 0.93,  -- 「展开/收起 N 条回复」：与一级作者行同款同号
 }
 
--- 仿粗强度（对应 KOReader Font.lua 的 bold_strength_factor = 3/8）。
--- 档位 1 用更轻的强度，只够补上「对比度调高」那点笔画差异。
-local SYNTH_BOLD_FACTORS = { [1] = 0.18, [2] = 3 / 8 }
+-- 仿粗强度：只有档 1/2 用仿粗，档 3 直接换真粗体文件。
+-- 档 1 对应 cre 的 450，视觉上只是一点点压深，不能给 3/8。
+local SYNTH_BOLD_FACTORS = { [1] = 0.10, [2] = 0.18 }
 
---- 把阅读器的「字重 + 对比度」映射成弹框的字重档位：
----   0 常规 / 1 轻仿粗 / 2 标准仿粗
---- cre 的 font.face.base.weight（400/500/350）与 setGammaIndex 只作用于
---- crengine 排版，弹框是自建 FreeType face，必须自己换算。
---- 字重「加粗」= cre 的 500（中等），不是 700，所以用仿粗而不是直接换成
---- 粗体文件——后者会明显比正文重。
+--- 把阅读器的「字重」映射成弹框的仿粗档位：
+---   0 常规 / 1 轻仿粗 / 2 中仿粗 / 3 真粗体文件
 ---
---- ⚠️ 第二个参数 gamma 必须是**换算后的 gamma 值**（1.0 = 标准），
----    不是设置里存的索引 —— 索引请先过 gammaIndexToValue()。
-function FaceFactory.resolveBoldLevel(weight, gamma)
-    weight = tonumber(weight) or 0
-    gamma = tonumber(gamma) or 1.0
-    local level = 0
-    if weight >= 0.5 then
-        level = 2
-    end
-    -- 对比度调高时正文字缘被压深，视觉上等于笔画变粗；低对比度则不加粗。
-    if gamma >= 1.25 then
-        level = math.max(level, 2)
-    elseif gamma >= 1.1 then
-        level = math.max(level, 1)
-    end
-    return level
+--- ⚠️ 只跟「字重」，**不跟对比度**。KOReader 的对比度是栅格层面的 gamma
+--- 曲线（只改笔画边缘的灰度过渡），不是笔画粗细；拿它去加仿粗会让整片
+--- 变黑变糊。weread 的想法弹窗同样不做这件事。
+---
+--- cre 的换算（credocument.lua:setFontBaseWeight）是 `400 + weight*100`，
+--- 因此 0→400、+½→450、+1→500、+1½→550、+3→700。字体列表里只有
+--- 400 与 700 两档实体（engineInit 会 regularize），中间的 450/500/550
+--- 在正文里只是「稍微压深」，所以这里必须给很轻的仿粗，不能一步跳到 3/8。
+function FaceFactory.resolveBoldLevel(weight)
+    local w = tonumber(weight) or 0
+    if w <= 0 then return 0 end
+    if w < 1 then return 1 end      -- +½  = 450：极轻
+    if w < 3 then return 2 end      -- +1 / +1½ = 500 / 550
+    return 3                        -- +3  = 700：正文用的是真粗体，弹框也用真粗体
 end
 
 --- crengine 的「对比度」在设置里存的是**索引**（0 起，对应 GammaGen 表），
@@ -231,7 +225,9 @@ local function resolveBundledFont(fontname)
 end
 
 --- @param embolden_factor number|nil 仿粗强度；nil 表示常规字重
-function FaceFactory:_buildFace(path, size, embolden_factor)
+--- @param is_real_bold boolean|nil true 表示用的是字体自带的粗体文件（700），
+---        不做仿粗，直接按真粗体字形渲染。
+function FaceFactory:_buildFace(path, size, embolden_factor, is_real_bold)
     if not path or not size or size <= 0 then return nil end
     local ok, ftsize = pcall(Freetype.newFaceSize, path, size)
     if not ok or not ftsize then
@@ -254,6 +250,9 @@ function FaceFactory:_buildFace(path, size, embolden_factor)
     if embolden_factor then
         hash = string.format("%s|emb%.3f", hash, embolden_factor)
     end
+    if is_real_bold then
+        hash = hash .. "|realbold"
+    end
     local face_obj = {
         orig_font = path,
         realname = path,
@@ -261,7 +260,7 @@ function FaceFactory:_buildFace(path, size, embolden_factor)
         orig_size = size,
         ftsize = ftsize,
         hash = hash,
-        is_real_bold = false,
+        is_real_bold = is_real_bold == true,
         embolden_half_strength = half,
         synth_bold = half ~= nil,
         hb_features = { "+kern", "+liga" },
@@ -348,25 +347,30 @@ function FaceFactory:getFace(doc_font_name, size, variant, bold_level)
     local face
 
     local paths = self:getFontPaths(doc_font_name)
-    local regular, italic
+    local regular, italic, bold_path
     for _, fp in ipairs(paths) do
-        -- 仿粗统一走常规字形：cre 的「加粗」是 500（中等），换成真粗体会过重
-        if not fp.bold then
-            if fp.italic then
-                if not italic then italic = fp.path end
-            elseif not regular then
-                regular = fp.path
-            end
+        if fp.bold then
+            -- 字体自带的粗体文件（700）：字重 +3 时直接用，和正文完全一致
+            if not fp.italic and not bold_path then bold_path = fp.path end
+        elseif fp.italic then
+            if not italic then italic = fp.path end
+        elseif not regular then
+            regular = fp.path
         end
     end
 
     local prefer_italic = variant == "quote"
     local path = prefer_italic and (italic or regular) or (regular or italic)
-    local synth = bold_level > 0
+    -- 档 3 = cre 的 700：换真粗体文件，不叠仿粗（否则会双重加粗）
+    local use_real_bold = bold_level >= 3 and bold_path ~= nil
+    if use_real_bold then
+        path = bold_path
+    end
+    local synth = bold_level > 0 and not use_real_bold
     local factor = synth and SYNTH_BOLD_FACTORS[bold_level >= 2 and 2 or 1] or nil
 
     if path then
-        face = self:_buildFace(path, v_size, factor)
+        face = self:_buildFace(path, v_size, factor, use_real_bold)
         if face then
             self:_addFallbacks(face, v_size, factor)
         end
