@@ -166,11 +166,13 @@ local function set_refreshing(v)
     end
 end
 
---- 书架刷新成功后的顺带维护：covers 目录只增不减，超阈值时清掉超期文件。
--- 保守策略（200MB / 30 天，见 cover_cache.lua），普通设备不会触发。
-local function maybe_prune_covers(settings)
+--- 书架刷新成功后的顺带维护：covers 目录只增不减，超阈值时清孤儿封面。
+-- 必须把这次拿到的全量 books 传进去：清理按「是不是还在书架上」判断，
+-- 按 mtime 判断会误删长期在读的老封面（自愈重下，但闪白 + 白耗流量）。
+-- 阈值仍是 200MB（见 cover_cache.lua），普通设备不会触发。
+local function maybe_prune_covers(settings, books)
     if ok_CoverCache and CoverCache and CoverCache.maybe_auto_prune then
-        pcall(CoverCache.maybe_auto_prune, settings)
+        pcall(CoverCache.maybe_auto_prune, settings, books)
     end
 end
 
@@ -213,7 +215,7 @@ function Bookshelf:showBookshelf(opts)
                         set_refreshing(false)
                         if ok and type(result) == "table" and #result > 0 then
                             save_shelf_cache(plugin.settings, result)
-                            maybe_prune_covers(plugin.settings)
+                            maybe_prune_covers(plugin.settings, result)
                             plugin:showBookList(result)
                         end
                     end, {
@@ -275,7 +277,7 @@ function Bookshelf:showBookshelf(opts)
             end
 
             save_shelf_cache(plugin.settings, result)
-            maybe_prune_covers(plugin.settings)
+            maybe_prune_covers(plugin.settings, result)
             plugin:showBookList(result)
         end, {
             poll_interval = 0.3, timeout = 60,
@@ -303,7 +305,7 @@ function Bookshelf:showBookshelf(opts)
         end
 
         save_shelf_cache(self.settings, result)
-        maybe_prune_covers(self.settings)
+        maybe_prune_covers(self.settings, result)
         self:showBookList(result)
     end
 end

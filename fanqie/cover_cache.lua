@@ -113,6 +113,8 @@ end
 
 --- 这张缓存还新鲜吗？取不到 mtime 时按「新鲜」处理，
 -- 避免因为文件系统能力缺失而反复重下。
+-- ⚠️ 目前没有调用方：预留给「按新鲜度优先保留」的淘汰策略（不要把
+-- 自动清理改回按它判断，mtime 只在写入时更新，见 prune_orphans 的注释）。
 function M.is_fresh(path, days)
     if not M.file_exists(path) then return false end
     local L = fs()
@@ -143,6 +145,10 @@ function M.stats(dir)
 end
 
 --- 删除超过 days 天没被写过的封面。
+-- ⚠️ **已废弃：生产路径不再调用，不要接回**。
+-- 原因：mtime 只在**写入**时更新，一本 40 天前下过封面、天天在读的书
+-- mtime 同样很旧，按时间删会误伤（删后能自愈重下，但会闪白 + 白耗流量）。
+-- 清理请用 prune_orphans（按书架集合判断）。
 -- @return deleted, freed_bytes
 function M.prune(dir, days)
     local deleted, freed = 0, 0
@@ -170,19 +176,87 @@ function M.prune(dir, days)
     return deleted, freed
 end
 
---- 保守的自动清理：只有目录超过阈值才动手，且只删超期文件。
+--- 把书架集合摊平成「允许保留的文件名」，新旧两套命名都收。
+-- 旧名不能丢：老缓存仍在被 find() 回退使用，删了等于白下一遍。
+local function keep_names(books)
+    local keep = {}
+    for i = 1, #books do
+        local book = books[i]
+        local name = M.filename(book)
+        if name then keep[name] = true end
+        local old = M.legacy_filename(book)
+        if old then keep[old] = true end
+    end
+    return keep
+end
+
+--- 按书架集合删除孤儿封面：已移出书架的书、被同名书顶掉的旧文件。
+-- 判据是**集合成员**而不是 mtime —— 「这本书还在不在书架上」才是封面该不该
+-- 留的依据，和它上次被下载/被读的时间无关。用 mtime 会把「40 天前下过封面
+-- 但天天在读」的书当过期删掉（能自愈重下，但闪白 + 白耗流量）。
+--
+-- 不做「待删多于待留就放弃」这类护栏：孤儿比在架书多是常态（长期换书后
+-- 旧文件堆积），那种护栏会把最该清理的场景整个拦死。真正的防线在上游：
+-- 书架结果为空时 bookshelf.lua 直接 return，不会进到这里。
+-- @return deleted, freed_bytes
+function M.prune_orphans(dir, books)
+    local deleted, freed = 0, 0
+    local L = fs()
+    if not L or type(L.dir) ~= "function" then return deleted, freed end
+    if type(books) ~= "table" or #books == 0 then return deleted, freed end
+    local keep = keep_names(books)
+    if next(keep) == nil then return deleted, freed end
+    local ok, iter, dir_obj = pcall(L.dir, dir)
+    if not ok or type(iter) ~= "function" then return deleted, freed end
+
+    -- 先列清单再动手：删一半才发现集合不对就来不及了
+    local dead, kept = {}, 0
+    for name in iter, dir_obj do
+        if type(name) == "string" and name:lower():match("%.jpg$") then
+            if keep[name] then
+                kept = kept + 1
+            else
+                local path = dir .. "/" .. name
+                local ok_s, size = pcall(L.attributes, path, "size")
+                dead[#dead + 1] = {
+                    path = path,
+                    bytes = (ok_s and type(size) == "number") and size or 0,
+                }
+            end
+        end
+    end
+
+    for i = 1, #dead do
+        local item = dead[i]
+        if os.remove(item.path) then
+            deleted = deleted + 1
+            freed = freed + item.bytes
+        end
+    end
+    if deleted > 0 and ok_Log and Log then
+        Log.info("[cover_cache] 清理 %d 张孤儿封面，释放 %d 字节（保留 %d 张）",
+            deleted, freed, kept)
+    end
+    return deleted, freed
+end
+
+--- 保守的自动清理：只有目录超过阈值才动手。
+-- 只走集合判据。**不要**在拿不到 books 时退回按 mtime 删 —— 那是已知会
+-- 误伤在读书籍的判据（见 M.prune 注释），拿不到集合就这次不清。
 -- 返回 deleted, freed；没触发时返回 0, 0。
-function M.maybe_auto_prune(settings)
+function M.maybe_auto_prune(settings, books)
     local dir = M.dir(settings)
     local st = M.stats(dir)
     if st.bytes < M.AUTO_PRUNE_BYTES then
         return 0, 0
     end
-    if ok_Log and Log then
-        Log.info("[cover_cache] 目录 %d 字节 / %d 张，开始清理超期封面",
-            st.bytes, st.count)
+    if type(books) ~= "table" or #books == 0 then
+        return 0, 0
     end
-    return M.prune(dir, M.PRUNE_DAYS)
+    if ok_Log and Log then
+        Log.info("[cover_cache] 目录 %d 字节 / %d 张，开始清理孤儿", st.bytes, st.count)
+    end
+    return M.prune_orphans(dir, books)
 end
 
 return M
