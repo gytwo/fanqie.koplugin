@@ -526,12 +526,9 @@ function Client:official_app_reset_identity()
     return ok_set and ok_key
 end
 
--- 段评气泡注入（官方 App 协议）。
--- App 正文是 HTML，段落形如 <p idx="N" p_idx="40000"><blk p_idx="N">正文</blk></p>，
--- blk 的 p_idx 正是段评统计（idea/list）用的段落序号。把
--- <comment ident="official:<book>/<item>/<pid>" count="N" /> 插到该段落 </p> 前，
--- 后续交给 content.lua 既有的气泡清洗管线处理。
--- 返回 (注入后的正文, para_reviews)，para_reviews 顺序与气泡序号一致。
+-- 段评气泡注入（官方 App 协议）：把
+-- <comment ident="official:<book>/<item>/<pid>" count="N" /> 插到段落 </p> 前
+-- （blk 的 p_idx 正是段评统计用的段落序号），交给 content.lua 既有气泡管线。
 --- 把段评统计注入正文气泡，并回报「命中率异常」。
 -- 返回 content, para_reviews, anomaly
 --   anomaly = { expected=, injected=, blk_seen=, kind="none"|"partial" }
@@ -813,7 +810,16 @@ end
 -- 解析出 bid/cid/pid，调用 GET /novel/comment/paragraph_list 取该段评论。
 -- 返回结构为番茄原生 { code, data:{ common_list_info:{total,..}, data_list:[{comment:{common,stat}}] } }，
 -- 与书山段评返回格式一致，main.lua 的 _displayParaReviewDetail 可直接解析。
-function Client:zhiqiu_get_para_review(ident)
+function Client:zhiqiu_get_para_review(ident, opts)
+    opts = opts or {}
+    -- 知秋的 paragraph_list 只能用 page/size（cursor/offset 参数被服务端忽略，
+    -- 与 reply 接口同源）。服务端返回的 common_list_info.cursor 是**条数偏移**
+    -- （"30" 表示下一屏从第 30 条开始），这里换算成页码。
+    local size = tonumber(opts.size) or 30
+    if size < 1 then size = 30 end
+    local offset = tonumber(tostring(opts.cursor or "0"))
+    if not offset or offset < 0 then offset = 0 end
+    local page = math.floor(offset / size) + 1
     local cfg = self.settings:get_source("zhiqiu")
     local ZhiQiu = require("fanqie.zhiqiu")
     local base = H.trim(cfg.server_url or ZhiQiu.DEFAULT_BASE)
@@ -847,11 +853,13 @@ function Client:zhiqiu_get_para_review(ident)
     local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
         .. "&cid=" .. H.url_encode(cid)
         .. "&pid=" .. H.url_encode(pid)
-        .. "&page=1&size=30"
+        .. "&page=" .. tostring(page)
+        .. "&size=" .. tostring(size)
 
     local ok_logger, logger_mod = pcall(require, "fanqie.logger")
     if ok_logger and logger_mod then
-        logger_mod.info("[FanQie] 知秋段评请求:", "pid=" .. tostring(pid), "url=" .. url:sub(1, 150))
+        logger_mod.info("[FanQie] 知秋段评请求:", "pid=" .. tostring(pid),
+            "page=" .. tostring(page), "url=" .. url:sub(1, 150))
     end
 
     local headers = {
@@ -880,6 +888,104 @@ function Client:zhiqiu_get_para_review(ident)
             tostring(result.code), tostring(result.error or result.msg or "")))
     end
     return result
+end
+
+-- 知秋二级评论（回复列表）：GET {base}/novel/comment/reply?bid=&rid=&page=&size=
+--   → { code:0, data:{ reply_list:[{Common,stat,reply_id,reply_to_comment_id,
+--        reply_to_reply_id,reply_to_user_info,sub_reply}], comment_list_info:{total,has_more,cursor} } }
+--
+-- 分页用 page/size：2026-10-26 实测 cursor / offset 参数被服务端忽略
+-- （page=1&size=20&cursor=2 仍然返回全部 3 条），所以cursor 在这里是**条数偏移**，
+-- 由调用方传进来的 cursor 换算成页码。
+-- 返回 { replies, total, has_more, cursor }，与 official_get_para_replies 同构，
+-- replies 是 Comments.flatten_reply 的扁平结构（Common 大写也认）。
+function Client:zhiqiu_get_para_replies(book_id, comment_id, opts)
+    opts = opts or {}
+    local bid = tostring(book_id or "")
+    local rid = tostring(comment_id or "")
+    if bid == "" or rid == "" then
+        return nil, "缺少书籍或段评 ID"
+    end
+    local cfg = self.settings:get_source("zhiqiu") or {}
+    local ZhiQiu = require("fanqie.zhiqiu")
+    local base = H.trim(cfg.server_url or ZhiQiu.DEFAULT_BASE)
+    if base:sub(-1) == "/" then base = base:sub(1, -2) end
+
+    local token = H.trim(cfg.token or "")
+    if token == "" then
+        token = ZhiQiu.ensure_token(self, self.settings, false)
+    end
+    if token == "" then
+        return nil, "知秋书源未配置共享 Token，无法加载回复"
+    end
+    local android_id = H.trim(cfg.android_id or "")
+    local ok_aid, aid_val = pcall(function() return ZhiQiu.resolve_android_id(self.settings) end)
+    if ok_aid and type(aid_val) == "string" and aid_val ~= "" then android_id = aid_val end
+
+    local size = math.max(1, math.min(tonumber(opts.count) or 20, 50))
+    local offset = math.max(0, math.floor(tonumber(opts.cursor) or 0))
+    local page = math.floor(offset / size) + 1
+
+    local url = base .. "/novel/comment/reply?bid=" .. H.url_encode(bid)
+        .. "&rid=" .. H.url_encode(rid)
+        .. "&page=" .. tostring(page)
+        .. "&size=" .. tostring(size)
+
+    local headers = {
+        ["User-Agent"]      = FanQie.MOBILE_UA,
+        ["x-sec-token"]     = token,
+        ["x-android-id"]    = android_id,
+        ["Accept"]          = "application/json, text/plain, */*",
+        ["Accept-Encoding"] = "identity",
+        ["Content-Type"]    = "application/json",
+    }
+    local ok_req, text, code = pcall(function()
+        return self:request({ url = url, method = "GET", headers = headers, timeout = 15 })
+    end)
+    if not ok_req or not code or code < 200 or code >= 300 then
+        return nil, "知秋回复请求失败: HTTP " .. tostring(code or "nil")
+            .. " " .. tostring(ok_req and "" or text)
+    end
+    local ok_decode, result = pcall(function() return self:json_decode(text) end)
+    if not ok_decode or type(result) ~= "table" then
+        return nil, "知秋回复响应解析失败: " .. tostring(text or ""):sub(1, 160)
+    end
+    if result.code and result.code ~= 0 then
+        return nil, string.format("知秋回复错误: code=%s %s",
+            tostring(result.code), tostring(result.error or result.msg or ""))
+    end
+
+    local data = type(result.data) == "table" and result.data or {}
+    local list = type(data.reply_list) == "table" and data.reply_list or {}
+    local Comments = require("fanqie.reading.comments")
+    local flat = {}
+    for _, item in ipairs(list) do
+        local r = Comments.flatten_reply(item)
+        -- sub_reply 是「回复的回复」内联数组；渲染端是平铺列表，
+        -- 直接按顺序接在后面，避免「点开只有一级」看着缺条。
+        if type(r) == "table" then
+            flat[#flat + 1] = r
+        end
+        local subs = type(item.sub_reply) == "table" and item.sub_reply or {}
+        for _, sub in ipairs(subs) do
+            local sr = Comments.flatten_reply(sub)
+            if type(sr) == "table" then
+                sr.reply_to_user_name = sr.reply_to_user_name
+                    or (type(r) == "table" and r.user_name or nil)
+                flat[#flat + 1] = sr
+            end
+        end
+    end
+    local info = type(data.comment_list_info) == "table" and data.comment_list_info or {}
+    local total = tonumber(info.total) or (#flat + offset)
+    local has_more = info.has_more
+    if has_more == nil then has_more = (offset + #flat) < total end
+    return {
+        replies = flat,
+        total = total,
+        has_more = has_more == true,
+        cursor = offset + #flat,
+    }
 end
 
 -- Generic source scheduler: iterate enabled+configured sources in priority

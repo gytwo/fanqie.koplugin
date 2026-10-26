@@ -55,6 +55,8 @@ function M.show(opts)
         more_text = opts.more_text,
         on_more = opts.on_more,
         on_replies = opts.on_replies,
+        pic_dir = opts.pic_dir,
+        fetch_pic = opts.fetch_pic,
     }
     UIManager:show(_popup)
     return _popup

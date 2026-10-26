@@ -1,6 +1,5 @@
 local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
-local DataStorage = require("datastorage")
 
 local M = {}
 
@@ -8,27 +7,8 @@ M.is_str = function(s)
     return type(s) == "string"
 end
 
-M.is_num = function(n)
-    return type(n) == "number"
-end
-
 M.is_tbl = function(t)
     return type(t) == "table"
-end
-
-M.is_func = function(f)
-    return type(f) == "function"
-end
-
-M.is_boolean = function(b)
-    return type(b) == "boolean"
-end
-
-M.if_nil = function(a, b)
-    if a == nil then
-        return b
-    end
-    return a
 end
 
 M.trim = function(s)
@@ -116,11 +96,6 @@ M.join_path = function(...)
     return path:gsub("/+", "/")
 end
 
-M.get_cache_path = function(book_id)
-    local base_dir = DataStorage:getFullDataDir() .. "/fanqie"
-    return M.join_path(base_dir, book_id)
-end
-
 M.make_dir = function(path)
     if lfs.attributes(path, "mode") == "directory" then return true end
     util.makePath(path)
@@ -171,13 +146,6 @@ M.delete_dir = function(path)
         end
     end
     return lfs.rmdir(path)
-end
-
-M.table_size = function(t)
-    if not M.is_tbl(t) then return 0 end
-    local count = 0
-    for _ in pairs(t) do count = count + 1 end
-    return count
 end
 
 M.split = function(str, sep)

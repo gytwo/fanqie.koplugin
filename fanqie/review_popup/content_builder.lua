@@ -231,6 +231,18 @@ function ContentBuilder.build(items, opts)
             }
         end
 
+        -- 段评配图：纯图评论（无文字）也会走到这里 —— 归一层已放开「必须有文字」
+        -- 的判据，否则这类图整个被丢弃。
+        if type(item.pics) == "table" and #item.pics > 0 then
+            blocks[#blocks + 1] = {
+                kind = "image",
+                pics = item.pics,
+                item_index = item_index,
+                spacing_before = 0.2,
+                spacing_after = 0.2,
+            }
+        end
+
         -- ── 二级评论（官方源）──────────────────────────────────────────
         -- 入口单独占一行且可点。展开后回复按接口顺序平铺，用「回复 @某人」
         -- 表达层级：接口里 sub_reply 恒空，层级只靠 reply_to_reply_id，

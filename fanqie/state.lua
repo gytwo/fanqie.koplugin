@@ -171,10 +171,6 @@ M.removePendingProgress = function(book_id, item_id)
     M.pending_progress[key] = nil
 end
 
-M.clearAllPendingProgress = function()
-    M.pending_progress = {}
-end
-
 M.setLastProgressReport = function(item_id, progress)
     M.last_progress_report[item_id] = {
         progress = progress,
@@ -248,10 +244,6 @@ end
 
 M.setTocMenuOpen = function(is_open)
     M.toc_menu_open = is_open
-end
-
-M.isTocMenuOpen = function()
-    return M.toc_menu_open == true
 end
 
 M.setReviewEnabled = function(enabled)

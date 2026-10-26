@@ -91,6 +91,9 @@ local Async = safe_require("fanqie.async")
 -- 封面缓存：命名规则（book_id 优先）、存在性查找、统计与清理
 local CoverCache = safe_require("fanqie.cover_cache")
 
+-- 段评配图缓存：按书分子目录、md5 命名、按书架集合清理
+local ReviewPics = safe_require("fanqie.review_pics")
+
 local unpack_args = unpack or table.unpack
 
 -- 菜单排序：让番茄书架紧跟在「微信读书」之后（工具菜单第二位）。
@@ -247,7 +250,44 @@ function FanQiePlugin:init()
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
+    -- 统计库静默收敛（合并历史重复行 / 清孤儿），每天最多一次
+    pcall(self.scheduleStatsSweep, self)
     Log.info("plugin initialized:", "version=", self.version)
+end
+
+-- 统计库自愈：历史版本留下的「同书多行」「孤儿 psd 行」不会因为用户不打开那本书
+-- 就消失（converge 只在打开时跑那一本）。这里启动后延迟扫一遍，每天最多一次。
+-- 失败不写时间戳，下次启动重试；全程 pcall，绝不影响插件加载。
+function FanQiePlugin:scheduleStatsSweep()
+    local dir
+    local ok_dir, d = pcall(function()
+        return DataStorage and DataStorage:getSettingsDir()
+    end)
+    if ok_dir and d then dir = d end
+    if not dir then return end
+    local stamp = dir .. "/fanqie_stats_sweep.stamp"
+    if lfs then
+        local at = lfs.attributes(stamp, "modification")
+        if at and (os.time() - at) < 86400 then return end
+    end
+    if not UIManager then return end
+    UIManager:scheduleIn(6, function()
+        local ok_bm, BookMeta = pcall(require, "fanqie.book_meta")
+        if not ok_bm or type(BookMeta) ~= "table" or not BookMeta.sweep_stats_db then return end
+        local ok, res = pcall(BookMeta.sweep_stats_db)
+        if not ok or type(res) ~= "table" then
+            if Log and Log.warn then Log.warn("[FanQie] 统计库收敛失败，下次重试") end
+            return
+        end
+        if (res.merged or 0) > 0 or (res.orphans or 0) > 0 then
+            if Log and Log.info then
+                Log.info("[FanQie] 统计库已收敛: 合并", tostring(res.merged),
+                    "组, 清理孤儿", tostring(res.orphans), "行")
+            end
+        end
+        local f = io.open(stamp, "w")
+        if f then f:write(tostring(os.time())); f:close() end
+    end)
 end
 
 function FanQiePlugin:displayError(err)
@@ -567,11 +607,53 @@ function FanQiePlugin:showParaReviewDetail(index)
     end
 end
 
--- 书山段评懒加载状态（同一时间只有一个段评弹窗）：
+-- 段评懒加载状态（同一时间只有一个段评弹窗，三源共用）：
 -- { ident, index, total_reviews, rich_items, total, cursor, has_more, busy, ui_opts }
 local _para_more_state = nil
 
--- 解析段评返回（支持新格式 data_list 与旧格式 comments），并提取书山分页信息
+-- 书山把该段评的**全部回复**内联在 data_list[].replies 里（2026-10-26 实测：
+-- 扫 6 页 × 2 段，reply_count 与内联条数完全一致，无截断）。结构是
+-- { Common = {user_info, content, create_timestamp}, stat } —— 注意 Common 是大写，
+-- 且没有 reply_id / reply_to_*，所以不能走 Comments.build_reply_tree（那会丢掉
+-- 没有 reply_id 的节点）；弹窗本来就是平铺渲染，这里只需要扁平数组。
+local function _flattenInlineReplies(raw)
+    local out = {}
+    if type(raw) ~= "table" or #raw == 0 then return out end
+    local ok_c, Comments = pcall(require, "fanqie.reading.comments")
+    for _, r in ipairs(raw) do
+        if type(r) == "table" then
+            local flat
+            if ok_c and type(Comments) == "table" and Comments.flatten_reply then
+                local ok, f = pcall(Comments.flatten_reply, r)
+                if ok and type(f) == "table" then flat = f end
+            end
+            if type(flat) ~= "table" then
+                -- flatten_reply 不可用时退化成极简结构，至少文字/作者不丢
+                local cm = type(r.Common) == "table" and r.Common
+                    or (type(r.common) == "table" and r.common or {})
+                local ui = type(cm.user_info) == "table" and cm.user_info or {}
+                local bi = type(ui.base_info) == "table" and ui.base_info or ui
+                local ct = type(cm.content) == "table" and cm.content or {}
+                local st = type(r.stat) == "table" and r.stat or {}
+                flat = {
+                    user_name = bi.user_name,
+                    text = ct.text or "",
+                    digg_count = tonumber(st.digg_count) or 0,
+                    create_time = cm.create_timestamp,
+                }
+            end
+            -- 内联结构没有 id：补一个稳定键（渲染端按数组顺序遍历，不依赖它，
+            -- 但 build_reply_tree / 去重逻辑看到 nil 会当脏数据跳过）
+            if flat.reply_id == nil or flat.reply_id == "" then
+                flat.reply_id = "inline-" .. tostring(#out + 1)
+            end
+            out[#out + 1] = flat
+        end
+    end
+    return out
+end
+
+-- 解析段评返回（支持新格式 data_list 与旧格式 comments），并提取分页信息
 -- （common_list_info 的 total / has_more / cursor）
 local function _parseParaReviewResult(result)
     local comments = nil
@@ -608,6 +690,17 @@ local function _parseParaReviewResult(result)
                     reply_count = stat.reply_count or 0,
                     create_time = common.create_timestamp or common.create_time,
                     para_src = (c.expand and c.expand.para_src_content) or "",
+                    -- ⚠️ 图片必须在这里带出来。这里是 main.lua 自己的一份手写扁平化，
+                    -- 不走 reading/comments.lua 的 flatten_comment，所以字段是逐个挑的：
+                    -- 之前漏了它，导致官方源段评的图在解析阶段就被丢掉，
+                    -- 下游 _normPics 拿到 nil ⇒ 一条图都渲染不出来。
+                    -- 保留**原始** image_data_list（不是扁平化后的图数组），
+                    -- 由 _normPics 交给 Comments.normalize_images 处理（含 HEIC 转码）。
+                    -- ⚠️ 书山的图只给 `web_uri` 字段（见 normalize_images 里的本地补丁），
+                    -- 知秋是 dynamic_url + width/height，两种都在这一层原样往下传。
+                    images = content.image_data_list,
+                    -- 书山内联的回复（其它源为 nil/空表）
+                    replies_inline = _flattenInlineReplies(item.replies),
                 })
             end
         else
@@ -628,9 +721,32 @@ local function _parseParaReviewResult(result)
     return comments, total, cursor, has_more
 end
 
--- 归一化为富排版 items：{ abstract, author, content, likes_count }
--- supports_replies 为真时额外携带 comment_id / reply_count / 展开状态，
--- 供弹窗渲染「展开 N 条回复」入口（目前只有官方源支持）。
+-- 段评配图归一化：一条段评 → [{ url, fetch, w, h, displayable }]。
+-- 实现在 review_pics.from_comment（官方源的 image_data_list 与其它源的
+-- picInfos 两种形态都在那里收口，且能单测）。缺模块时退化为「不显示图」。
+local function _normPics(comment)
+    if ReviewPics and ReviewPics.from_comment then
+        return ReviewPics.from_comment(comment)
+    end
+    return {}
+end
+
+-- 三个源的段评都支持「展开回复」（2026-10-26 起）：
+--   official → App 协议 /commentapi/reply/list
+--   zhiqiu   → /novel/comment/reply?bid=&rid=
+--   shushan  → 段评响应已内联全部 replies，展开时本地返回、零请求
+-- ⚠️ 首屏与「继续加载」必须用同一个判据：续拉单独写死 official 会让
+-- 知秋/书山的续拉页丢掉「展开 N 条回复」入口（2026-10-26 修的 bug）。
+local function _supportsReplies(ident)
+    local s = tostring(ident or "")
+    return s:find("official:", 1, true) == 1
+        or s:find("zhiqiu:", 1, true) == 1
+        or s:find("shushan:", 1, true) == 1
+end
+
+-- 归一化为富排版 items：{ abstract, author, content, likes_count, pics }
+-- supports_replies 为真时额外携带 reply_count / 内联回复，供弹窗渲染「展开 N 条回复」。
+-- comment_id 无条件带出（续拉去重要用）。
 local function _normParaRichItems(comments, abstract, supports_replies)
     local rich_items = {}
     for _, comment in ipairs(comments or {}) do
@@ -641,17 +757,30 @@ local function _normParaRichItems(comments, abstract, supports_replies)
         local content_text = tostring(comment.text or comment.content or "")
         local like_count = tonumber(comment.like_count or comment.likeCount
             or comment.digg_count) or 0
-        if content_text ~= "" then
+        local pics = _normPics(comment)
+        -- ⚠️ 判据不能只看文字：纯图评论（只晒图没配文）在番茄很常见，
+        -- 以前 `content_text ~= ""` 把它们整条丢掉了，弹窗里「少了几条」。
+        if content_text ~= "" or #pics > 0 then
             local item = {
                 abstract = abstract,
                 author = username,
                 content = content_text,
                 likes_count = like_count,
+                pics = pics,
+                -- ⚠️ comment_id 必须**无条件**带出（与 supports_replies 无关）：
+                -- 续拉合并时靠它去重。知秋服务端分页会在页间抖动（实测 page1/page2
+                -- 重叠 4 条、page3 又与前面重叠 7 条，370 条池子翻 3 页有 11 条重复），
+                -- 不按 id 去重就会出现同一条评论连着两份。
+                comment_id = comment.comment_id,
             }
             if supports_replies then
-                item.comment_id = comment.comment_id
                 item.reply_count = tonumber(comment.reply_count) or 0
                 item.can_replies = true
+                -- 书山的回复在段评响应里就带全了，不用再发请求；
+                -- 放到 item 上，弹窗展开时直接本地返回（见 on_replies）。
+                if type(comment.replies_inline) == "table" and #comment.replies_inline > 0 then
+                    item.replies_inline = comment.replies_inline
+                end
             end
             table.insert(rich_items, item)
         end
@@ -714,9 +843,9 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             .. " total=" .. tostring(total_val))
     end
 
-    -- 解析评论列表（支持新格式 data_list 和旧格式 comments），并取书山分页游标
+    -- 解析评论列表（支持新格式 data_list 和旧格式 comments），并取分页游标
     local comments, total, more_cursor, more_has_more = _parseParaReviewResult(result)
-    -- 书山 /idea_comment 不返回 total（无 common_list_info），
+    -- 书山 /idea_comment 不返回 total（无 common_list_info，实测为空对象），
     -- 气泡 count 才是该段评论总数 → 用它驱动「还剩 N 条」与按钮显隐
     local bubble_total = tonumber(bubble_count) or 0
     if bubble_total > total then total = bubble_total end
@@ -734,8 +863,12 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
         end
 
         -- 归一化 items: { abstract, author, content, likes_count }
-        -- 只有官方源接了二级评论接口，其它书源不渲染「展开回复」入口
-        local supports_replies = tostring(ident or ""):find("official:", 1, true) ~= nil
+        -- 三个源都支持二级评论（2026-10-26 起）：
+        --   official → App 协议 /commentapi/reply/list
+        --   zhiqiu   → /novel/comment/reply?bid=&rid=
+        --   shushan  → 段评响应已内联全部 replies，展开时本地返回、零请求
+        local ident_str = tostring(ident or "")
+        local supports_replies = _supportsReplies(ident_str)
         local rich_items = _normParaRichItems(comments, abstract, supports_replies)
 
         if #rich_items == 0 then
@@ -754,6 +887,42 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             end)
         end
 
+        -- ── 段评配图 ─────────────────────────────────────────────────
+        -- 目录：<下载目录>/review_pics/<book_id>/ —— 按书分目录，书移出书架时整目录清理。
+        local review_pic_dir
+        if ReviewPics and ReviewPics.ensure then
+            local bid = _state.bookIdFromPath(_state.current_document_path)
+            local ok_dir, dir = pcall(ReviewPics.ensure, self.settings, bid)
+            if ok_dir then review_pic_dir = dir end
+        end
+
+        -- 图片下载走 Async 子进程（与封面同一套），UI 线程零阻塞。
+        -- done(ok) 必到达一次；widget 那边负责刷新页面位图。
+        local function fetch_review_pic(url, path, done)
+            local function finish(ok)
+                if done then pcall(done, ok) end
+            end
+            if not path or type(url) ~= "string" or url == "" then
+                return finish(false)
+            end
+            if not Async or not Async.run then return finish(false) end
+            local plugin_ref = self
+            Async.run(function()
+                local c = Client:new(plugin_ref.settings)
+                local data = c:get_binary(url)
+                if type(data) ~= "string" or #data == 0 then
+                    error("empty image body", 0)
+                end
+                local f = io.open(path, "wb")
+                if not f then error("cannot open " .. tostring(path), 0) end
+                f:write(data)
+                f:close()
+                return true
+            end, function(ok)
+                finish(ok == true)
+            end, { poll_interval = 0.2, timeout = 30 })
+        end
+
         local opts = {
             pages = rich_items,
             height_ratio = 0.7,
@@ -765,6 +934,8 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             doc_font_name = nil,
             doc_font_size = nil,
             doc_margins = nil,
+            pic_dir = review_pic_dir,
+            fetch_pic = fetch_review_pic,
         }
         -- 从当前阅读器 ui 读取正文字体/字号/边距（带降级，读不到就交给弹框默认）
         if self.ui then
@@ -798,7 +969,7 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             end
         end
 
-        -- 书山段评懒加载：首屏只展示已拉到的 1 页（20 条），
+        -- 段评懒加载（三源共用）：首屏一次请求出内容，
         -- 底部「继续加载（还剩 N 条）」按钮续拉下一页。
         _para_more_state = {
             ident = tostring(ident),
@@ -855,24 +1026,57 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                 if not st2 or type(item) ~= "table" then
                     return done(false, nil, "段评上下文已失效")
                 end
-                if not tostring(st2.ident or ""):find("official:", 1, true) then
+                local idt = tostring(st2.ident or "")
+                local src
+                if idt:find("official:", 1, true) == 1 then src = "official"
+                elseif idt:find("zhiqiu:", 1, true) == 1 then src = "zhiqiu"
+                elseif idt:find("shushan:", 1, true) == 1 then src = "shushan"
+                end
+                if not src then
                     return done(false, nil, "当前书源不支持回复")
+                end
+                -- 书山：回复在段评响应里就带全了（实测无截断），本地直接返回，
+                -- 不发网络请求。没有内联数据的段评直接报「没有回复」，不静默空转。
+                if src == "shushan" then
+                    local inline = item.replies_inline
+                    if type(inline) ~= "table" or #inline == 0 then
+                        return done(false, nil, "该段评没有回复")
+                    end
+                    local payload = { replies = inline, total = #inline, has_more = false }
+                    -- ⚠️ 不能直接同步调 done：done 里会重建弹窗页面，而此刻正处在
+                    -- 触摸事件的回调栈里（on_replies 以往的路径全是 Async 异步）。
+                    -- 延后一帧，和异步路径保持同样的时序。
+                    if UIManager and UIManager.nextTick then
+                        UIManager:nextTick(function() done(true, payload) end)
+                    else
+                        done(true, payload)
+                    end
+                    return
                 end
                 local cid = item.comment_id
                 if cid == nil or tostring(cid) == "" then
                     return done(false, nil, "缺少段评 ID")
                 end
                 if Log then
-                    Log.info("[段评] 展开回复: cid=" .. tostring(cid)
-                        .. " type=" .. type(cid)
+                    Log.info("[段评] 展开回复: src=" .. tostring(src)
+                        .. " cid=" .. tostring(cid)
                         .. " len=" .. tostring(#tostring(cid))
                         .. " cursor=" .. tostring(cursor))
                 end
+                -- 知秋需要书籍 ID：ident = "zhiqiu:<bid>:<cid>:<pid>"
+                local zq_bid = src == "zhiqiu" and idt:match("^zhiqiu:([^:]+):") or nil
                 Async.run(function()
                     local c = Client:new(self.settings)
-                    local res, rerr = c:official_get_para_replies(cid, {
-                        cursor = cursor, count = 20,
-                    })
+                    local res, rerr
+                    if src == "zhiqiu" then
+                        res, rerr = c:zhiqiu_get_para_replies(zq_bid, cid, {
+                            cursor = cursor, count = 20,
+                        })
+                    else
+                        res, rerr = c:official_get_para_replies(cid, {
+                            cursor = cursor, count = 20,
+                        })
+                    end
                     -- ⚠️ Async 的子进程只序列化**第一个**返回值：`return nil, err`
                     -- 会让父进程拿到 ok=true, result=nil，失败原因直接蒸发，
                     -- 用户只能看到笼统的「回复加载失败」。必须 error() 抛出去。
@@ -912,10 +1116,16 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                     return c:official_get_para_review(idt,
                         { cursor = st.cursor, count = 20 })
                 end
+                if idt:find("zhiqiu:", 1, true) then
+                    -- 知秋只认 page/size，cursor 由 client 换算成页码
+                    return c:zhiqiu_get_para_review(idt,
+                        { cursor = st.cursor, size = 30 })
+                end
                 return c:shushan_get_para_review(idt,
                     { cursor = st.cursor, count = 20, page_max = 1 })
             end, function(ok2, result2, err2)
                 st.busy = false
+                local added = 0   -- 本页真正新增的条数（去重后），供自动续拉判断
                 if ok2 and type(result2) == "table" then
                     local comments2, total2, cursor2, has_more2 =
                         _parseParaReviewResult(result2)
@@ -929,9 +1139,34 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                         abstract2 = st.rich_items[1].abstract or ""
                     end
                     local new_items = _normParaRichItems(comments2, abstract2,
-                        tostring(st.ident or ""):find("official:", 1, true) ~= nil)
+                        _supportsReplies(st.ident))
+                    -- 跨页去重：服务端分页不保证严格不重叠（知秋实测 page1/page2
+                    -- 重叠 4 条、page3 又与前面重叠 7 条），按 comment_id 过滤；
+                    -- 缺 id 时退化用「作者 + 正文」当键。
+                    local seen, seen_anon = {}, {}
+                    for _, old in ipairs(st.rich_items) do
+                        if old.comment_id ~= nil then
+                            seen[tostring(old.comment_id)] = true
+                        else
+                            seen_anon[tostring(old.author or "") .. "\1"
+                                .. tostring(old.content or "")] = true
+                        end
+                    end
                     for _, it in ipairs(new_items) do
-                        table.insert(st.rich_items, it)
+                        local dup
+                        if it.comment_id ~= nil then
+                            local k = tostring(it.comment_id)
+                            dup = seen[k]
+                            seen[k] = true
+                        else
+                            local k = tostring(it.author or "") .. "\1" .. tostring(it.content or "")
+                            dup = seen_anon[k]
+                            seen_anon[k] = true
+                        end
+                        if not dup then
+                            table.insert(st.rich_items, it)
+                            added = added + 1
+                        end
                     end
                     if (tonumber(total2) or 0) > (tonumber(st.total) or 0) then
                         st.total = total2
@@ -939,7 +1174,9 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                     st.cursor = cursor2
                     if has_more2 ~= nil then st.has_more = has_more2 end
                     if Log then
-                        Log.info("[段评] 继续加载成功: +" .. tostring(#new_items)
+                        Log.info("[段评] 继续加载成功: +" .. tostring(added)
+                            .. "（本页 " .. tostring(#new_items)
+                            .. " 条，去重 " .. tostring(#new_items - added) .. "）"
                             .. " 已加载=" .. tostring(#st.rich_items)
                             .. "/" .. tostring(st.total)
                             .. " has_more=" .. tostring(st.has_more))
@@ -950,6 +1187,14 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                     end
                     self:showInfo(_("继续加载失败，请稍后重试"))
                 end
+                -- 整页都是重复（服务端游标抖动撞上已加载区间）时自动再翻一页，
+                -- 否则用户点「继续加载」看起来毫无反应。最多连拉两次，防死循环。
+                if ok2 and added == 0 and st.has_more and not st.auto_retry then
+                    st.auto_retry = true
+                    UIManager:nextTick(function() load_more() end)
+                    return
+                end
+                st.auto_retry = false
                 refresh_popup()
             end, { poll_interval = 0.125, timeout = 45 })
         end
@@ -964,6 +1209,9 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
             -- 漏掉就会退化成默认值，弹框永远不跟随阅读器设置。
             doc_font_weight = opts.doc_font_weight,
             doc_font_gamma = opts.doc_font_gamma,
+            -- 配图：续拉重开走的是 ui_opts，漏掉这两项新拉到的图就只剩占位框
+            pic_dir = opts.pic_dir,
+            fetch_pic = opts.fetch_pic,
         }
         refresh_popup()
     else
@@ -1952,7 +2200,9 @@ function FanQiePlugin:showBookList(books)
     end
 
     local ShelfView = require("fanqie.shelf_view")
-    self.book_list_menu = ShelfView.show{
+    -- opts 存到 self 上：书名后台校正完成后要用同一套回调重建 item_table
+    -- （ShelfView.update 不关闭菜单，能保持当前页与滚动位置）
+    local shelf_opts = {
         title = _("番茄书架"),
         books = books,
         show_covers = true,
@@ -1963,6 +2213,7 @@ function FanQiePlugin:showBookList(books)
         on_close = function()
             self:_cancelCoverLoading()
             self.book_list_menu = nil
+            self._shelf_opts = nil
             _state.active_menu = nil
         end,
         on_refresh = function()
@@ -1972,10 +2223,26 @@ function FanQiePlugin:showBookList(books)
             self:_onShelfPage(books, current, page, first, last)
         end,
     }
+    self._shelf_opts = shelf_opts
+    self.book_list_menu = ShelfView.show(shelf_opts)
     _state.active_menu = self.book_list_menu
 
     -- 后台批量预下载所有未缓存的封面（串行，避免阻塞 UI）
     self:_preloadAllCovers(books)
+end
+
+-- 书名后台校正完成后原地刷新书架标题（保持当前页，不重开菜单）。
+-- 只在书架仍然开着时生效：用户已经进了别的界面就静默跳过。
+-- ⚠️ 这里**不要**用 pcall 包住 update：ShelfView.update 会改菜单状态，
+-- 一旦中途抛错，pcall 只会把错误吞掉、留下半改的坏菜单，用户下一次翻页
+-- 才炸（2026-10-26 就是这么崩的）。宁可让错误当场出现在日志里。
+function FanQiePlugin:refreshShelfTitles(books)
+    if not self.book_list_menu or not self._shelf_opts then return end
+    if type(books) ~= "table" or #books == 0 then return end
+    self._shelf_opts.books = books
+    local ok, ShelfView = pcall(require, "fanqie.shelf_view")
+    if not ok or type(ShelfView) ~= "table" or not ShelfView.update then return end
+    ShelfView.update(self.book_list_menu, books, self._shelf_opts)
 end
 
 function FanQiePlugin:_cancelCoverLoading()

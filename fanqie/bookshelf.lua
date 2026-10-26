@@ -15,6 +15,8 @@ local ok_state, _state = pcall(require, "fanqie.state")
 local ok_Async, Async = pcall(require, "fanqie.async")
 local ok_FanQie, FanQie = pcall(require, "fanqie.fanqie")
 local ok_CoverCache, CoverCache = pcall(require, "fanqie.cover_cache")
+local ok_ReviewPics, ReviewPics = pcall(require, "fanqie.review_pics")
+local ok_BookNames, BookNames = pcall(require, "fanqie.book_names")
 
 -- 书架内存缓存：内存主源 + 文件后备
 -- 存精简后的 books 数组（与 shelf_cache.lua 同构）。
@@ -124,6 +126,10 @@ local function load_shelf_cache(settings)
     end)
     if ok and type(data) == "table" and #data > 0 then
         if Log then Log.info("shelf cache loaded: " .. tostring(#data) .. " books") end
+        -- 用本地缓存的 App 正式名覆盖 SEO 推广名（纯内存，无网络）
+        if ok_BookNames and BookNames then
+            pcall(BookNames.decorate, settings, data)
+        end
         -- 3. 回填内存缓存（存原始引用，调用方拿到的是浅拷贝不会污染 data）
         SHELF_MEM_CACHE = data
         return shallow_copy_books(data)
@@ -174,6 +180,27 @@ local function maybe_prune_covers(settings, books)
     if ok_CoverCache and CoverCache and CoverCache.maybe_auto_prune then
         pcall(CoverCache.maybe_auto_prune, settings, books)
     end
+    -- 段评配图（review_pics/<book_id>/）独立目录、独立阈值，同样按书架集合清理。
+    -- 分开做：混目录会让两边的孤儿清理互相误删。
+    if ok_ReviewPics and ReviewPics and ReviewPics.maybe_auto_prune then
+        pcall(ReviewPics.maybe_auto_prune, settings, books)
+    end
+end
+
+-- 后台校正书名（App 正式名）。拿到后写回缓存、同步刷新书架当前页。
+-- 不阻塞界面：本地缓存名在 decorate 阶段已经生效，这里只补「还没查过的书」。
+function Bookshelf:_ensureBookNames(books)
+    if not (ok_BookNames and BookNames) then return false end
+    if type(books) ~= "table" or #books == 0 then return false end
+    local plugin = self
+    local ok, started = pcall(BookNames.ensure, self.settings, books, function(updated)
+        save_shelf_cache(plugin.settings, updated)
+        -- 只刷标题，保持当前页；书架没开着（或已换菜单）时静默跳过
+        if plugin.refreshShelfTitles then
+            pcall(plugin.refreshShelfTitles, plugin, updated)
+        end
+    end)
+    return ok and started or false
 end
 
 function Bookshelf:showBookshelf(opts)
@@ -201,6 +228,8 @@ function Bookshelf:showBookshelf(opts)
         local cached_shelf = load_shelf_cache(self.settings)
         if cached_shelf and #cached_shelf > 0 then
             self:showBookList(cached_shelf)
+            -- 顺手补齐还没查过的书名（后台、串行、有缓存挡着，稳态 0 请求）
+            self:_ensureBookNames(cached_shelf)
             -- 后台异步刷新：门控——已有刷新在跑就跳过（不重入、不排队，
             -- 缓存已经显示，刷新交给正在进行的那个任务）
             if self:checkNetwork() and not refreshing_now() then
@@ -217,6 +246,7 @@ function Bookshelf:showBookshelf(opts)
                             save_shelf_cache(plugin.settings, result)
                             maybe_prune_covers(plugin.settings, result)
                             plugin:showBookList(result)
+                            plugin:_ensureBookNames(result)
                         end
                     end, {
                         poll_interval = 0.3, timeout = 60,
@@ -279,6 +309,7 @@ function Bookshelf:showBookshelf(opts)
             save_shelf_cache(plugin.settings, result)
             maybe_prune_covers(plugin.settings, result)
             plugin:showBookList(result)
+            plugin:_ensureBookNames(result)
         end, {
             poll_interval = 0.3, timeout = 60,
             on_cancel = function()
@@ -307,6 +338,7 @@ function Bookshelf:showBookshelf(opts)
         save_shelf_cache(self.settings, result)
         maybe_prune_covers(self.settings, result)
         self:showBookList(result)
+        self:_ensureBookNames(result)
     end
 end
 
@@ -351,6 +383,12 @@ function Bookshelf:get_shelf(force_refresh)
             end
             local book = {
                 book_id = item.book_id or item.bookId or item.id,
+                -- ⚠️ book_name 必须是第一优先，**不能**改成 title 优先。
+                -- multidetail 的 detail_list 每项是「书 + 最近阅读位置」的混合结构
+                -- （同项还带 latest_read_item_id / index / read_progress），其中的
+                -- title 指向的是**章节标题**而非书名：2026-10-26 按一份诊断文档改成
+                -- title 优先后，真机书架上整片书名变成「第 N 章 xxx」，随即回退。
+                -- 书名字段是 book_name。
                 title = item.book_name or item.title or item.name or "未知",
                 author = item.author_name or item.author or "",
                 cover = cover,
@@ -364,6 +402,11 @@ function Bookshelf:get_shelf(force_refresh)
                 table.insert(books, book)
             end
         end
+    end
+    -- 已有缓存的书名立刻替换成 App 正式名（没缓存过的先保持 SEO 名，
+    -- 由 _ensureBookNames 在后台补齐；绝不阻塞书架打开）
+    if ok_BookNames and BookNames then
+        pcall(BookNames.decorate, self and self.settings or nil, books)
     end
     return books
 end

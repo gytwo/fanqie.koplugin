@@ -21,6 +21,8 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local PageRenderer = require("fanqie.review_popup.pages")
 local ScrollContainer = require("fanqie.review_popup.scroll_container")
+-- 配图缓存模块可选：缺了就只画占位框，不影响文字弹窗
+local ok_ReviewPics, ReviewPics = pcall(require, "fanqie.review_pics")
 local Size = require("ui/size")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager = require("ui/uimanager")
@@ -63,6 +65,11 @@ local ThoughtPopupWidget = InputContainer:extend{
     -- 二级评论回调：on_replies(item, cursor, done)，
     -- done(ok, result, err)，result = { replies, total, has_more, cursor }
     on_replies = nil,
+    -- 段评配图：pic_dir 是本书的图片缓存目录；fetch_pic(url, path, done)
+    -- 由 main.lua 注入（走 Async 子进程下载）。两者都缺时只画占位框，不做 IO。
+    pic_dir = nil,
+    fetch_pic = nil,
+    _img_gen = 0,
     -- 续拉重开后恢复的滚动位置（内容坐标）；_buildLayout 消费后清零
     _restore_offset = nil,
 
@@ -77,6 +84,19 @@ function ThoughtPopupWidget:_clampHeight()
     self.height_ratio = math.max(0.1, math.min(0.9, self.height_ratio or 0.70))
     self.width = Screen:getWidth()
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
+end
+
+--- 内容区高度估算。
+-- 分页阶段要定「单图最多多高」（缩略图上限 = 弹窗可视高度的一半），但真实视口
+-- 要等分页完才知道（总高决定弹窗撑满还是收缩）。这里用估算值，因为已经扣掉
+-- 边框/边距/按钮，算出来只有比半个弹窗更小，不会越界。
+function ThoughtPopupWidget:_estimateViewportH()
+    local ratio_h = math.floor(Screen:getHeight() * self.height_ratio)
+    local chrome = TOP_BORDER_SIZE + 2 * PADDING
+    if self.more_text and self.on_more then
+        chrome = chrome + Screen:scaleBySize(36) + Screen:scaleBySize(14)
+    end
+    return math.max(1, ratio_h - chrome)
 end
 
 function ThoughtPopupWidget:init()
@@ -119,6 +139,8 @@ function ThoughtPopupWidget:init()
         contrast = self.contrast,
         doc_font_weight = self.doc_font_weight,
         doc_font_gamma = self.doc_font_gamma,
+        pic_dir = self.pic_dir,
+        estimate_viewport_h = self:_estimateViewportH(),
     }
     self._pages:ensureLayout()
     self:_buildLayout()
@@ -155,6 +177,12 @@ function ThoughtPopupWidget:_reopen(opts)
     self.on_replies = opts.on_replies
     self:_clampHeight()
 
+    -- 配图：目录可能随书变化（切段落不变，切书会重开）。fetch_pic 一直沿用。
+    if opts.pic_dir then self.pic_dir = opts.pic_dir end
+    if opts.fetch_pic then self.fetch_pic = opts.fetch_pic end
+    self._pages.pic_dir = self.pic_dir
+    self._pages.estimate_viewport_h = self:_estimateViewportH()
+
     self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
         self.doc_margins, self.height_ratio, self.contrast,
         self.doc_font_weight, self.doc_font_gamma)
@@ -163,6 +191,10 @@ end
 
 function ThoughtPopupWidget:_buildLayout()
     self:clear()
+
+    -- 「真的画过图」计数归零：它挂在 PageRenderer 上、而弹窗是池化复用的，
+    -- 不归零的话看过一次图之后，之后每次关窗（哪怕纯文字）都会触发 full 刷新。
+    self._pages._drawn_images = 0
 
     local item_width = math.min(math.ceil(self.doc_margins.right * 2 / 5), Screen:scaleBySize(10))
     local text_w = self._pages.text_w
@@ -254,12 +286,96 @@ function ThoughtPopupWidget:_buildLayout()
         dimen = Screen:getSize(),
         self.container
     }
+
+    -- 布局就绪后再拉图：首屏文字已经能画了，图片是「陆续填充」。
+    self:_startImageDownloads()
+end
+
+--- 本段评里所有配图（去重）。只返回还没落盘的。
+function ThoughtPopupWidget:_pendingImageUrls()
+    if not self.pic_dir or not ok_ReviewPics then return {} end
+    local seen, out = {}, {}
+    for _, item in ipairs(self.items or {}) do
+        if type(item.pics) == "table" then
+            for _, p in ipairs(item.pics) do
+                local url = p and p.url
+                if type(url) == "string" and url ~= "" and not seen[url] then
+                    seen[url] = true
+                    local path = self.pic_dir .. "/" .. (ReviewPics.filename(url) or "")
+                    if not ReviewPics.file_exists(path) then
+                        -- url 作去重与缓存名，fetch 才是真正下载地址
+                        out[#out + 1] = { url = url, fetch = p.fetch or url, path = path }
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+--- 串行下载未缓存的配图（并发几十张会把弱网和内存都拖死）。
+-- 每张下完清一次页面位图缓存 + 局部刷新，滚动位置不变。
+function ThoughtPopupWidget:_startImageDownloads()
+    if not self.pic_dir or type(self.fetch_pic) ~= "function" then return end
+    local queue = self:_pendingImageUrls()
+    if #queue == 0 then return end
+
+    self._img_gen = (self._img_gen or 0) + 1
+    local gen = self._img_gen
+    local widget = self
+
+    local function step(i)
+        if gen ~= widget._img_gen then return end
+        local job = queue[i]
+        if not job then return end
+        local finished = false
+        local function done(ok)
+            if finished then return end
+            finished = true
+            if gen ~= widget._img_gen then return end
+            if ok then
+                widget._pages:invalidateImage(job.url)
+                widget:_refreshImageArea()
+            end
+            -- 无论成败都继续下一张：一张坏图不该挡住后面的
+            step(i + 1)
+        end
+        local ok_call = pcall(self.fetch_pic, job.fetch or job.url, job.path, done)
+        if not ok_call then
+            self._pages:invalidateImage(job.url)
+            done(false)
+        end
+    end
+    step(1)
+end
+
+--- 图片落盘后重画：页面位图里烤的是旧占位框，必须清掉再让它重绘。
+function ThoughtPopupWidget:_refreshImageArea()
+    if not self._scroll_container then return end
+    self._pages:_freePageBBs()
+    UIManager:setDirty(self, function()
+        return "partial", self._scroll_container.dimen
+    end)
 end
 
 function ThoughtPopupWidget:onCloseWidget()
+    -- 图片是大面积深色块，partial 局部刷新擦不干净：关窗后会留下图的鬼影
+    -- （上游 comment_view 也踩过同一个坑）。但鬼影只可能在弹窗矩形内 ——
+    -- 用「区域内 full」把黑闪限制在弹窗那一条，不再整屏闪。
+    local had_images = self._pages and (tonumber(self._pages._drawn_images) or 0) > 0
     UIManager:setDirty(self, function()
         return "partial", self.container.dimen
     end)
+    if had_images then
+        local dim = self.container and self.container.dimen
+        if dim then
+            UIManager:setDirty(nil, function()
+                return "full", dim
+            end)
+        else
+            UIManager:setDirty(nil, "full")
+        end
+    end
     if self.close_callback then
         local callback = self.close_callback
         self.close_callback = nil
@@ -278,13 +394,20 @@ function ThoughtPopupWidget:onTapClose(_, ges)
         UIManager:close(self)
         return true
     end
-    -- 只有「展开/收起/继续加载」这几行会拦截点击；未命中就什么都不做
+    -- 只有「展开/收起/继续加载」这几行和图片块会拦截点击；未命中就什么都不做
     local scroll = self._scroll_container
     if scroll and scroll.dimen and ges.pos:intersectWith(scroll.dimen) then
+        local content_x = (ges.pos.x - scroll.dimen.x) - (scroll.margin_left or 0)
         local content_y = (ges.pos.y - scroll.dimen.y) + (scroll.scroll_offset or 0)
         local piece = self:_findActionPieceAtContentY(content_y)
-        if piece and self:_handleReplyAction(piece) then
-            return true
+        if piece then
+            if piece.action == "open_image" then
+                self:_handleImageAction(piece, content_x, content_y)
+                return true
+            end
+            if self:_handleReplyAction(piece) then
+                return true
+            end
         end
     end
     return true
@@ -334,6 +457,77 @@ function ThoughtPopupWidget:_refreshAfterReplyChange()
     UIManager:setDirty(self, function()
         return "partial", self.container.dimen
     end)
+end
+
+--- 点击配图：已缓存 → 交给 KOReader 的 ImageViewer 全屏看原图（它会全刷，
+--- 残影留在查看器层面解决）；未缓存 → 就地触发一次下载，不弹错误框打断阅读。
+function ThoughtPopupWidget:_handleImageAction(piece, content_x, content_y)
+    local lay = piece.layout
+    if not lay or not lay.cells then return end
+    local pics = piece.pics or {}
+    local rel_y = (content_y or 0) - (piece.y or 0)
+    local idx
+    for i = 1, #lay.cells do
+        local cell = lay.cells[i]
+        if pics[i] and (content_x or 0) >= cell.x and (content_x or 0) < cell.x + cell.w
+            and rel_y >= cell.y and rel_y < cell.y + cell.h then
+            idx = i
+            break
+        end
+    end
+    if not idx then idx = 1 end
+    local pic = pics[idx]
+    if not pic then return end
+    if not ok_ReviewPics then return end
+    local name = ReviewPics.filename(pic.url)
+    local path = (self.pic_dir and name) and (self.pic_dir .. "/" .. name) or nil
+
+    local function refetch()
+        if not (path and type(self.fetch_pic) == "function") then return end
+        -- 下载用 fetch（HEIC 已换成转码后的 WebP 地址），缓存名仍用稳定 url
+        pcall(self.fetch_pic, pic.fetch or pic.url, path, function(ok)
+            if ok then
+                self._pages:invalidateImage(pic.url)
+                self:_refreshImageArea()
+            end
+        end)
+    end
+
+    -- 0 字节是下载被中断留下的残骸：留着也解不出图，删掉重下一次
+    if path and ReviewPics.file_exists(path) then
+        local f = io.open(path, "rb")
+        local size = 0
+        if f then
+            size = f:seek("end") or 0
+            f:close()
+        end
+        if size <= 0 then
+            pcall(os.remove, path)
+            refetch()
+            if Log and Log.info then Log.info("[段评] 配图是 0 字节残骸，已删除重下") end
+            return
+        end
+    end
+
+    if not (path and ReviewPics.file_exists(path)) then
+        refetch()
+        if Log and Log.info then Log.info("[段评] 图片尚未缓存，已触发下载") end
+        return
+    end
+
+    -- 注意：ImageViewer 的 image 形参要的是 BlitBuffer，文件路径必须给 file。
+    -- 传 image = path 会让 ImageWidget 把字符串当位图（_bb = image），
+    -- 随后 _render/getSize 里 _bb:getWidth() 抛"attempt to call method
+    -- 'getWidth' (a nil value)"，崩在 UIManager 重绘阶段 —— 是整个 KOReader
+    -- 挂掉，插件侧连 pcall 都接不住。
+    local ok, viewer = pcall(function()
+        return require("ui/widget/imageviewer"):new{ file = path, fullscreen = true }
+    end)
+    if ok and viewer then
+        UIManager:show(viewer)
+    elseif Log and Log.warn then
+        Log.warn("[段评] ImageViewer 打开失败")
+    end
 end
 
 function ThoughtPopupWidget:_handleReplyAction(piece)

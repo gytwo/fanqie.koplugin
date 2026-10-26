@@ -196,12 +196,6 @@ function ShuShan.candidate_bases(cfg)
     return hot
 end
 
--- 首选节点（UI 展示 / 单点请求用）
-function ShuShan.resolve_base(cfg)
-    local bases = ShuShan.candidate_bases(cfg)
-    return bases[1] or ShuShan.DEFAULT_BASE
-end
-
 -- 节点健康反馈：成功 → 记忆为首选并解除冷却；传输层失败 → 进入冷却。
 -- settings 非空时把"最近可用节点"持久化：章节抓取跑在 fork 子进程里，内存态
 -- 不会回传父进程，不持久化的话主节点持续故障时每个新章节都要重撞一次超时。

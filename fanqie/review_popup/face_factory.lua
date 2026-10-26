@@ -32,16 +32,23 @@ local FaceFactory = {
 }
 
 -- Size variants (relative to the base size, which equals the body font size).
--- 一级评论 0.93，二级评论 0.90（比一级略小一点）。
--- 「展开 N 条回复」属于一级评论的附属行，与一级作者行同号 —— 未登记 variant
--- 时 getFace 会兜底成 1.0，反而比一级正文还大。
+-- 一级正文 0.93，二级正文 0.90（比一级略小一点）。
+-- 「展开 N 条回复」是**可点控件**，跟一级正文同号（0.93），不跟作者行 ——
+-- 这样调作者名字号时它不用跟着动，也不至于小到不好点。未登记 variant 时
+-- getFace 会兜底成 1.0，反而比一级正文还大，所以必须显式登记。
+--
+-- 作者行比正文小一档：名字（· 用户名 · ♥ N）只是身份标签，和正文同号会跟
+-- 评论内容抢注意力，压小之后「谁说的 / 说了什么」的层级才立得住。
+-- ⚠️ 改 meta 时必须同步看 reply_meta：二级作者行要比一级作者行更小，
+--    否则回复里的名字反而比一级评论的名字更大，层级倒挂。
+--    只想要「再小一点」就动这两行，正文（content/reply）不要碰。
 FaceFactory.VARIANTS = {
     content      = 0.93,  -- thought body
     quote        = 0.93,  -- quoted abstract (italic, gray)
-    meta         = 0.93,  -- author line; same size as the thought body
-    reply_meta   = 0.90,  -- 二级评论作者行：字体同 meta，字号略小
+    meta         = 0.86,  -- 一级评论作者行（用户名 · ♥）：比正文小一档
+    reply_meta   = 0.84,  -- 二级评论作者行：比一级作者行再小半档
     reply        = 0.90,  -- 二级评论正文：字体同 content，字号略小
-    reply_toggle = 0.93,  -- 「展开/收起 N 条回复」：与一级作者行同款同号
+    reply_toggle = 0.93,  -- 「展开/收起 N 条回复」：跟一级正文同号（可点控件，别太小）
 }
 
 -- 仿粗强度：只有档 1/2 用仿粗，档 3 直接换真粗体文件。

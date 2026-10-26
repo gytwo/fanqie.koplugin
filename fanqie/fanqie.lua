@@ -76,12 +76,4 @@ function FanQie.reader_url(item_id)
     return "https://fanqienovel.com/reader/" .. item_id
 end
 
-function FanQie.is_valid_book_id(book_id)
-    return book_id and tostring(book_id) ~= ""
-end
-
-function FanQie.normalize_book_id(book_id)
-    return tostring(book_id or "")
-end
-
 return FanQie

@@ -15,7 +15,6 @@ local ok_Log, Log = pcall(require, "fanqie.logger")
 local M = {}
 
 M.SUFFIX = ".jpg"
-M.FRESH_DAYS = 7                        -- 缓存新鲜期
 M.PRUNE_DAYS = 30                       -- 自动清理只删「超过这么久没被写过」的
 M.AUTO_PRUNE_BYTES = 200 * 1024 * 1024  -- 目录超过 200MB 才考虑自动清理
 
@@ -111,19 +110,6 @@ function M.find(settings, book)
     return nil
 end
 
---- 这张缓存还新鲜吗？取不到 mtime 时按「新鲜」处理，
--- 避免因为文件系统能力缺失而反复重下。
--- ⚠️ 目前没有调用方：预留给「按新鲜度优先保留」的淘汰策略（不要把
--- 自动清理改回按它判断，mtime 只在写入时更新，见 prune_orphans 的注释）。
-function M.is_fresh(path, days)
-    if not M.file_exists(path) then return false end
-    local L = fs()
-    if not L or type(L.attributes) ~= "function" then return true end
-    local ok, mtime = pcall(L.attributes, path, "modification")
-    if not ok or type(mtime) ~= "number" then return true end
-    return (os.time() - mtime) < (tonumber(days) or M.FRESH_DAYS) * 86400
-end
-
 --- 目录占用：{ count = 图片数, bytes = 总字节 }
 function M.stats(dir)
     local out = { count = 0, bytes = 0 }
@@ -186,6 +172,11 @@ local function keep_names(books)
         if name then keep[name] = true end
         local old = M.legacy_filename(book)
         if old then keep[old] = true end
+        -- 改名前的接口原名：书名被 book_names 校正成 App 正式名后，照旧名存的
+        -- 封面 / 段评目录仍要算在架，不能因为改了个名字就把图删了
+        if type(book.web_title) == "string" and book.web_title ~= "" then
+            keep[sanitize(book.web_title) .. M.SUFFIX] = true
+        end
     end
     return keep
 end
