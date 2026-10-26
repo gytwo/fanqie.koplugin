@@ -104,6 +104,9 @@ h1 { font-size: 1.3em; text-align: center; margin: 0.8em 0 1.2em; }
 ]]
 
 -- 返回 (epub_path, chapter_count, missing_count) 或 (nil, err)
+-- 内存策略：两遍扫描。第一遍只收集章节路径与图片 href，不读内容；
+-- 第二遍逐章读文件 → 写 zip → 立即释放，图片读一张写一张。
+-- 避免原实现「所有章节 body + 所有图片二进制」同时驻留导致低内存设备 OOM。
 function EpubBuilder.build(settings, book, chapters, opts)
     opts = opts or {}
     if type(chapters) ~= "table" or #chapters == 0 then
@@ -119,10 +122,12 @@ function EpubBuilder.build(settings, book, chapters, opts)
         return nil, "缓存目录不存在：" .. tostring(book_dir)
     end
 
-    -- 收集章节
-    local selected = {}
+    -- ---------- 第一遍：只收集章节文件路径与图片 href，不读文件内容 ----------
+    local chapter_plans = {}   -- { chapter, path|nil, images={href,...} }
     local missing = 0
     local real_count = 0
+    local image_set = {}       -- 全书去重后的图片 href
+    local image_order = {}
 
     for _, ch in ipairs(chapters) do
         local item_id = tostring(ch.itemId or ch.item_id or "")
@@ -134,22 +139,26 @@ function EpubBuilder.build(settings, book, chapters, opts)
             end
         end
 
+        local plan = { chapter = ch, path = path, images = {} }
         if path then
+            -- 只读这一章来收集图片 href，读完立即丢弃 body
             local html = read_file(path)
             local body = clean_chapter_body(html)
+            html = nil
             local images = collect_image_hrefs(body)
-            body = rewrite_image_hrefs(body)
-            selected[#selected + 1] = { chapter = ch, body = body, images = images }
+            body = nil
+            plan.images = images
+            for _, href in ipairs(images) do
+                if not image_set[href] then
+                    image_set[href] = true
+                    image_order[#image_order + 1] = href
+                end
+            end
             real_count = real_count + 1
         else
-            selected[#selected + 1] = {
-                chapter = ch,
-                body = string.format('<h1>%s</h1>\n<p>[内容下载失败]</p>',
-                    xml_escape(ch.title or "")),
-                images = {},
-            }
             missing = missing + 1
         end
+        chapter_plans[#chapter_plans + 1] = plan
     end
 
     if real_count == 0 then
@@ -161,11 +170,7 @@ function EpubBuilder.build(settings, book, chapters, opts)
     local epub_name = book_title:gsub("[/\\:%*%?\"<>|]", "_") .. ".epub"
     local epub_path = book_dir .. "/" .. epub_name
 
-    local entries = {
-        { name = "mimetype", data = "application/epub+zip" },
-        { name = "META-INF/container.xml", data = [[<?xml version="1.0" encoding="utf-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>]] },
-    }
-
+    -- ---------- 组装元数据（很小，放内存无压力） ----------
     local manifest = {
         [[<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>]],
         [[<item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml"/>]],
@@ -174,9 +179,12 @@ function EpubBuilder.build(settings, book, chapters, opts)
     local spine = {}
     local nav_items = {}
     local ncx_points = {}
-    local play_order = 0
 
     -- 封面
+    local cover_entry = nil   -- { name, data }
+    local cover_manifest = nil
+    local cover_spine = nil
+    local cover_xhtml_entry = nil
     local cover_file
     for _, ext in ipairs({ "jpg", "jpeg", "png", "webp" }) do
         local p = book_dir .. "/cover." .. ext
@@ -187,12 +195,13 @@ function EpubBuilder.build(settings, book, chapters, opts)
         if data then
             local ext = cover_file:match("%.([^.]+)$"):lower()
             local mt = ext == "png" and "image/png" or "image/jpeg"
-            table.insert(entries, { name = "OEBPS/images/cover." .. ext, data = data })
-            table.insert(manifest, string.format(
-                [[<item id="cover-image" href="images/cover.%s" media-type="%s" properties="cover-image"/>]], ext, mt))
+            cover_entry = { name = "OEBPS/images/cover." .. ext, data = data }
+            cover_manifest = string.format(
+                [[<item id="cover-image" href="images/cover.%s" media-type="%s" properties="cover-image"/>]], ext, mt)
+            table.insert(manifest, cover_manifest)
             table.insert(manifest, [[<item id="cover" href="text/cover.xhtml" media-type="application/xhtml+xml"/>]])
-            table.insert(spine, [[<itemref idref="cover"/>]])
-            table.insert(entries, { name = "OEBPS/text/cover.xhtml", data = string.format([[
+            cover_spine = [[<itemref idref="cover"/>]]
+            cover_xhtml_entry = { name = "OEBPS/text/cover.xhtml", data = string.format([[
 <?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN">
@@ -200,40 +209,36 @@ function EpubBuilder.build(settings, book, chapters, opts)
 <style>html,body{margin:0;padding:0;width:100%%;height:100%%;overflow:hidden;}img{display:block;width:100%%;height:100%%;object-fit:contain;}</style>
 </head>
 <body><img src="../images/cover.%s" alt="Cover"/></body>
-</html>]], ext) })
+</html>]], ext) }
         end
     end
 
-    -- 图片去重
-    local added_images = {}
-    for _, item in ipairs(selected) do
-        for _, href in ipairs(item.images) do
-            if not added_images[href] then
-                local img = load_image(book_dir, href)
-                if img then
-                    added_images[href] = true
-                    local fname = href:match("([^/]+)$")
-                    local id = "img_" .. fname:gsub("[^%w]", "_")
-                    table.insert(entries, { name = "OEBPS/" .. href, data = img.data })
-                    table.insert(manifest, string.format(
-                        [[<item id="%s" href="%s" media-type="%s"/>]], id, href, img.media_type))
-                end
-            end
+    -- 图片 manifest（只登记，不读数据）
+    for _, href in ipairs(image_order) do
+        local fname = href:match("([^/]+)$")
+        local id = "img_" .. fname:gsub("[^%w]", "_")
+        local ext = href:match("%.([^.]+)$")
+        ext = ext and ext:lower() or ""
+        local mt = ({
+            jpg = "image/jpeg", jpeg = "image/jpeg",
+            png = "image/png", gif = "image/gif",
+            webp = "image/webp", svg = "image/svg+xml",
+        })[ext]
+        if mt then
+            table.insert(manifest, string.format(
+                [[<item id="%s" href="%s" media-type="%s"/>]], id, href, mt))
         end
     end
 
-    -- 章节
-    for i, item in ipairs(selected) do
-        local ch = item.chapter
+    -- 章节 manifest / spine / nav / ncx（只登记，不写内容）
+    local play_order = 0
+    for i, plan in ipairs(chapter_plans) do
+        local ch = plan.chapter
         local item_id = tostring(ch.itemId or ch.item_id or i)
         local fname = string.format("text/chapter-%03d.xhtml", i)
         local id = "chapter_" .. item_id:gsub("[^%w]", "_")
         local title = ch.title or ("Chapter " .. i)
 
-        table.insert(entries, {
-            name = "OEBPS/" .. fname,
-            data = build_chapter_xhtml(title, item.body),
-        })
         table.insert(manifest, string.format(
             [[<item id="%s" href="%s" media-type="application/xhtml+xml"/>]], id, fname))
         table.insert(spine, string.format([[<itemref idref="%s"/>]], id))
@@ -246,6 +251,8 @@ function EpubBuilder.build(settings, book, chapters, opts)
 <content src="%s"/>
 </navPoint>]], play_order, play_order, xml_escape(title), fname))
     end
+
+    if cover_spine then table.insert(spine, 1, cover_spine) end
 
     local opf = string.format([[
 <?xml version="1.0" encoding="utf-8"?>
@@ -295,12 +302,7 @@ function EpubBuilder.build(settings, book, chapters, opts)
 </navMap>
 </ncx>]], xml_escape(book_id), xml_escape(book_title), table.concat(ncx_points, "\n"))
 
-    table.insert(entries, { name = "OEBPS/content.opf", data = opf })
-    table.insert(entries, { name = "OEBPS/nav.xhtml", data = nav })
-    table.insert(entries, { name = "OEBPS/toc.ncx", data = ncx })
-    table.insert(entries, { name = "OEBPS/style.css", data = DEFAULT_CSS })
-
-    -- 写 EPUB
+    -- ---------- 打开 zip，按固定顺序逐条写入，写完即释放 ----------
     local Archiver = require("ffi/archiver")
     local archive = Archiver.Writer:new{}
     local part_path = epub_path .. ".part"
@@ -309,21 +311,64 @@ function EpubBuilder.build(settings, book, chapters, opts)
         return nil, "无法创建 EPUB：" .. tostring(archive.err)
     end
     local mtime = os.time()
+
+    local function write_entry(name, data)
+        assert(archive:addFileFromMemory(name, data, mtime), archive.err)
+    end
+
     local ok, err = xpcall(function()
+        -- mimetype 必须第一个且不压缩
         assert(archive:setZipCompression("store"), archive.err)
-        for _, e in ipairs(entries) do
-            if e.name == "mimetype" then
-                assert(archive:addFileFromMemory(e.name, e.data, mtime), archive.err)
-                break
-            end
-        end
+        write_entry("mimetype", "application/epub+zip")
         assert(archive:setZipCompression("deflate"), archive.err)
-        for _, e in ipairs(entries) do
-            if e.name ~= "mimetype" then
-                assert(archive:addFileFromMemory(e.name, e.data or "", mtime), archive.err)
+
+        write_entry("META-INF/container.xml", [[<?xml version="1.0" encoding="utf-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>]])
+
+        -- 封面：写一张释放一张
+        if cover_entry then
+            write_entry(cover_entry.name, cover_entry.data)
+            cover_entry.data = nil
+        end
+        if cover_xhtml_entry then
+            write_entry(cover_xhtml_entry.name, cover_xhtml_entry.data)
+            cover_xhtml_entry.data = nil
+        end
+
+        -- 图片：读一张写一张，绝不攒进数组
+        for _, href in ipairs(image_order) do
+            local img = load_image(book_dir, href)
+            if img then
+                write_entry("OEBPS/" .. href, img.data)
+                img.data = nil
             end
         end
+
+        -- 章节：逐章读文件 → 生成 XHTML → 写入 → 释放
+        for i, plan in ipairs(chapter_plans) do
+            local ch = plan.chapter
+            local fname = string.format("text/chapter-%03d.xhtml", i)
+            local title = ch.title or ("Chapter " .. i)
+            local body
+            if plan.path then
+                local html = read_file(plan.path)
+                body = clean_chapter_body(html)
+                html = nil
+                body = rewrite_image_hrefs(body)
+            else
+                body = string.format('<h1>%s</h1>\n<p>[内容下载失败]</p>',
+                    xml_escape(title))
+            end
+            write_entry("OEBPS/" .. fname, build_chapter_xhtml(title, body))
+            body = nil
+        end
+
+        -- 元数据
+        write_entry("OEBPS/content.opf", opf)
+        write_entry("OEBPS/nav.xhtml", nav)
+        write_entry("OEBPS/toc.ncx", ncx)
+        write_entry("OEBPS/style.css", DEFAULT_CSS)
     end, debug.traceback)
+
     pcall(function() archive:close() end)
     if not ok then
         pcall(os.remove, part_path)
@@ -336,7 +381,7 @@ function EpubBuilder.build(settings, book, chapters, opts)
         return nil, "无法写入 EPUB 文件"
     end
 
-    return epub_path, #selected, missing
+    return epub_path, #chapter_plans, missing
 end
 
 return EpubBuilder
