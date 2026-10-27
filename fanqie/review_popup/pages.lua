@@ -444,14 +444,26 @@ function PageRenderer:paginate()
         elseif block.kind == "image" then
             y = y + math.floor(base_size * (block.spacing_before or 0) + 0.5)
             local pics = block.pics or {}
-            local lay = imageLayout(pics, text_w, viewport_h)
+            -- 二级评论里的图要跟着回复一起缩进：宽度同步收窄，否则图会
+            -- 顶到弹窗左边缘、看着不像某条回复的配图。cell.x 仍是块内相对
+            -- 坐标，绘制与点击命中都要再加上 piece.x（见 renderPage /
+            -- _handleImageAction）。
+            local img_level = tonumber(block.indent_level) or 0
+            local img_indent = 0
+            if img_level > 0 then
+                img_indent = math.floor(base_size * 1.15 * img_level)
+                if img_indent > text_w / 2 then img_indent = math.floor(text_w / 2) end
+            end
+            local img_w = text_w - img_indent
+            if img_w < 10 then img_w = 10 end
+            local lay = imageLayout(pics, img_w, viewport_h)
             pieces[#pieces + 1] = {
                 kind = "image",
                 pics = pics,
                 layout = lay,
-                x = 0,
+                x = img_indent,
                 y = y,
-                width = text_w,
+                width = img_w,
                 piece_h = lay.box_h,
                 -- 点击命中：整块图区域都可点，逐张按 cell 判定（见 widget.lua）
                 action = "open_image",
@@ -677,6 +689,7 @@ function PageRenderer:renderPage(page_idx, page_starts)
             -- 图块跨页：相邻页各绘自己那一段（src_y 对得上），滚动拼起来连续，
             -- 不需要把图顶到下一页开头去「防截断」（那样只会在图前留白）。
             local lay = piece.layout
+            local ox = piece.x or 0
             if lay and lay.cells then
                 for i = 1, #lay.cells do
                     local cell = lay.cells[i]
@@ -688,17 +701,17 @@ function PageRenderer:renderPage(page_idx, page_starts)
                         if bottom > top then
                             local img_bb = self:_getImageBB(pic, cell.w, cell.h)
                             if img_bb then
-                                bb:blitFrom(img_bb, cell.x, top - p0, 0, top - cell_top,
+                                bb:blitFrom(img_bb, ox + cell.x, top - p0, 0, top - cell_top,
                                     math.min(cell.w, img_bb:getWidth()), bottom - top)
                             else
                                 -- 占位框：还没下完 / 解码失败。浅灰底 + 上下细线，
                                 -- 让「这里有一张图」可感知，同时保持可点击。
-                                bb:paintRect(cell.x, top - p0, cell.w, bottom - top,
+                                bb:paintRect(ox + cell.x, top - p0, cell.w, bottom - top,
                                     Blitbuffer.COLOR_GRAY_E)
-                                bb:paintRect(cell.x, top - p0, cell.w, 1,
+                                bb:paintRect(ox + cell.x, top - p0, cell.w, 1,
                                     Blitbuffer.COLOR_GRAY_9)
                                 if cell.h >= 2 then
-                                    bb:paintRect(cell.x, top - p0 + (bottom - top) - 1,
+                                    bb:paintRect(ox + cell.x, top - p0 + (bottom - top) - 1,
                                         cell.w, 1, Blitbuffer.COLOR_GRAY_9)
                                 end
                             end

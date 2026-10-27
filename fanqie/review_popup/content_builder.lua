@@ -301,6 +301,19 @@ function ContentBuilder.build(items, opts)
                             item_index = item_index,
                         }
                     end
+                    -- 二级回复也可能带图（实测书山内联回复里就有，纯表情+图很常见）。
+                    -- 纯图回复 rtext 为空，只有这段能把它显示出来；缩进 1 级与
+                    -- 回复正文对齐，宽度同步收窄（见 pages.lua 的 image 分支）。
+                    if type(reply.pics) == "table" and #reply.pics > 0 then
+                        blocks[#blocks + 1] = {
+                            kind = "image",
+                            pics = reply.pics,
+                            item_index = item_index,
+                            indent_level = 1,
+                            spacing_before = 0.12,
+                            spacing_after = 0.06,
+                        }
+                    end
                 end
 
                 if item.replies_more then

@@ -36,6 +36,23 @@ if not ok_log then Log = nil end
 local TOP_BORDER_SIZE = Size.line.thick
 local PADDING = Size.padding.large
 
+--- 回复条目补一层可渲染的 pics。
+--- 接口给的回复图是原始 image_data 结构（web_uri / web_url / dynamic_url，
+--- HEIC 还要转码），必须过 normalize_images 才能得到 {url, fetch, w, h}。
+--- 三个源的回复最终都汇到 _fetchReplies 的合并循环里（书山内联也走 on_replies），
+--- 所以在这里统一处理，不散落到各客户端。
+local function _attachReplyPics(reply)
+    if type(reply) ~= "table" then return reply end
+    if type(reply.pics) == "table" and #reply.pics > 0 then return reply end
+    local pics = {}
+    if ok_ReviewPics and type(ReviewPics) == "table" and ReviewPics.from_comment then
+        local ok, got = pcall(ReviewPics.from_comment, { images = reply.images })
+        if ok and type(got) == "table" then pics = got end
+    end
+    reply.pics = pics
+    return reply
+end
+
 local ThoughtPopupWidget = InputContainer:extend{
     items = nil,
     doc_font_name = nil,
@@ -178,6 +195,14 @@ function ThoughtPopupWidget:_reopen(opts)
     self:_clampHeight()
 
     -- 配图：目录可能随书变化（切段落不变，切书会重开）。fetch_pic 一直沿用。
+    -- 换了书就得作废在跑的队列：旧任务会把图写进旧书的目录，白耗流量，
+    -- 而且新书目录的 _pendingImageUrls 会因 inflight 标记把同名任务挡掉。
+    if opts.pic_dir and self.pic_dir and opts.pic_dir ~= self.pic_dir then
+        self._img_gen = (self._img_gen or 0) + 1
+        self._img_queue = {}
+        self._img_inflight = {}
+        self._img_running = false
+    end
     if opts.pic_dir then self.pic_dir = opts.pic_dir end
     if opts.fetch_pic then self.fetch_pic = opts.fetch_pic end
     self._pages.pic_dir = self.pic_dir
@@ -292,21 +317,38 @@ function ThoughtPopupWidget:_buildLayout()
 end
 
 --- 本段评里所有配图（去重）。只返回还没落盘的。
+--- ⚠️ 二级回复里的图也算：回复展开时它们才进入 items，而预下载队列
+--- 以前只扫一级评论的 item.pics，导致回复配图**根本不会自动下载**，
+--- 必须点一下才触发（点击走 _handleImageAction 的 refetch）。表现就是
+--- 「回复里的图一直占位、点了才出来」。
 function ThoughtPopupWidget:_pendingImageUrls()
     if not self.pic_dir or not ok_ReviewPics then return {} end
     local seen, out = {}, {}
-    for _, item in ipairs(self.items or {}) do
-        if type(item.pics) == "table" then
-            for _, p in ipairs(item.pics) do
-                local url = p and p.url
-                if type(url) == "string" and url ~= "" and not seen[url] then
-                    seen[url] = true
-                    local path = self.pic_dir .. "/" .. (ReviewPics.filename(url) or "")
-                    if not ReviewPics.file_exists(path) then
-                        -- url 作去重与缓存名，fetch 才是真正下载地址
-                        out[#out + 1] = { url = url, fetch = p.fetch or url, path = path }
-                    end
+    local function take(pics)
+        if type(pics) ~= "table" then return end
+        for _, p in ipairs(pics) do
+            local url = p and p.url
+            if type(url) == "string" and url ~= "" and not seen[url] then
+                seen[url] = true
+                local name = ReviewPics.filename(url)
+                -- filename 拿不到（异常 url）就整条跳过：拼出的 path 会退化成
+                -- 目录本身，file_exists(目录) 若为真就永远不进队列，
+                -- 若为假则每次重建都重试一次必然失败的下载
+                local path = name and (self.pic_dir .. "/" .. name)
+                if path and not ReviewPics.file_exists(path) then
+                    -- url 作去重与缓存名，fetch 才是真正下载地址
+                    out[#out + 1] = { url = url, fetch = p.fetch or url, path = path }
                 end
+            end
+        end
+    end
+    for _, item in ipairs(self.items or {}) do
+        take(item.pics)
+        -- 回复只有展开后才有数据；展开会重建布局并再次调用本函数，
+        -- 所以这里按「已拿到的回复」扫一遍即可（未展开时是空表）。
+        if type(item.replies) == "table" then
+            for _, r in ipairs(item.replies) do
+                take(r and r.pics)
             end
         end
     end
@@ -315,30 +357,66 @@ end
 
 --- 串行下载未缓存的配图（并发几十张会把弱网和内存都拖死）。
 -- 每张下完清一次页面位图缓存 + 局部刷新，滚动位置不变。
+--
+-- ⚠️ 队列是**常驻**的，跨布局重建（展开回复 / 继续加载 / 切段落）延续，
+-- 不再每次 `_buildLayout` 就 ++gen 从头重扫。原因不是省事：
+--   旧队列的 Async 子进程不会因为 gen 变了就被取消，而 fetch_pic 是直接
+--   `io.open(path,"wb")` 写目标文件（非原子）。若重建后新队列对同一张
+--   「还没落盘」的图再发一次，两个子进程就同写一个文件，可能留下半截
+--   位图 —— 而半截图 file_exists 为真，模型层会当成「已缓存」永远不再重下，
+--   表现是这张图永久停在占位框。
+-- 现在只把「新出现且不在下载中」的任务追加进队列，同一 url 永不同时两份。
 function ThoughtPopupWidget:_startImageDownloads()
     if not self.pic_dir or type(self.fetch_pic) ~= "function" then return end
-    local queue = self:_pendingImageUrls()
-    if #queue == 0 then return end
+    self._img_queue = self._img_queue or {}
+    self._img_inflight = self._img_inflight or {}
 
-    self._img_gen = (self._img_gen or 0) + 1
-    local gen = self._img_gen
+    local added = 0
+    for _, job in ipairs(self:_pendingImageUrls()) do
+        if not self._img_inflight[job.url] then
+            self._img_inflight[job.url] = true
+            self._img_queue[#self._img_queue + 1] = job
+            added = added + 1
+        end
+    end
+    -- 只有真加了任务才出声：用来在设备日志里区分「增量补队」和「重复重下」
+    if added > 0 and Log and Log.info then
+        Log.info("[段评] 配图排队 +%d，待下 %d", added, #self._img_queue)
+    end
+    if self._img_running or #self._img_queue == 0 then return end
+
+    self._img_running = true
     local widget = self
+    -- gen 只在关窗时变（见 onCloseWidget），代表「这个弹窗会话还活着」
+    local gen = self._img_gen
 
-    local function step(i)
-        if gen ~= widget._img_gen then return end
-        local job = queue[i]
-        if not job then return end
+    local function step()
+        if gen ~= widget._img_gen then
+            -- 弹窗已关闭：丢掉剩余任务，下次打开会重新扫（已落盘的不会再下）
+            widget._img_queue = {}
+            widget._img_inflight = {}
+            widget._img_running = false
+            return
+        end
+        local job = table.remove(widget._img_queue, 1)
+        if not job then
+            widget._img_running = false
+            return
+        end
         local finished = false
         local function done(ok)
             if finished then return end
             finished = true
+            -- 先清在飞标记：这张（无论成败）已经不再是「下载中」，
+            -- 下一轮重建可以重新排它重试，不会被 inflight 永久挡住
+            widget._img_inflight[job.url] = nil
             if gen ~= widget._img_gen then return end
             if ok then
                 widget._pages:invalidateImage(job.url)
-                widget:_refreshImageArea()
+                widget:_queueImageRefresh()
             end
             -- 无论成败都继续下一张：一张坏图不该挡住后面的
-            step(i + 1)
+            step()
         end
         local ok_call = pcall(self.fetch_pic, job.fetch or job.url, job.path, done)
         if not ok_call then
@@ -346,7 +424,7 @@ function ThoughtPopupWidget:_startImageDownloads()
             done(false)
         end
     end
-    step(1)
+    step()
 end
 
 --- 图片落盘后重画：页面位图里烤的是旧占位框，必须清掉再让它重绘。
@@ -358,7 +436,36 @@ function ThoughtPopupWidget:_refreshImageArea()
     end)
 end
 
+--- 批量下载时的合并刷新：串行队列里每下一张都整页清缓存重绘，十几张就是
+--- 十几次全量重排（电纸书上很贵）。这里把同一窗口内的完成事件攒一次，
+--- 最多每 0.35s 重绘一回；点图单独下载时仍走 _refreshImageArea 立即生效。
+function ThoughtPopupWidget:_queueImageRefresh()
+    if self._img_refresh_pending then return end
+    self._img_refresh_pending = true
+    local widget = self
+    -- 定时器不会随弹窗关闭取消：0.35s 后弹窗可能已经不在窗口栈上，
+    -- 再 setDirty 它只是白发一次刷新（严重时容器已被 clear）。
+    -- 用 gen 判断这次 flush 是否还属于同一个弹窗会话。
+    local gen = self._img_gen
+    local function flush()
+        widget._img_refresh_pending = false
+        if gen ~= widget._img_gen then return end
+        if widget._scroll_container then widget:_refreshImageArea() end
+    end
+    local ok = pcall(function() UIManager:scheduleIn(0.35, flush) end)
+    if not ok then flush() end
+end
+
 function ThoughtPopupWidget:onCloseWidget()
+    -- 关窗即停下载：队列是常驻的（跨布局重建延续），不在这里作废的话，
+    -- 关掉弹窗后还会把这一段的几十张图全部在后台下完，每张还 setDirty 一次
+    -- 已经不在窗口栈上的 widget。切段落走的是 _reopen，不需要靠关窗保活。
+    self._img_gen = (self._img_gen or 0) + 1
+    self._img_queue = {}
+    self._img_inflight = {}
+    self._img_running = false
+    self._img_refresh_pending = false
+
     -- 图片是大面积深色块，partial 局部刷新擦不干净：关窗后会留下图的鬼影
     -- （上游 comment_view 也踩过同一个坑）。但鬼影只可能在弹窗矩形内 ——
     -- 用「区域内 full」把黑闪限制在弹窗那一条，不再整屏闪。
@@ -466,10 +573,12 @@ function ThoughtPopupWidget:_handleImageAction(piece, content_x, content_y)
     if not lay or not lay.cells then return end
     local pics = piece.pics or {}
     local rel_y = (content_y or 0) - (piece.y or 0)
+    -- cell.x 是块内相对坐标；回复里的图块整体缩进 piece.x，命中要减掉
+    local rel_x = (content_x or 0) - (piece.x or 0)
     local idx
     for i = 1, #lay.cells do
         local cell = lay.cells[i]
-        if pics[i] and (content_x or 0) >= cell.x and (content_x or 0) < cell.x + cell.w
+        if pics[i] and rel_x >= cell.x and rel_x < cell.x + cell.w
             and rel_y >= cell.y and rel_y < cell.y + cell.h then
             idx = i
             break
@@ -484,6 +593,8 @@ function ThoughtPopupWidget:_handleImageAction(piece, content_x, content_y)
 
     local function refetch()
         if not (path and type(self.fetch_pic) == "function") then return end
+        -- 队列已在下载同一张：等它跑完自己会刷新，别再起一份并发写同一文件
+        if self._img_inflight and self._img_inflight[pic.url] then return end
         -- 下载用 fetch（HEIC 已换成转码后的 WebP 地址），缓存名仍用稳定 url
         pcall(self.fetch_pic, pic.fetch or pic.url, path, function(ok)
             if ok then
@@ -572,7 +683,7 @@ function ThoughtPopupWidget:_fetchReplies(item, cursor)
         if ok and type(result) == "table" and type(result.replies) == "table" then
             item.replies = item.replies or {}
             for _, r in ipairs(result.replies) do
-                item.replies[#item.replies + 1] = r
+                item.replies[#item.replies + 1] = _attachReplyPics(r)
             end
             item.replies_total = tonumber(result.total) or #item.replies
             item.replies_more = result.has_more == true
