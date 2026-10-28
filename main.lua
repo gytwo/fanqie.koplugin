@@ -1028,11 +1028,39 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
 
         -- ── 段评配图 ─────────────────────────────────────────────────
         -- 目录：<下载目录>/review_pics/<book_id>/ —— 按书分目录，书移出书架时整目录清理。
+        --
+        -- ⚠️ book_id 的来源必须分三种情况，不能只用 bookIdFromPath：
+        --   番茄缓存章节（/fanqie/xxx/chapter_N.html）→ 从路径反查
+        --   本地书籍（EPUB/TXT）→ 用 _local_review_book（用户匹配的番茄书）
+        --   其它兜底 → _state.current_book.book_id
+        -- 之前只调 _state.bookIdFromPath：本地书籍路径不是 chapter_*.html，
+        -- 反查恒 nil → pic_dir 变成 review_pics/ 根目录 → 图片写/读路径都对不上
+        -- → 弹窗永远画占位符。
         local review_pic_dir
         if ReviewPics and ReviewPics.ensure then
-            local bid = _state.bookIdFromPath(_state.current_document_path)
-            local ok_dir, dir = pcall(ReviewPics.ensure, self.settings, bid)
-            if ok_dir then review_pic_dir = dir end
+            local bid
+            -- 本地书籍：优先用匹配的番茄书
+            if not self:isCurrentDocFanqie() and self._local_review_book then
+                bid = self._local_review_book.book_id
+            end
+            -- 番茄缓存章节：从路径反查
+            if not bid or bid == "" then
+                bid = _state.bookIdFromPath(_state.current_document_path)
+            end
+            -- 兜底：当前书（番茄阅读器里打开时 _state.current_book 有值）
+            if not bid or bid == "" then
+                bid = _state.current_book and _state.current_book.book_id
+            end
+            if bid and bid ~= "" then
+                local ok_dir, dir = pcall(ReviewPics.ensure, self.settings, bid)
+                if ok_dir then review_pic_dir = dir end
+            end
+            if Log then
+                Log.info("[段评] pic_dir: bid=" .. tostring(bid)
+                   .. " is_fanqie=" .. tostring(self:isCurrentDocFanqie())
+                    .. " local_book=" .. tostring(self._local_review_book and self._local_review_book.book_id)
+                    .. " dir=" .. tostring(review_pic_dir))
+            end
         end
 
         -- 图片下载走 Async 子进程（与封面同一套），UI 线程零阻塞。
