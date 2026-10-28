@@ -748,6 +748,80 @@ function PageRenderer:_freePageBBs()
     self._page_pieces_key = nil
 end
 
+--- 只重画某张图在它所在页上的那个 cell，不重建整页。
+--- 返回 { bb=页面位图, page_idx=页号, rect=屏幕相对矩形 } 或 nil。
+--- rect 坐标相对 ScrollContainer 的内容坐标系（y 从内容顶部算），
+--- 调用方负责转成屏幕坐标。
+function PageRenderer:repaintImageCell(url, page_starts)
+    if not url or not self.layout or not page_starts then return nil end
+
+    -- 找含该 url 的 image piece + cell
+    local target_piece, target_cell, target_pic
+    for _, piece in ipairs(self.layout.pieces or {}) do
+        if piece.kind == "image" and type(piece.pics) == "table" then
+            for i, pic in ipairs(piece.pics) do
+                if pic and pic.url == url then
+                    target_piece = piece
+                    target_cell = piece.layout.cells[i]
+                    target_pic = pic
+                    break
+                end
+            end
+        end
+        if target_piece then break end
+    end
+    if not target_piece or not target_cell then return nil end
+
+    -- 找这个 piece 落在哪一页（可能跨页，取覆盖它的所有页，逐页重画）
+    local y0 = target_piece.y
+    local y1 = y0 + target_piece.piece_h
+    local pages_hit = {}
+    for pi, start in ipairs(page_starts) do
+        local pend = page_starts[pi + 1] or self.content_h
+        if y1 > start and y0 < pend then
+            pages_hit[#pages_hit + 1] = { idx = pi, p0 = start, p1 = pend }
+        end
+    end
+    if #pages_hit == 0 then return nil end
+
+    -- 取该图的位图（内部会走 _getImageBB 缓存，第一次会解码，之后命中）
+    local img_bb = self:_getImageBB(target_pic, target_cell.w, target_cell.h)
+
+    local results = {}
+    for _, hit in ipairs(pages_hit) do
+        local cached = self._page_bbs:get(hit.idx)
+        if cached and cached.bb then
+            local bb = cached.bb
+            local cell_top = target_piece.y + target_cell.y
+            local top = math.max(cell_top, hit.p0)
+            local bottom = math.min(cell_top + target_cell.h, hit.p1)
+            if bottom > top then
+                local x = (target_piece.x or 0) + target_cell.x
+                -- 先擦掉这块区域（占位框 / 旧图）
+                bb:paintRect(x, top - hit.p0, target_cell.w, bottom - top,
+                    Blitbuffer.COLOR_WHITE)
+                if img_bb then
+                    bb:blitFrom(img_bb, x, top - hit.p0, 0, top - cell_top,
+                        math.min(target_cell.w, img_bb:getWidth()), bottom - top)
+                else
+                    -- 还是没图（解码失败）：画占位框
+                    bb:paintRect(x, top - hit.p0, target_cell.w, bottom - top,
+                        Blitbuffer.COLOR_GRAY_E)
+                end
+                results[#results + 1] = {
+                    page_idx = hit.idx,
+                    -- 内容坐标：x 相对内容左边缘，y 相对内容顶部
+                    x = x,
+                    y = top,
+                    w = target_cell.w,
+                    h = bottom - top,
+                }
+            end
+        end
+    end
+    return results
+end
+
 --- Drop every cached bitmap and layout (called on document close); the next
 --- use re-paginates from scratch.
 function PageRenderer:freeContentCaches()
