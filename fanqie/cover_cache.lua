@@ -67,12 +67,32 @@ end
 --- 新命名：<book_id>.jpg；没有 book_id 时退回书名
 function M.filename(book)
     if type(book) ~= "table" then return nil end
+
+    -- 与 content.lua 的 basename_safe 完全一致：替换非法字符、去控制字符、
+    -- 去首尾空白/点、空串兜底 fanqie、按字符截断到 10。
+    local function safe_name(value)
+        value = tostring(value or "")
+            :gsub("[/\\:%*%?\"<>|]", "_")
+            :gsub("%c", "")
+            :gsub("^%s+", ""):gsub("%s+$", "")
+            :gsub("^%.+", ""):gsub("%.+$", "")
+        if value == "" then value = "fanqie" end
+        local chars = require("util").splitToChars(value)
+        if #chars > 10 then value = table.concat(chars, "", 1, 10) end
+        return value
+    end
+
     local bid = book.book_id or book.bookId
     if bid ~= nil and tostring(bid) ~= "" then
-        return sanitize(bid) .. M.SUFFIX
+        local id = sanitize(tostring(bid))
+        local title = type(book.title) == "string" and book.title or ""
+        if title ~= "" then
+            return safe_name(title) .. "-" .. id .. M.SUFFIX
+        end
+        return id .. M.SUFFIX
     end
     if type(book.title) == "string" and book.title ~= "" then
-        return sanitize(book.title) .. M.SUFFIX
+        return safe_name(book.title) .. M.SUFFIX
     end
     return nil
 end
