@@ -387,6 +387,16 @@ local function media_type_for(data)
     return ".bin", "application/octet-stream"
 end
 
+--- 根据图片数据头返回扩展名（.png / .jpg / .gif / .webp / .bin）。
+--- 供 save_catalog_cache 等调用方使用；内部复用 media_type_for 的第一个返回值。
+--- 数据为空或不是图片时返回 nil，调用方自行兜底（通常是 ".jpg"）。
+function Content.detect_image_type(data)
+    if type(data) ~= "string" or #data < 4 then return nil end
+    local ext = media_type_for(data)
+    if ext == ".bin" then return nil end
+    return ext
+end
+
 local function xml_escape(value)
     value = tostring(value or "")
     value = value:gsub("&", "&amp;")
