@@ -413,7 +413,7 @@ function ThoughtPopupWidget:_startImageDownloads()
             if gen ~= widget._img_gen then return end
             if ok then
                 widget._pages:invalidateImage(job.url)
-                widget:_queueImageRefresh()
+                widget:_repaintImageCell(job.url)
             end
             -- 无论成败都继续下一张：一张坏图不该挡住后面的
             step()
@@ -434,6 +434,42 @@ function ThoughtPopupWidget:_refreshImageArea()
     UIManager:setDirty(self, function()
         return "partial", self._scroll_container.dimen
     end)
+end
+
+--- 图下载完：只在缓存的页面位图上重画那个 cell，不重建整页。
+--- 只 dirty 那个 cell 的屏幕矩形，屏幕只重画一小块，视觉不闪。
+function ThoughtPopupWidget:_repaintImageCell(url)
+    local scroll = self._scroll_container
+    if not scroll or not self._pages then return end
+    local page_starts = scroll.pages
+    if not page_starts then return end
+
+    local results = self._pages:repaintImageCell(url, page_starts)
+    if not results or #results == 0 then return end
+
+    -- 把内容坐标转成屏幕坐标，逐块 dirty（只 dirty 图那块，不 dirty 整视口）
+    for _, r in ipairs(results) do
+        local sx = scroll.dimen.x + (scroll.margin_left or 0) + r.x
+        -- r.y 是内容坐标的绝对 y（top），减去 scroll_offset 得到视口内 y
+        local sy = scroll.dimen.y + (r.y - (scroll.scroll_offset or 0))
+        -- 裁掉视口外的部分
+        local vp_top = scroll.dimen.y
+        local vp_bottom = scroll.dimen.y + scroll.viewport_h
+        if sy < vp_top then
+            local cut = vp_top - sy
+            r.h = r.h - cut
+            sy = vp_top
+        end
+        if sy + r.h > vp_bottom then
+            r.h = vp_bottom - sy
+        end
+        if r.h > 0 then
+            local rect = Geom:new{ x = sx, y = sy, w = r.w, h = r.h }
+            UIManager:setDirty(self, function()
+                return "partial", rect
+            end)
+        end
+    end
 end
 
 --- 批量下载时的合并刷新：串行队列里每下一张都整页清缓存重绘，十几张就是
@@ -599,7 +635,7 @@ function ThoughtPopupWidget:_handleImageAction(piece, content_x, content_y)
         pcall(self.fetch_pic, pic.fetch or pic.url, path, function(ok)
             if ok then
                 self._pages:invalidateImage(pic.url)
-                self:_refreshImageArea()
+                self:_repaintImageCell(pic.url)
             end
         end)
     end
