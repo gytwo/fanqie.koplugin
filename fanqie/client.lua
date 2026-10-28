@@ -926,10 +926,24 @@ function Client:zhiqiu_get_para_review(ident, opts)
         page = page + 1
     end
 
-    -- cursor 语义：下一页页码。循环里 has_more=true 时已 page=page+1，
-    -- 所以这里直接用 page，不能再 +1（否则会跳过一页）。
-    local has_more_out = (last_has_more == true)
-    local next_page = page
+    -- 知秋服务端不返回 common_list_info.has_more，last_has_more 恒为 nil。
+    -- 用「本次拉到的条数是否达到 page_size」判断是否还有下一页：
+    --   拉满一页 → 可能还有，has_more = true
+    --   不足一页 → 到底了，has_more = false
+    -- 这是分页接口的通用判据，不依赖服务端显式字段。
+    local has_more_out
+    if last_has_more ~= nil then
+        has_more_out = (last_has_more == true)
+    else
+        has_more_out = (#merged > 0 and #merged % page_size == 0)
+    end
+
+    -- cursor 语义必须和入参 opts.cursor 一致，都是「条数偏移」。
+    -- 之前返回的是页码 next_page，load_more 下次传进来被当条数偏移算页码，
+    -- 又回到第 1 页 → 看起来"继续加载没反应"。
+    -- 正确值 = 起始偏移 + 本次拉到的条数。
+    local next_offset = offset + #merged
+
     return {
         code = 0,
         msg = "susscess",
@@ -938,11 +952,11 @@ function Client:zhiqiu_get_para_review(ident, opts)
             common_list_info = {
                 total = last_total or #merged,
                 has_more = has_more_out,
-                cursor = next_page,
+                cursor = next_offset,
             },
         },
     }
-end
+    end
 
 -- 知秋二级评论（回复列表）：GET {base}/novel/comment/reply?bid=&rid=&page=&size=
 --   → { code:0, data:{ reply_list:[{Common,stat,reply_id,reply_to_comment_id,
