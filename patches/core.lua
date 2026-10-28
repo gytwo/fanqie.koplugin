@@ -83,7 +83,8 @@ local is_fanqie_path = function(file_path, instance)
     end
     local parent = normalized:match("/([^/]+)/chapter_[^/]+%.html$")
     if parent and #parent >= 6
-            and parent:match("^[%w%._-]+$") and parent:match("%d") then
+            and not parent:match("[/\\]")     -- 已经由 match 保证不含分隔符
+            and parent:match("%d") then       -- 至少含一位数字（书号）
         return true
     end
     warn_shape_mismatch(normalized)
