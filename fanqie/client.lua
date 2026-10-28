@@ -868,17 +868,23 @@ function Client:zhiqiu_get_para_review(ident, opts)
         ["Content-Type"]     = "application/json",
     }
 
+    -- 首屏和续拉的页数上限：opts.page_max 控制，默认 1（只拉一页）。
+    -- 之前这里用的是未定义的 PAGE_MAX，导致 while 直接崩。
+    local page_max = tonumber(opts.page_max) or 1
+    if page_max < 1 then page_max = 1 end
+    -- 每页条数（已被 size 钳制过），用作「本页是否拉满」的判据
+    local page_size = size
+
     local merged = {}
     local last_total, last_has_more = nil, nil
-    local page = PAGE
     local pages_done = 0
-    while pages_done < PAGE_MAX do
+    while pages_done < page_max do
         pages_done = pages_done + 1
         local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
             .. "&cid=" .. H.url_encode(cid)
             .. "&pid=" .. H.url_encode(pid)
             .. "&page=" .. tostring(page)
-            .. "&size=" .. tostring(SIZE)
+            .. "&size=" .. tostring(page_size)
 
         local ok_logger, logger_mod = pcall(require, "fanqie.logger")
         if ok_logger and logger_mod then
@@ -915,7 +921,7 @@ function Client:zhiqiu_get_para_review(ident, opts)
             last_has_more = clinfo.has_more
         end
 
-        if #list < SIZE then break end
+        if #list < page_size then break end
         if last_has_more == false then break end
         page = page + 1
     end
