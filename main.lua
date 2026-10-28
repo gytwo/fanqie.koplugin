@@ -1282,12 +1282,8 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                 if idt:find("official:", 1, true) then
                     return c:official_get_para_review(idt,
                         { cursor = st.cursor, count = 40 })
-                elseif idt:find("zhiqiu:", 1, true) then
-                    return c:zhiqiu_get_para_review(idt,
-                        { page = tonumber(st.cursor) or 2, size = 30, page_max = 1 })
                 end
                 if idt:find("zhiqiu:", 1, true) then
-                    -- 知秋只认 page/size，cursor 由 client 换算成页码
                     return c:zhiqiu_get_para_review(idt,
                         { cursor = st.cursor, size = 30 })
                 end
