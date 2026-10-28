@@ -184,11 +184,242 @@ function M.fetch_author(settings, book_id)
     return nil, "error", err_text(last_err)
 end
 
--- 回填 KOReader 统计库：把 book.authors 从 N/A 改成真实作者。
+-- ── 统计库身份收敛 ────────────────────────────────────────────────
+-- 为什么不能只写一条 UPDATE authors：
+--   KOReader statistics 用 (title, authors, md5) 三元组认书（getIdBookDB），
+--   而 book 表上有 UNIQUE(title, authors, md5)。作者在 "N/A" 与真名之间
+--   切换一次就会多出一行；之后再想 UPDATE authors 就会撞唯一约束 → 整条
+--   语句回滚（外层 pcall 吞掉，日志里什么都看不到），两行永久共存，
+--   页记录被拆到两边。所以回填必须是「按 md5 合并成一个身份」，不是改字段：
+--     1) 选主行：页记录多者优先 → 已有真名优先 → 最近打开优先
+--     2) 其余行的 page_stat_data 改挂主行（UNIQUE 冲突的重复条目跳过，随后清掉）
+--     3) 时长/页数累加，last_open 取最大，pages 取最近打开那一行的值
+--     4) 先删掉其余行（解除唯一约束），最后才改主行 authors
+-- 全过程一个事务，异常回滚，绝不留半合并状态。
+local function sql_num(v, default)
+    if v == nil then return default end
+    local s = tostring(v):gsub("LL$", ""):gsub("%.0$", "")
+    return tonumber(s) or default
+end
+
+local function sql_quote(s)
+    return (tostring(s):gsub("'", "''"))
+end
+
+local function fetch_identity_rows(db, md5)
+    local rows = {}
+    local st = db:prepare(string.format([[
+        SELECT b.id, IFNULL(b.authors, ''), IFNULL(b.last_open, 0), IFNULL(b.pages, 0),
+               IFNULL(b.total_read_time, 0), IFNULL(b.total_read_pages, 0),
+               (SELECT COUNT(*) FROM page_stat_data p WHERE p.id_book = b.id)
+        FROM book b WHERE b.md5 = '%s' ORDER BY b.id;
+    ]], sql_quote(md5)))
+    local r = st:step()
+    while r do
+        rows[#rows + 1] = {
+            id         = sql_num(r[1], 0),
+            authors    = tostring(r[2] or ""),
+            last_open  = sql_num(r[3], 0),
+            pages      = sql_num(r[4], 0),
+            time       = sql_num(r[5], 0),
+            read_pages = sql_num(r[6], 0),
+            psd        = sql_num(r[7], 0),
+        }
+        r = st:step()
+    end
+    st:close()
+    return rows
+end
+
+-- 当前阅读会话正在使用的 book 行 id（没有会话时返回 nil）。
+-- 延迟 require：stats.lua 也 require 本模块，放在函数里取才不会撞循环依赖。
+local function current_session_id()
+    local ok, Stats = pcall(require, "fanqie.stats")
+    if ok and type(Stats) == "table" and Stats.current_book_db_id then
+        local ok2, id = pcall(Stats.current_book_db_id)
+        if ok2 then return tonumber(id) end
+    end
+    return nil
+end
+
+-- 返回 "absent" / "clean" / "updated" / "merged"
+local function merge_identity_rows(db, md5, author)
+    local rows = fetch_identity_rows(db, md5)
+    if #rows == 0 then return "absent" end
+
+    local keep = rows[1]
+    for i = 2, #rows do
+        local a = rows[i]
+        local win = false
+        if a.psd ~= keep.psd then
+            win = a.psd > keep.psd
+        elseif a.authors ~= "N/A" and keep.authors == "N/A" then
+            win = true
+        elseif a.last_open ~= keep.last_open then
+            win = a.last_open > keep.last_open
+        end
+        if win then keep = a end
+    end
+
+    -- 当前会话的行是"活"的：KOReader 内存里缓存着它的 id，删掉它只会让
+    -- 之后每一页都写到已删除的 id 上（孤儿行）。所以最后一步强制把它定为主行。
+    local protected = current_session_id()
+    if protected then
+        for _, row in ipairs(rows) do
+            if row.id == protected then keep = row break end
+        end
+    end
+
+    local total_time, total_read_pages, last_open = 0, 0, 0
+    local pages, pages_stamp = keep.pages, -1
+    for _, row in ipairs(rows) do
+        total_time       = total_time + row.time
+        total_read_pages = total_read_pages + row.read_pages
+        if row.last_open > last_open then last_open = row.last_open end
+        if row.pages > 0 and row.last_open > pages_stamp then
+            pages, pages_stamp = row.pages, row.last_open
+        end
+    end
+
+    -- 单行且已收敛：直接返回，避免每次打开书都白写一次库
+    if #rows == 1 then
+        local only = rows[1]
+        if only.authors == author and only.last_open == last_open
+            and only.pages == pages and only.time == total_time
+            and only.read_pages == total_read_pages then
+            return "clean"
+        end
+    end
+
+    for _, row in ipairs(rows) do
+        if row.id ~= keep.id then
+            -- page_stat_data 上有 UNIQUE(id_book, page, start_time)。旧写法用
+            -- "UPDATE OR IGNORE" 搬家：撞车的行会被静默跳过，紧接着的 DELETE 又
+            -- 把它删掉 —— 结果是数据丢失 + 留下指向已删 book 的孤儿行（2026-10-26
+            -- 在 Kobo 真机上抓到 id_book=201 那条就是这么来的）。
+            -- 正确顺序：先删掉与主行同 (page, start_time) 的重复行，再无冲突地搬。
+            db:exec(string.format([[
+                DELETE FROM page_stat_data
+                 WHERE id_book = %d
+                   AND EXISTS (SELECT 1 FROM page_stat_data k
+                                WHERE k.id_book = %d
+                                  AND k.page = page_stat_data.page
+                                  AND k.start_time = page_stat_data.start_time);
+            ]], row.id, keep.id))
+            db:exec(string.format(
+                "UPDATE page_stat_data SET id_book = %d WHERE id_book = %d;",
+                keep.id, row.id))
+            -- 兜底：搬完之后该 id 不应再有行，留一条防御性清理
+            db:exec(string.format(
+                "DELETE FROM page_stat_data WHERE id_book = %d;", row.id))
+            db:exec(string.format("DELETE FROM book WHERE id = %d;", row.id))
+        end
+    end
+
+    db:exec(string.format([[
+        UPDATE book SET authors = '%s', last_open = %d, pages = %d,
+                         total_read_time = %d, total_read_pages = %d
+        WHERE id = %d;
+    ]], sql_quote(author), last_open, pages, total_time, total_read_pages, keep.id))
+
+    return #rows > 1 and "merged" or "updated"
+end
+
+-- 打开统计库（打不开就返回 nil，调用方不必再判断 DataStorage 等）
+local function open_stats_db()
+    local ok_sq3, SQ3 = pcall(require, "lua-ljsqlite3/init")
+    if not ok_sq3 or not SQ3 then return nil end
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    if not ok_ds or type(DataStorage) ~= "table" then return nil end
+    local ok_path, dir = pcall(DataStorage.getSettingsDir, DataStorage)
+    if not ok_path or not is_str(dir) then return nil end
+    local ok_db, db = pcall(SQ3.open, dir .. "/statistics.sqlite3")
+    if not ok_db or not db then return nil end
+    return db
+end
+
+-- 一次性收敛：把库里所有 fanqie- 书的重复行合并成一行，并清掉孤儿统计行。
+--
+-- 为什么需要：merge_identity_rows 只在「打开某本书」时顺手收敛那一本。历史上
+-- 早期版本先写 N/A 行、抓到作者后又插一行（UNIQUE(title,authors,md5) 拦不住），
+-- 这些老行永远不会被再次打开，就长期躺在库里 —— 2026-10-26 在 Kindle 上查到
+-- 3 组（4 行空壳）残留、Kobo 上 1 条孤儿。
+--
+-- 只处理「多于一行」的组，已收敛的书零写入；整段跑在一个事务里。
+-- 返回 { merged = 组数, orphans = 清掉的孤儿行数 }
+function M.sweep_stats_db()
+    local db = open_stats_db()
+    if not db then return nil end
+
+    local out = { merged = 0, orphans = 0 }
+    local ok, err = pcall(function()
+        db:exec("PRAGMA busy_timeout=5000;")
+        db:exec("BEGIN IMMEDIATE;")
+
+        -- 1) 同 md5 多行 → 逐组收敛。代表作者优先取组内已有的真名。
+        local groups = {}
+        local st = db:prepare([[
+            SELECT md5, COUNT(*) FROM book
+             WHERE md5 LIKE 'fanqie-%'
+             GROUP BY md5 HAVING COUNT(*) > 1;
+        ]])
+        local r = st:step()
+        while r do
+            groups[#groups + 1] = tostring(r[1])
+            r = st:step()
+        end
+        st:close()
+
+        for _, md5 in ipairs(groups) do
+            -- 组内已有的真名（N/A 不算）作为合并后的作者
+            local author = nil
+            local ast = db:prepare(string.format([[
+                SELECT authors FROM book
+                 WHERE md5 = '%s' AND IFNULL(authors, '') NOT IN ('', 'N/A')
+                 ORDER BY last_open DESC LIMIT 1;
+            ]], sql_quote(md5)))
+            local ar = ast:step()
+            if ar and is_str(ar[1]) and ar[1] ~= "" then author = tostring(ar[1]) end
+            ast:close()
+            if author then
+                local res = merge_identity_rows(db, md5, author)
+                if res == "merged" then
+                    out.merged = out.merged + 1
+                end
+            end
+        end
+
+        -- 2) 孤儿统计行：id_book 不在 book 表里（旧合并 bug 的产物），无主数据。
+        db:exec("CREATE TEMP TABLE IF NOT EXISTS _fq_orphan AS "
+            .. "SELECT id_book FROM page_stat_data "
+            .. "WHERE id_book NOT IN (SELECT id FROM book);")
+        local ost = db:prepare("SELECT COUNT(*) FROM _fq_orphan;")
+        local orow = ost:step()
+        if orow then out.orphans = sql_num(orow[1], 0) end
+        ost:close()
+        if out.orphans > 0 then
+            db:exec("DELETE FROM page_stat_data WHERE id_book IN (SELECT id_book FROM _fq_orphan);")
+        end
+        db:exec("DROP TABLE IF EXISTS _fq_orphan;")
+
+        db:exec("COMMIT;")
+    end)
+
+    if not ok then
+        pcall(function() db:exec("ROLLBACK;") end)
+        log_warn("[book_meta] 统计库收敛失败:", tostring(err))
+    else
+        log_debug("[book_meta] 统计库收敛: merged=", out.merged, "orphans=", out.orphans)
+    end
+    pcall(db.close, db)
+    return ok and out or nil
+end
+
+-- 回填 KOReader 统计库：把作者落到 book.authors，并顺手把同 md5 的重复行收敛成一行。
 -- 统计库里本插件的书靠 md5 = "fanqie-<book_id>" 标识（见 stats.lua）。
--- 不存在该行时静默返回（下次打开书时 resolve 会带上缓存作者重新落库）。
 function M.backfill_stats_db(book_id, author)
     if not is_str(book_id) or not is_str(author) or author == "" then return false end
+    if author == "N/A" then return false end   -- 占位名不值得写库，也没法收敛
     local ok_sq3, SQ3 = pcall(require, "lua-ljsqlite3/init")
     if not ok_sq3 or not SQ3 then return false end
     local ok_ds, DataStorage = pcall(require, "datastorage")
@@ -198,10 +429,19 @@ function M.backfill_stats_db(book_id, author)
     local ok_db, db = pcall(SQ3.open, dir .. "/statistics.sqlite3")
     if not ok_db or not db then return false end
     local md5 = "fanqie-" .. tostring(book_id)
-    local esc = author:gsub("'", "''")
-    local ok = pcall(function()
-        db:exec(string.format("UPDATE book SET authors = '%s' WHERE md5 = '%s';", esc, md5))
+    local ok, res = pcall(function()
+        db:exec("PRAGMA busy_timeout=5000;")
+        db:exec("BEGIN IMMEDIATE;")
+        local r = merge_identity_rows(db, md5, author)
+        db:exec("COMMIT;")
+        return r
     end)
+    if not ok then
+        pcall(function() db:exec("ROLLBACK;") end)
+        log_warn("[book_meta] 统计库身份合并失败:", tostring(res))
+    else
+        log_debug("[book_meta] 统计库身份:", tostring(book_id), tostring(res))
+    end
     pcall(db.close, db)
     return ok and true or false
 end

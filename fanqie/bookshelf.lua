@@ -11,13 +11,15 @@ local ok_Notification, Notification = pcall(require, "ui/widget/notification")
 local ok_ConfirmBox, ConfirmBox = pcall(require, "ui/widget/confirmbox")
 local ok_InputDialog, InputDialog = pcall(require, "ui/widget/inputdialog")
 
-local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-local ok_util, util = pcall(require, "util")
 local ok_H, H = pcall(require, "fanqie.helper")
 local ok_Log, Log = pcall(require, "fanqie.logger")
 local ok_Content, Content = pcall(require, "fanqie.content")
 local ok_state, _state = pcall(require, "fanqie.state")
 local ok_Async, Async = pcall(require, "fanqie.async")
+local ok_FanQie, FanQie = pcall(require, "fanqie.fanqie")
+local ok_CoverCache, CoverCache = pcall(require, "fanqie.cover_cache")
+local ok_ReviewPics, ReviewPics = pcall(require, "fanqie.review_pics")
+local ok_BookNames, BookNames = pcall(require, "fanqie.book_names")
 
 -- 书架内存缓存：内存主源 + 文件后备
 -- 存精简后的 books 数组（与 shelf_cache.lua 同构）。
@@ -55,9 +57,10 @@ local function get_shelf_cache_path(settings)
     return cache_dir .. "/shelf_cache.lua"
 end
 
--- 浅拷贝 books 数组（仅数组层）：避免 do_sort/showBookList 的 table.sort 原地排序
--- 污染内存缓存的原始顺序。内部 book 对象仍共享引用，download_covers 加的
--- cover_path 会影响缓存中的 book 对象，但该污染无害（有益——跳过重复下载）。
+-- 浅拷贝 books 数组（仅数组层）：调用方（main.lua 的 showBookList）可能原地
+-- table.sort，浅拷贝保证内存缓存的原始顺序（= 服务端顺序）不被污染。
+-- 内部 book 对象仍共享引用，封面下载回填的 cover_path 会写进缓存对象——
+-- 该污染无害（有益：下次跳过重复下载）。
 local function shallow_copy_books(books)
     local copy = {}
     for i, b in ipairs(books) do
@@ -68,7 +71,7 @@ end
 
 local function save_shelf_cache(settings, books)
     if not settings or not books or type(books) ~= "table" then return end
-    -- 写内存缓存（浅拷贝：调用方后续的 do_sort/showBookList 会原地修改 books，
+    -- 写内存缓存（浅拷贝：调用方可能原地排序 books，
     -- 存浅拷贝保持内存缓存的原始顺序不被污染）
     SHELF_MEM_CACHE = shallow_copy_books(books)
     local path = get_shelf_cache_path(settings)
@@ -106,7 +109,7 @@ end
 -- 书架缓存读取：内存主源 + 文件后备 + 回填
 -- 优先查内存缓存，命中直接返回，避免文件 IO；
 -- 未命中时读文件缓存，并回填内存，后续读取全部走内存。
--- 返回浅拷贝：避免调用方 do_sort/showBookList 的 table.sort 原地排序污染内存缓存。
+-- 返回浅拷贝：避免调用方原地排序污染内存缓存。
 local function load_shelf_cache(settings)
     if SHELF_MEM_CACHE and #SHELF_MEM_CACHE > 0 then
         return shallow_copy_books(SHELF_MEM_CACHE)
@@ -126,6 +129,10 @@ local function load_shelf_cache(settings)
     end)
     if ok and type(data) == "table" and #data > 0 then
         if Log then Log.info("shelf cache loaded: " .. tostring(#data) .. " books") end
+        -- 用本地缓存的 App 正式名覆盖 SEO 推广名（纯内存，无网络）
+        if ok_BookNames and BookNames then
+            pcall(BookNames.decorate, settings, data)
+        end
         -- 3. 回填内存缓存（存原始引用，调用方拿到的是浅拷贝不会污染 data）
         SHELF_MEM_CACHE = data
         return shallow_copy_books(data)
@@ -155,6 +162,50 @@ function Bookshelf:clearShelfCache()
     end
 end
 
+--- 刷新门控位：自动刷新与手动刷新共用，防止两个子进程同时拉 get_shelf。
+-- 位放在 _state（模块级，跨实例共享）。🔴 **每个出口都必须清位**，
+-- 漏一个的后果是「书架再也不自动刷新」，比并发本身更难排查。
+local function refreshing_now()
+    return ok_state and _state and _state.shelf_refreshing == true
+end
+
+local function set_refreshing(v)
+    if ok_state and _state then
+        _state.shelf_refreshing = v and true or nil
+    end
+end
+
+--- 书架刷新成功后的顺带维护：covers 目录只增不减，超阈值时清孤儿封面。
+-- 必须把这次拿到的全量 books 传进去：清理按「是不是还在书架上」判断，
+-- 按 mtime 判断会误删长期在读的老封面（自愈重下，但闪白 + 白耗流量）。
+-- 阈值仍是 200MB（见 cover_cache.lua），普通设备不会触发。
+local function maybe_prune_covers(settings, books)
+    if ok_CoverCache and CoverCache and CoverCache.maybe_auto_prune then
+        pcall(CoverCache.maybe_auto_prune, settings, books)
+    end
+    -- 段评配图（review_pics/<book_id>/）独立目录、独立阈值，同样按书架集合清理。
+    -- 分开做：混目录会让两边的孤儿清理互相误删。
+    if ok_ReviewPics and ReviewPics and ReviewPics.maybe_auto_prune then
+        pcall(ReviewPics.maybe_auto_prune, settings, books)
+    end
+end
+
+-- 后台校正书名（App 正式名）。拿到后写回缓存、同步刷新书架当前页。
+-- 不阻塞界面：本地缓存名在 decorate 阶段已经生效，这里只补「还没查过的书」。
+function Bookshelf:_ensureBookNames(books)
+    if not (ok_BookNames and BookNames) then return false end
+    if type(books) ~= "table" or #books == 0 then return false end
+    local plugin = self
+    local ok, started = pcall(BookNames.ensure, self.settings, books, function(updated)
+        save_shelf_cache(plugin.settings, updated)
+        -- 只刷标题，保持当前页；书架没开着（或已换菜单）时静默跳过
+        if plugin.refreshShelfTitles then
+            pcall(plugin.refreshShelfTitles, plugin, updated)
+        end
+    end)
+    return ok and started or false
+end
+
 function Bookshelf:showBookshelf(opts)
     opts = opts or {}
     local force_refresh = opts.force_refresh == true
@@ -165,30 +216,10 @@ function Bookshelf:showBookshelf(opts)
         self.patches_ok = true
     end
 
-    local sort_type = _state.shelf_sort_type or "default"
-    local function do_sort(books)
-        if sort_type ~= "default" then
-            table.sort(books, function(a, b)
-                if sort_type == "progress" then
-                    return (a.progress or 0) < (b.progress or 0)
-                elseif sort_type == "added" then
-                    return (a.added_time or 0) > (b.added_time or 0)
-                elseif sort_type == "read" then
-                    return (a.last_read_time or 0) > (b.last_read_time or 0)
-                elseif sort_type == "title" then
-                    return (a.title or "") < (b.title or "")
-                else
-                    return true
-                end
-            end)
-        end
-    end
-
     -- 回退到文件缓存（force_refresh 获取失败时使用）
     local function fallback_to_cache()
         local cached = load_shelf_cache(self.settings)
         if cached and #cached > 0 then
-            do_sort(cached)
             self:showBookList(cached)
             return true
         end
@@ -199,32 +230,36 @@ function Bookshelf:showBookshelf(opts)
     if not force_refresh then
         local cached_shelf = load_shelf_cache(self.settings)
         if cached_shelf and #cached_shelf > 0 then
-            do_sort(cached_shelf)
             self:showBookList(cached_shelf)
-            -- 后台异步刷新：失败时弹 toast，不再静默
-            if self:checkNetwork() then
+            -- 顺手补齐还没查过的书名（后台、串行、有缓存挡着，稳态 0 请求）
+            self:_ensureBookNames(cached_shelf)
+            -- 后台异步刷新：门控——已有刷新在跑就跳过（不重入、不排队，
+            -- 缓存已经显示，刷新交给正在进行的那个任务）
+            if self:checkNetwork() and not refreshing_now() then
                 local plugin = self
                 if ok_Async and Async then
+                    set_refreshing(true)
+                    self:showBusy(_("正在刷新书架..."))
                     Async.run(function()
                         return plugin:get_shelf()
                     end, function(ok, result, err)
+                        plugin:closeBusy()
+                        set_refreshing(false)
                         if ok and type(result) == "table" and #result > 0 then
                             save_shelf_cache(plugin.settings, result)
-                            do_sort(result)
+                            maybe_prune_covers(plugin.settings, result)
                             plugin:showBookList(result)
-                        else
-                            UIManager:show(Notification:new{
-                                text = _("无网络，仅显示缓存"),
-                                timeout = 2,
-                            })
+                            plugin:_ensureBookNames(result)
                         end
-                    end, { poll_interval = 0.3, timeout = 8 })
+                    end, {
+                        poll_interval = 0.3, timeout = 8,
+                        on_cancel = function()
+                            plugin:closeBusy()
+                            set_refreshing(false)
+                        end,
+                    })
                 end
-            else
-                UIManager:show(Notification:new{
-                    text = _("无网络，仅显示缓存"),
-                    timeout = 2,
-                })
+                -- Async 不可用：不做后台刷新（缓存已在显示，没必要同步阻塞一次）
             end
             return
         end
@@ -246,12 +281,16 @@ function Bookshelf:showBookshelf(opts)
 
     self:showBusy(force_refresh and _("正在刷新书架...") or _("正在获取书架..."))
     local plugin = self
+    -- 手动刷新不被门控拒绝（行为不变），但必须参与置位/清位，
+    -- 否则位永不清、自动刷新会永久被挡。
+    set_refreshing(true)
     if ok_Async and Async then
         Async.run(function()
             -- force_refresh=true 跳过 client 内存缓存，从网络获取
             return plugin:get_shelf(force_refresh)
         end, function(ok, result, err)
             plugin:closeBusy()
+            set_refreshing(false)  -- 统一清位：下面所有 return 都被覆盖
             if not ok or type(result) ~= "table" then
                 if Log then Log.error("fetch shelf failed:", log_error(err or result)) end
                 -- 获取失败：回退到旧缓存，不删除任何数据
@@ -274,15 +313,23 @@ function Bookshelf:showBookshelf(opts)
             end
 
             save_shelf_cache(plugin.settings, result)
-            do_sort(result)
+            maybe_prune_covers(plugin.settings, result)
             plugin:showBookList(result)
-        end, { poll_interval = 0.3, timeout = 60 })
+            plugin:_ensureBookNames(result)
+        end, {
+            poll_interval = 0.3, timeout = 60,
+            on_cancel = function()
+                plugin:closeBusy()
+                set_refreshing(false)
+            end,
+        })
     else
         -- Async 模块不可用时降级为同步
         local ok, result = pcall(function()
             return self:get_shelf()
         end)
         self:closeBusy()
+        set_refreshing(false)
         if not ok then
             if Log then Log.error("fetch shelf failed:", log_error(result)) end
             self:showError(T(_("获取书架失败:\n%1"), display_error(result)))
@@ -295,8 +342,9 @@ function Bookshelf:showBookshelf(opts)
         end
 
         save_shelf_cache(self.settings, result)
-        do_sort(result)
+        maybe_prune_covers(self.settings, result)
         self:showBookList(result)
+        self:_ensureBookNames(result)
     end
 end
 
@@ -326,6 +374,19 @@ function Bookshelf:get_shelf(force_refresh)
             elseif item.read_progress then
                 progress = tonumber(item.read_progress) / 10000
             end
+            -- 封面地址必须收敛成无签名 CDN：接口给的 thumb_url 带签名，
+            -- x-expires 只签到次日，缓存未命中时用旧地址回源会 403（封面变空白）。
+            -- 另外不能只靠 or 兜底——空串 "" 在 Lua 里是 truthy，会把后面
+            -- 所有候选字段整个吃掉，所以逐个挑「非空字符串」。
+            local raw_cover = item.thumb_url
+            if type(raw_cover) ~= "string" or raw_cover == "" then raw_cover = item.thumb_uri end
+            if type(raw_cover) ~= "string" or raw_cover == "" then raw_cover = item.coverUrl end
+            if type(raw_cover) ~= "string" or raw_cover == "" then raw_cover = item.cover end
+            if type(raw_cover) ~= "string" or raw_cover == "" then raw_cover = item.cover_url end
+            local cover = raw_cover
+            if ok_FanQie and FanQie and FanQie.mobile_cover then
+                cover = FanQie.mobile_cover(raw_cover) or raw_cover
+            end
             local book = {
                 book_id = (function()
                     local v = item.book_id or item.bookId or item.id
@@ -335,9 +396,15 @@ function Bookshelf:get_shelf(force_refresh)
                     end
                     return tostring(v or "")
                 end)(),
+                -- ⚠️ book_name 必须是第一优先，**不能**改成 title 优先。
+                -- multidetail 的 detail_list 每项是「书 + 最近阅读位置」的混合结构
+                -- （同项还带 latest_read_item_id / index / read_progress），其中的
+                -- title 指向的是**章节标题**而非书名：2026-10-26 按一份诊断文档改成
+                -- title 优先后，真机书架上整片书名变成「第 N 章 xxx」，随即回退。
+                -- 书名字段是 book_name。
                 title = item.book_name or item.title or item.name or "未知",
                 author = item.author_name or item.author or "",
-                cover = item.thumb_url or item.coverUrl or item.cover or item.cover_url,
+                cover = cover,
                 desc = item.description or item.desc or item.abstract or "",
                 progress = progress,
                 item_id = item.item_id or item.itemId,
@@ -350,188 +417,20 @@ function Bookshelf:get_shelf(force_refresh)
             end
         end
     end
+    -- 已有缓存的书名立刻替换成 App 正式名（没缓存过的先保持 SEO 名，
+    -- 由 _ensureBookNames 在后台补齐；绝不阻塞书架打开）
+    if ok_BookNames and BookNames then
+        pcall(BookNames.decorate, self and self.settings or nil, books)
+    end
     return books
 end
 
-function Bookshelf:download_covers(books)
-    local cover_cache_dir = self.settings:get("cache_dir") .. "/covers"
-    H.make_dir(cover_cache_dir)
-    for _, book in ipairs(books) do
-        if book.cover and not book.cover_path then
-            local cover_filename = string.gsub(book.title, "[/\\:%*%?\"<>|]", "_") .. ".jpg"
-            local cover_path = cover_cache_dir .. "/" .. cover_filename
-            local ok, _ = pcall(function()
-                local data = self.client:get_binary(book.cover)
-                local file = io.open(cover_path, "wb")
-                if file then
-                    file:write(data)
-                    file:close()
-                    book.cover_path = cover_path
-                end
-            end)
-            if not ok and Log then Log.warn("failed to download cover for:", book.title) end
-        end
-    end
-end
-
-function Bookshelf:showBookList(books)
-    table.sort(books, function(a, b)
-        return (a.progress or 0) < (b.progress or 0)
-    end)
-
-    self:download_covers(books)
-
-    local ShelfView = require("fanqie.shelf_view")
-    local plugin = self
-    local opts = {
-        title = _("我的书架"),
-        books = books,
-        show_covers = true,
-        on_select = function(book)
-            plugin:showBookDetail(book)
-        end,
-        on_close = function()
-            plugin.book_list_menu = nil
-        end,
-        on_refresh = function()
-            -- 不关闭旧菜单：数据回来后由 showBookList → ShelfView.update 动态更新
-            plugin:showBookshelf({force_refresh = true})
-        end,
-    }
-
-    if self.book_list_menu then
-        -- 旧菜单存在：动态更新内容，避免关闭重开导致闪烁
-        ShelfView.update(self.book_list_menu, books, opts)
-    else
-        self.book_list_menu = ShelfView.show(opts)
-    end
-end
-
-function Bookshelf:showBookDetail(book)
-    local progress_text = ""
-    if book.progress then
-        progress_text = string.format(_("已读 %.1f%%"), book.progress * 100)
-    end
-    local chapter_text = ""
-    if book.read_chapters and book.total_chapters then
-        chapter_text = string.format(_("%d/%d章"), book.read_chapters, book.total_chapters)
-    end
-
-    -- 异步获取目录，UI 保持响应
-    local self_ref = self
-    local book_id = book.book_id
-    local client = self.client
-    local settings = self.settings
-    local Async_mod = Async
-
-    local function fetch_chapters_async(callback)
-        if ok_Async and Async_mod then
-            Async_mod.run(function()
-                return self_ref:get_chapters(book_id)
-            end, function(ok, result, err)
-                if not ok or type(result) ~= "table" then
-                    if Log then Log.error("fetch chapters failed:", log_error(err or result)) end
-                    self_ref:showError(T(_("获取目录失败:\n%1"), display_error(err or result)))
-                    return
-                end
-                callback(result)
-            end, { poll_interval = 0.3, timeout = 60 })
-        else
-            local ok, result = pcall(function()
-                return self_ref:get_chapters(book_id)
-            end)
-            if not ok or type(result) ~= "table" then
-                if Log then Log.error("fetch chapters failed:", log_error(result)) end
-                self_ref:showError(T(_("获取目录失败:\n%1"), display_error(result)))
-                return
-            end
-            callback(result)
-        end
-    end
-
-    local items = {
-        {
-            text = _("开始阅读"),
-            callback = function()
-                UIManager:close(self.book_detail_menu)
-                self:openBook(book)
-            end,
-        },
-        {
-            text = _("目录"),
-            callback = function()
-                UIManager:close(self.book_detail_menu)
-                self:showChapterListing(book)
-            end,
-        },
-        {
-            text = _("下载"),
-            callback = function()
-                UIManager:close(self.book_detail_menu)
-                self:showBusy(_("正在获取目录..."))
-                fetch_chapters_async(function(chapters)
-                    self_ref:closeBusy()
-                    require("fanqie.download").showOptionsDialog(self_ref, book, chapters)
-                end)
-            end,
-        },
-        {
-            text = _("刷新进度"),
-            callback = function()
-                UIManager:close(self.book_detail_menu)
-                self:showBusy(_("正在刷新进度..."))
-                fetch_chapters_async(function()
-                    if ok_Async and Async_mod then
-                        Async_mod.run(function()
-                            return self_ref:get_shelf(true)
-                        end, function(ok, books, err)
-                            self_ref:closeBusy()
-                            if ok and type(books) == "table" and #books > 0 then
-                                for _, b in ipairs(books) do
-                                    if b.book_id == book_id then
-                                        self_ref:showBookDetail(b)
-                                        break
-                                    end
-                                end
-                            else
-                                self_ref:showError(T(_("刷新失败:\n%1"), display_error(err or books)))
-                            end
-                        end, { poll_interval = 0.3, timeout = 60 })
-                    else
-                        local ok, books = pcall(function()
-                            return self_ref:get_shelf(true)
-                        end)
-                        self_ref:closeBusy()
-                        if ok and type(books) == "table" and #books > 0 then
-                            for _, b in ipairs(books) do
-                                if b.book_id == book_id then
-                                    self_ref:showBookDetail(b)
-                                    break
-                                end
-                            end
-                        else
-                            self_ref:showError(T(_("刷新失败:\n%1"), display_error(books)))
-                        end
-                    end
-                end)
-            end,
-        },
-    }
-
-    self.book_detail_menu = Menu:new{
-        title = book.title,
-        subtitle = progress_text .. (chapter_text ~= "" and (" " .. chapter_text) or ""),
-        item_table = items,
-        is_borderless = true,
-        width = Screen:getWidth() - 40,
-        height = Screen:getHeight() - 100,
-        close_callback = function()
-            self.book_detail_menu = nil
-        end,
-    }
-    UIManager:show(self.book_detail_menu)
-end
-
+-- ⚠️ 这里原本有 download_covers / showBookList / showBookDetail 三个方法，
+-- 已整体移除：main.lua 在末尾用同名方法（FanQiePlugin:showBookList /
+-- FanQiePlugin:showBookDetail）覆盖了 Bookshelf 的混入实现，三者永不执行。
+-- 其中 download_covers 是**同步串行**HTTP 下载版，是个随时会被误启用的地雷；
+-- 真正在跑的是 main.lua 的 _preloadAllCovers / _cacheShelfPageCovers
+-- （子进程 + generation 取消）。删掉可避免「改了半天没生效」和「误启用阻塞版」。
 function Bookshelf:showChapterListing(book)
     local self_ref = self
     local book_id = book.book_id

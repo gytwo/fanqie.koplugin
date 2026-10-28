@@ -32,42 +32,65 @@ local FaceFactory = {
 }
 
 -- Size variants (relative to the base size, which equals the body font size).
--- 一级评论 0.93，二级评论 0.90（比一级略小一点）。
--- 「展开 N 条回复」属于一级评论的附属行，与一级作者行同号 —— 未登记 variant
--- 时 getFace 会兜底成 1.0，反而比一级正文还大。
+-- 一级正文 0.93，二级正文 0.90（比一级略小一点）。
+-- 「展开 N 条回复」是**可点控件**，跟一级正文同号（0.93），不跟作者行 ——
+-- 这样调作者名字号时它不用跟着动，也不至于小到不好点。未登记 variant 时
+-- getFace 会兜底成 1.0，反而比一级正文还大，所以必须显式登记。
+--
+-- 作者行比正文小一档：名字（· 用户名 · ♥ N）只是身份标签，和正文同号会跟
+-- 评论内容抢注意力，压小之后「谁说的 / 说了什么」的层级才立得住。
+-- ⚠️ 改 meta 时必须同步看 reply_meta：二级作者行要比一级作者行更小，
+--    否则回复里的名字反而比一级评论的名字更大，层级倒挂。
+--    只想要「再小一点」就动这两行，正文（content/reply）不要碰。
 FaceFactory.VARIANTS = {
     content      = 0.93,  -- thought body
     quote        = 0.93,  -- quoted abstract (italic, gray)
-    meta         = 0.93,  -- author line; same size as the thought body
-    reply_meta   = 0.90,  -- 二级评论作者行：字体同 meta，字号略小
+    meta         = 0.86,  -- 一级评论作者行（用户名 · ♥）：比正文小一档
+    reply_meta   = 0.84,  -- 二级评论作者行：比一级作者行再小半档
     reply        = 0.90,  -- 二级评论正文：字体同 content，字号略小
-    reply_toggle = 0.93,  -- 「展开/收起 N 条回复」：与一级作者行同款同号
+    reply_toggle = 0.93,  -- 「展开/收起 N 条回复」：跟一级正文同号（可点控件，别太小）
 }
 
--- 仿粗强度（对应 KOReader Font.lua 的 bold_strength_factor = 3/8）。
--- 档位 1 用更轻的强度，只够补上「对比度调高」那点笔画差异。
-local SYNTH_BOLD_FACTORS = { [1] = 0.18, [2] = 3 / 8 }
+-- 仿粗强度：只有档 1/2 用仿粗，档 3 直接换真粗体文件。
+-- 档 1 对应 cre 的 450，视觉上只是一点点压深，不能给 3/8。
+local SYNTH_BOLD_FACTORS = { [1] = 0.10, [2] = 0.18 }
 
---- 把阅读器的「字重 + 对比度」映射成弹框的字重档位：
----   0 常规 / 1 轻仿粗 / 2 标准仿粗
---- cre 的 font.face.base.weight（400/500/350）与 setGammaIndex 只作用于
---- crengine 排版，弹框是自建 FreeType face，必须自己换算。
---- 字重「加粗」= cre 的 500（中等），不是 700，所以用仿粗而不是直接换成
---- 粗体文件——后者会明显比正文重。
-function FaceFactory.resolveBoldLevel(weight, gamma)
-    weight = tonumber(weight) or 0
-    gamma = tonumber(gamma) or 0
-    local level = 0
-    if weight >= 0.5 then
-        level = 2
-    end
-    -- 对比度调高时正文字缘被压深，视觉上等于笔画变粗；负数则靠字色变浅表现
-    if gamma >= 1.25 then
-        level = math.max(level, 2)
-    elseif gamma > 0.25 then
-        level = math.max(level, 1)
-    end
-    return level
+--- 把阅读器的「字重」映射成弹框的仿粗档位：
+---   0 常规 / 1 轻仿粗 / 2 中仿粗 / 3 真粗体文件
+---
+--- ⚠️ 只跟「字重」，**不跟对比度**。KOReader 的对比度是栅格层面的 gamma
+--- 曲线（只改笔画边缘的灰度过渡），不是笔画粗细；拿它去加仿粗会让整片
+--- 变黑变糊。weread 的想法弹窗同样不做这件事。
+---
+--- cre 的换算（credocument.lua:setFontBaseWeight）是 `400 + weight*100`，
+--- 因此 0→400、+½→450、+1→500、+1½→550、+3→700。字体列表里只有
+--- 400 与 700 两档实体（engineInit 会 regularize），中间的 450/500/550
+--- 在正文里只是「稍微压深」，所以这里必须给很轻的仿粗，不能一步跳到 3/8。
+function FaceFactory.resolveBoldLevel(weight)
+    local w = tonumber(weight) or 0
+    if w <= 0 then return 0 end
+    if w < 1 then return 1 end      -- +½  = 450：极轻
+    if w < 3 then return 2 end      -- +1 / +1½ = 500 / 550
+    return 3                        -- +3  = 700：正文用的是真粗体，弹框也用真粗体
+end
+
+--- crengine 的「对比度」在设置里存的是**索引**（0 起，对应 GammaGen 表），
+--- 不是 gamma 值：0 → 0.3，15 → 1.0（默认），25 → 1.45，56 → 15。
+--- 直接把索引当 gamma 值判断会永远命中「高对比」（15 >= 1.25），
+--- 段评就会全篇多一层标准仿粗，比正文还黑。
+local GAMMA_BY_INDEX = {
+    0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9,
+    0.95, 0.98, 1, 1.02, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45,
+    1.5, 1.6, 1.7, 1.8, 1.9, 2, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9,
+    3, 3.5, 4, 4.5, 5, 5.5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+}
+
+--- 对比度索引 -> gamma 值。默认索引 15（= 1.0）对应「不调对比度」。
+function FaceFactory.gammaIndexToValue(index)
+    index = math.floor(tonumber(index) or 15)
+    if index < 0 then index = 0 end
+    if index > #GAMMA_BY_INDEX - 1 then index = #GAMMA_BY_INDEX - 1 end
+    return GAMMA_BY_INDEX[index + 1]
 end
 
 function FaceFactory:init()
@@ -209,7 +232,9 @@ local function resolveBundledFont(fontname)
 end
 
 --- @param embolden_factor number|nil 仿粗强度；nil 表示常规字重
-function FaceFactory:_buildFace(path, size, embolden_factor)
+--- @param is_real_bold boolean|nil true 表示用的是字体自带的粗体文件（700），
+---        不做仿粗，直接按真粗体字形渲染。
+function FaceFactory:_buildFace(path, size, embolden_factor, is_real_bold)
     if not path or not size or size <= 0 then return nil end
     local ok, ftsize = pcall(Freetype.newFaceSize, path, size)
     if not ok or not ftsize then
@@ -232,6 +257,9 @@ function FaceFactory:_buildFace(path, size, embolden_factor)
     if embolden_factor then
         hash = string.format("%s|emb%.3f", hash, embolden_factor)
     end
+    if is_real_bold then
+        hash = hash .. "|realbold"
+    end
     local face_obj = {
         orig_font = path,
         realname = path,
@@ -239,7 +267,7 @@ function FaceFactory:_buildFace(path, size, embolden_factor)
         orig_size = size,
         ftsize = ftsize,
         hash = hash,
-        is_real_bold = false,
+        is_real_bold = is_real_bold == true,
         embolden_half_strength = half,
         synth_bold = half ~= nil,
         hb_features = { "+kern", "+liga" },
@@ -313,7 +341,7 @@ end
 --- @param doc_font_name string|nil document font name (nil -> Noto Sans family)
 --- @param size number DPI-scaled base size (i.e. doc_font_size)
 --- @param variant string key of VARIANTS
---- @param bold_level number|nil 0..3, see resolveBoldLevel
+--- @param bold_level number|nil 0/1/2, see resolveBoldLevel
 function FaceFactory:getFace(doc_font_name, size, variant, bold_level)
     variant = variant or "content"
     bold_level = tonumber(bold_level) or 0
@@ -326,25 +354,30 @@ function FaceFactory:getFace(doc_font_name, size, variant, bold_level)
     local face
 
     local paths = self:getFontPaths(doc_font_name)
-    local regular, italic
+    local regular, italic, bold_path
     for _, fp in ipairs(paths) do
-        -- 仿粗统一走常规字形：cre 的「加粗」是 500（中等），换成真粗体会过重
-        if not fp.bold then
-            if fp.italic then
-                if not italic then italic = fp.path end
-            elseif not regular then
-                regular = fp.path
-            end
+        if fp.bold then
+            -- 字体自带的粗体文件（700）：字重 +3 时直接用，和正文完全一致
+            if not fp.italic and not bold_path then bold_path = fp.path end
+        elseif fp.italic then
+            if not italic then italic = fp.path end
+        elseif not regular then
+            regular = fp.path
         end
     end
 
     local prefer_italic = variant == "quote"
     local path = prefer_italic and (italic or regular) or (regular or italic)
-    local synth = bold_level > 0
+    -- 档 3 = cre 的 700：换真粗体文件，不叠仿粗（否则会双重加粗）
+    local use_real_bold = bold_level >= 3 and bold_path ~= nil
+    if use_real_bold then
+        path = bold_path
+    end
+    local synth = bold_level > 0 and not use_real_bold
     local factor = synth and SYNTH_BOLD_FACTORS[bold_level >= 2 and 2 or 1] or nil
 
     if path then
-        face = self:_buildFace(path, v_size, factor)
+        face = self:_buildFace(path, v_size, factor, use_real_bold)
         if face then
             self:_addFallbacks(face, v_size, factor)
         end

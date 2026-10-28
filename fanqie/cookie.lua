@@ -15,21 +15,6 @@ function Cookie.parse_cookie_header(header)
     return cookies
 end
 
-function Cookie.extract_from_curl(curl)
-    if not curl or curl == "" then
-        return "", nil
-    end
-
-    local cookie = curl:match("%-H%s+['\"][Cc]ookie:%s*(.-)['\"]")
-        or curl:match("%-b%s+['\"](.-)['\"]")
-        or curl:match("%-%-cookie%s+['\"](.-)['\"]")
-    local data = curl:match("%-%-data%-raw%s+['\"](.-)['\"]")
-        or curl:match("%-%-data%s+['\"](.-)['\"]")
-        or curl:match("%-d%s+['\"](.-)['\"]")
-
-    return cookie or curl, data
-end
-
 function Cookie.to_header(cookies)
     local parts = {}
     for key, value in pairs(cookies or {}) do
@@ -84,16 +69,6 @@ function Cookie.merge_set_cookie(cookies, set_cookie)
         end
     end
     return cookies
-end
-
-function Cookie.has_login_cookie(cookies)
-    if not cookies then return false end
-    for key in pairs(cookies) do
-        if cookies[key] and #tostring(cookies[key]) >= 8 then
-            return true
-        end
-    end
-    return false
 end
 
 return Cookie
