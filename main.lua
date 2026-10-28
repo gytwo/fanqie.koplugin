@@ -2372,21 +2372,35 @@ function FanQiePlugin:showBookList(books, opts)
         UIManager:close(self.book_list_menu)
         self.book_list_menu = nil
     end
+
     local cover_cache_dir = self.settings:get_download_dir() .. "/covers"
     if H then H.make_dir(cover_cache_dir) end
     for _i, book in ipairs(books) do
         if book.cover then
-            local cover_filename = string.gsub(book.title, "[/\\:%*%?\"<>|]", "_") .. ".jpg"
-            local cover_path = cover_cache_dir .. "/" .. cover_filename
-            if H.file_exists(cover_path) then book.cover_path = cover_path end
+            -- 命名规则统一交给 cover_cache：新名 <book_id>.jpg，
+            -- 找不到时回退旧名 <书名>.jpg（兼容已下载的旧缓存）
+            local cover_path = CoverCache and CoverCache.find(self.settings, book) or nil
+            if cover_path then
+                book.cover_path = cover_path
+            end
         end
     end
+
     local on_select = opts.on_select_override or function(book)
         self:_cancelCoverLoading()
         self:showBookDetail(book)
     end
+
     local ShelfView = require("fanqie.shelf_view")
-    self.book_list_menu = ShelfView.show{
+    -- ⚠️ 合并残留修复：原来这里是
+    --     self.book_list_menu = ShelfView.show{ ... }      -- 第一次 show
+    --     self._shelf_opts = shelf_opts                    -- shelf_opts 未定义 = nil
+    --     self.book_list_menu = ShelfView.show(shelf_opts) -- show(nil) 必崩
+    -- 第二次 show 用的是从未定义的 local，ShelfView.show(nil) 内部
+    -- 对 opts 取字段直接抛 "attempt to index a nil value"，
+    -- 整个 showBookList 中断 → 书架永远画不出来（空白）。
+    -- 正确做法：先构造 shelf_opts 这个 local table，只 show 一次。
+    local shelf_opts = {
         title = opts.title or _("番茄书架"),
         books = books,
         show_covers = true,
