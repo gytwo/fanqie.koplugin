@@ -381,7 +381,7 @@ function ThoughtPopupWidget:_startImageDownloads()
     end
     -- 只有真加了任务才出声：用来在设备日志里区分「增量补队」和「重复重下」
     if added > 0 and Log and Log.info then
-        Log.info("[段评] 配图排队 +%d，待下 %d", added, #self._img_queue)
+        Log.info("[段评] 配图排队 +" .. tostring(added) .. "，待下 " .. tostring(#self._img_queue))
     end
     if self._img_running or #self._img_queue == 0 then return end
 
