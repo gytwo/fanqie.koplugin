@@ -88,10 +88,23 @@ function ZhiQiu.get_content(client, settings, book_id, item_id, opts)
     end
 
     local url = base .. "/novel/chap?" .. table.concat(q, "&")
-    local text, code = http_get(client, url, {
-        ["x-sec-token"]  = token,
-        ["x-android-id"] = android_id,
-    })
+    local function request_chap(tok, aid)
+        return http_get(client, url, {
+            ["x-sec-token"]  = tok,
+            ["x-android-id"] = aid,
+        })
+    end
+
+    local text, code = request_chap(token, android_id)
+
+    if code == 401 then
+        local ok_mint, new_token = pcall(ZhiQiu.ensure_token, client, settings, true)
+        if ok_mint and new_token and new_token ~= "" then
+            android_id = resolve_android_id(settings)
+            text, code = request_chap(new_token, android_id)
+        end
+    end
+
     if not text or not code then
         error("知秋正文请求失败（网络错误）")
     end
@@ -394,6 +407,33 @@ function ZhiQiu.is_configured(cfg)
     local pw2 = H.trim(cfg.group_id or "")
     local pw3 = H.trim(cfg.temp_token_pass or "")
     return pw1 ~= "" and pw2 ~= "" and pw3 ~= ""
+end
+
+-- 知秋搜索：GET {base}/{type}/search?keyword=<kw>&page=<n>
+-- 返回 data 数组：{ { title, author, cover, intro, type, last_chapter_title, word_number, book_id }, ... }
+-- type 取值：novel（小说）/ comic（漫画）/ audio（听书）/ video（短剧），默认 novel。
+function ZhiQiu.search(client, settings, keyword, opts)
+    opts = opts or {}
+    local cfg = settings:get_source("zhiqiu") or {}
+    local base = H.trim(cfg.server_url or ZhiQiu.DEFAULT_BASE)
+    if base:sub(-1) == "/" then base = base:sub(1, -2) end
+    local token = H.trim(cfg.token or "")
+    if token == "" then token = ZhiQiu.ensure_token(client, settings, false) end
+    if token == "" then error("知秋 Token 未配置") end
+    local aid = ZhiQiu.resolve_android_id(settings)
+    local type_ = opts.type_ or "novel"
+    local url = base .. "/" .. type_ .. "/search?keyword=" .. H.url_encode(keyword)
+        .. "&page=" .. tostring(opts.page or 1)
+    local text, code = http_get(client, url, {
+        ["x-sec-token"]  = token,
+        ["x-android-id"] = aid,
+    })
+    if not text or not code or code < 200 or code >= 300 then
+        error("知秋搜索失败: HTTP " .. tostring(code or "nil"))
+    end
+    local ok, obj = pcall(function() return client:json_decode(text) end)
+    if not ok or type(obj) ~= "table" then error("知秋搜索响应非 JSON") end
+    return obj.data or {}
 end
 
 return ZhiQiu

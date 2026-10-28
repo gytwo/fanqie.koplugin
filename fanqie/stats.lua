@@ -27,8 +27,10 @@ end
 -- 取倒数第二段作为 book_id（与 Content.book_cache_dir 的构造方式一致）
 local function book_id_from_path(file_path)
     if not is_str(file_path) then return nil end
-    local book_id = file_path:match("/([^/]+)/[^/]+$")
-    if not book_id or book_id == "" then return nil end
+    local folder = file_path:match("/([^/]+)/[^/]+$")
+    if not folder or folder == "" then return nil end
+    -- 目录名可能是 title-id 或纯 id，取最后一段纯数字作为 book_id
+    local book_id = folder:match("(%d+)$") or folder
     return book_id
 end
 

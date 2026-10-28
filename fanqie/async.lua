@@ -164,7 +164,7 @@ function Async.run(work_func, on_done, opts)
         return run_sync(work_func, on_done, delay)
     end
 
-    local handle = { pid = pid, fd = parent_read_fd, _cancelled = false }
+    local handle = { pid = pid, fd = parent_read_fd, _cancelled = false, _done = false }
     local start_clock = os.time()
 
     -- on_done 只允许到达一次：poll 异常收口与正常收口可能同时命中
@@ -179,7 +179,10 @@ function Async.run(work_func, on_done, opts)
     -- 终止并清理子进程（避免僵尸），fd 也一并关闭。
     local function cleanup(pid_ref, fd_ref)
         if fd_ref then
-            pcall(ffiutil.readAllFromFD, fd_ref)
+            pcall(function()
+                local ffi_c = require("ffi")
+                ffi_c.C.close(fd_ref)
+            end)
         end
         if pid_ref and not ffiutil.isSubProcessDone(pid_ref) then
             pcall(ffiutil.terminateSubProcess, pid_ref)

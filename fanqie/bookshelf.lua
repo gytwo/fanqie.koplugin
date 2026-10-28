@@ -6,6 +6,9 @@ local ok_device, device = pcall(require, "device")
 local Screen = ok_device and device.screen or nil
 local ok_UIManager, UIManager = pcall(require, "ui/uimanager")
 local ok_Menu, Menu = pcall(require, "ui/widget/menu")
+local ok_InfoMessage, InfoMessage = pcall(require, "ui/widget/infomessage")
+local ok_Notification, Notification = pcall(require, "ui/widget/notification")
+local ok_ConfirmBox, ConfirmBox = pcall(require, "ui/widget/confirmbox")
 local ok_InputDialog, InputDialog = pcall(require, "ui/widget/inputdialog")
 
 local ok_H, H = pcall(require, "fanqie.helper")
@@ -249,7 +252,7 @@ function Bookshelf:showBookshelf(opts)
                             plugin:_ensureBookNames(result)
                         end
                     end, {
-                        poll_interval = 0.3, timeout = 60,
+                        poll_interval = 0.3, timeout = 8,
                         on_cancel = function()
                             plugin:closeBusy()
                             set_refreshing(false)
@@ -266,7 +269,10 @@ function Bookshelf:showBookshelf(opts)
     -- 获取成功后 save_shelf_cache 覆盖旧缓存；失败时回退到旧缓存
     if not self:checkNetwork() then
         if force_refresh and fallback_to_cache() then
-            self:showInfo(_("无网络，显示缓存数据"))
+            UIManager:show(Notification:new{
+                text = _("无网络，仅显示缓存"),
+                timeout = 2,
+            })
             return
         end
         self:showError(_("无网络且无书架缓存，请先联网获取书架"))
@@ -382,7 +388,14 @@ function Bookshelf:get_shelf(force_refresh)
                 cover = FanQie.mobile_cover(raw_cover) or raw_cover
             end
             local book = {
-                book_id = item.book_id or item.bookId or item.id,
+                book_id = (function()
+                    local v = item.book_id or item.bookId or item.id
+                    if type(v) == "number" then
+                        -- 大整数 book_id 转 string 时防精度丢失
+                        return string.format("%.0f", v)
+                    end
+                    return tostring(v or "")
+                end)(),
                 -- ⚠️ book_name 必须是第一优先，**不能**改成 title 优先。
                 -- multidetail 的 detail_list 每项是「书 + 最近阅读位置」的混合结构
                 -- （同项还带 latest_read_item_id / index / read_progress），其中的
@@ -397,6 +410,7 @@ function Bookshelf:get_shelf(force_refresh)
                 item_id = item.item_id or item.itemId,
                 total_chapters = total_chapters,
                 read_chapters = read_chapters,
+                _fanqie_sync = true,   -- 书架书才同步番茄进度
             }
             if book.book_id then
                 table.insert(books, book)
