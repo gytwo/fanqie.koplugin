@@ -909,9 +909,6 @@ local function _normParaRichItems(comments, abstract, supports_replies)
                 -- 不按 id 去重就会出现同一条评论连着两份。
                 comment_id = comment.comment_id,
             }
-            if has_image then
-                item.image_data_list = img
-            end
             if supports_replies then
                 item.reply_count = tonumber(comment.reply_count) or 0
                 item.can_replies = true
