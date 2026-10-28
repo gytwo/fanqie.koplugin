@@ -73,10 +73,69 @@ local function sanitize(seg)
     return (tostring(seg or ""):gsub("[/\\:%*%?\"<>|]", "_"))
 end
 
---- 单本书的图片目录：<base>/<book_id>
+--- 单本书的图片目录：<base>/<书名-id>。
+--- 按末尾数字 id 查找已有目录（不管它叫「书名-id」还是纯 id），有就复用；
+--- 没有就新建，名字用「书名-id」，书名过长截断。
 function M.dir(settings, book_id)
-    if book_id == nil or tostring(book_id) == "" then return nil end
-    return M.base(settings) .. "/" .. sanitize(book_id)
+    if book_id == nil then return nil end
+    local base = M.base(settings)
+    local s = tostring(book_id)
+    local num = s:match("(%d+)$")
+    if not num then return nil end
+
+    -- 按 id 找已有目录（entry == id 或末尾 -id），有就复用
+    local L = fs()
+    if L and L.dir then
+        local ok, iter, obj = pcall(L.dir, base)
+        if ok then
+            for name in iter, obj do
+                if type(name) == "string" and name ~= "." and name ~= ".." then
+                    if name == num or name:sub(-(#num + 1)) == "-" .. num then
+                        return base .. "/" .. name
+                    end
+                end
+            end
+        end
+    end
+
+    -- 没有就新建：书名复用 content.lua 的 basename_safe（已截断到 10 字符）
+    local title = s:match("^(.+)%-%d+$")
+    if not title then
+        local ok_bn, BookNames = pcall(require, "fanqie.book_names")
+        if ok_bn and BookNames and BookNames.get then
+            local ok, name = pcall(BookNames.get, settings, num)
+            if ok and type(name) == "string" and name ~= "" then title = name end
+        end
+    end
+    if not title then
+        local ok_bs, Bookshelf = pcall(require, "fanqie.bookshelf")
+        if ok_bs and Bookshelf and Bookshelf.find_book_meta then
+            local ok, meta = pcall(Bookshelf.find_book_meta, num, settings)
+            if ok and type(meta) == "table" and meta.title and meta.title ~= "" then
+                title = meta.title
+            end
+        end
+    end
+    if not title then return base .. "/" .. num end
+
+    -- 复用 content.lua 的 basename_safe：替换非法字符 + 截断到 10 字符
+    local ok_c, Content = pcall(require, "fanqie.content")
+    local safe
+    if ok_c and Content and Content._basename_safe then
+        safe = Content._basename_safe(title)
+    else
+        -- basename_safe 目前是 content.lua 的 local，没导出。
+        -- 用同样的规则内联一份（与 content.lua 保持一致）。
+        safe = tostring(title or "")
+            :gsub("[/\\:%*%?\"<>|]", "_"):gsub("%c", "")
+            :gsub("^%s+", ""):gsub("%s+$", "")
+            :gsub("^%.+", ""):gsub("%.+$", "")
+        if safe == "" then safe = "fanqie" end
+        local chars = require("util").splitToChars(safe)
+        if #chars > 10 then safe = table.concat(chars, "", 1, 10) end
+    end
+    if safe == "" then safe = "fanqie" end
+    return base .. "/" .. safe .. "-" .. num
 end
 
 --- 确保某本书的图片目录存在（写图前调一次，之后直接用 dir() 拼路径）。
@@ -300,10 +359,10 @@ local function rmdir_tree(path)
     return removed
 end
 
---- 按书架集合清理：删除不在集合内的 <book_id>/ 整个子目录。
--- 判据是集合成员而不是 mtime —— 理由同 cover_cache.prune_orphans：
--- mtime 只在写入时更新，常读的书同样「很旧」。
--- @param book_ids table  书架 book_id 数组（或 set）
+--- 按书架集合清理：删除末尾 id 不在集合里的 <书名-id>/ 整个子目录。
+--- 判据是集合成员而不是 mtime —— 理由同 cover_cache.prune_orphans：
+--- mtime 只在写入时更新，常读的书同样「很旧」。
+-- @param book_ids table  书架 book_id 数组（或 set，元素可以是 book 表）
 -- @return deleted_files, freed_bytes
 function M.prune_orphans(settings, book_ids)
     local L = fs()
@@ -311,7 +370,6 @@ function M.prune_orphans(settings, book_ids)
     if not L or type(L.dir) ~= "function" then return deleted, freed end
     if type(book_ids) ~= "table" then return deleted, freed end
 
-    local keep = {}
     -- 同时接受两种形状：book_id 数组/set，或者书架书目数组（元素是 book 表）。
     local function id_of(v)
         if type(v) == "table" then
@@ -319,11 +377,15 @@ function M.prune_orphans(settings, book_ids)
         end
         return v
     end
+
+    -- keep 集合：末尾纯数字 id（与 M.dir 的查找判据一致）
+    local keep = {}
     for k, v in pairs(book_ids) do
         local id
         if type(k) == "number" then id = id_of(v) else id = id_of(k) end
         if id ~= nil and tostring(id) ~= "" then
-            keep[sanitize(id)] = true
+            local num = tostring(id):match("(%d+)$") or tostring(id)
+            keep[num] = true
         end
     end
     if next(keep) == nil then return deleted, freed end   -- 空集合不动手
@@ -332,13 +394,17 @@ function M.prune_orphans(settings, book_ids)
     local ok, iter, dir_obj = pcall(L.dir, base)
     if not ok or type(iter) ~= "function" then return deleted, freed end
 
+    -- 先列清单再动手：删一半才发现集合不对就来不及了
     local dead = {}
     for name in iter, dir_obj do
-        if type(name) == "string" and not name:match("^%.") and not keep[name] then
-            local path = base .. "/" .. name
-            if is_dir(path) then
-                local st = M.stats(path)
-                dead[#dead + 1] = { path = path, bytes = st.bytes }
+        if type(name) == "string" and not name:match("^%.") then
+            local num = name:match("(%d+)$") or name
+            if not keep[num] then
+                local path = base .. "/" .. name
+                if is_dir(path) then
+                    local st = M.stats(path)
+                    dead[#dead + 1] = { path = path, bytes = st.bytes }
+                end
             end
         end
     end
