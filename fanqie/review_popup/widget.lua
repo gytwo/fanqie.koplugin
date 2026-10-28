@@ -427,15 +427,6 @@ function ThoughtPopupWidget:_startImageDownloads()
     step()
 end
 
---- 图片落盘后重画：页面位图里烤的是旧占位框，必须清掉再让它重绘。
-function ThoughtPopupWidget:_refreshImageArea()
-    if not self._scroll_container then return end
-    self._pages:_freePageBBs()
-    UIManager:setDirty(self, function()
-        return "partial", self._scroll_container.dimen
-    end)
-end
-
 --- 图下载完：只在缓存的页面位图上重画那个 cell，不重建整页。
 --- 只 dirty 那个 cell 的屏幕矩形，屏幕只重画一小块，视觉不闪。
 function ThoughtPopupWidget:_repaintImageCell(url)
@@ -470,26 +461,6 @@ function ThoughtPopupWidget:_repaintImageCell(url)
             end)
         end
     end
-end
-
---- 批量下载时的合并刷新：串行队列里每下一张都整页清缓存重绘，十几张就是
---- 十几次全量重排（电纸书上很贵）。这里把同一窗口内的完成事件攒一次，
---- 最多每 0.35s 重绘一回；点图单独下载时仍走 _refreshImageArea 立即生效。
-function ThoughtPopupWidget:_queueImageRefresh()
-    if self._img_refresh_pending then return end
-    self._img_refresh_pending = true
-    local widget = self
-    -- 定时器不会随弹窗关闭取消：0.35s 后弹窗可能已经不在窗口栈上，
-    -- 再 setDirty 它只是白发一次刷新（严重时容器已被 clear）。
-    -- 用 gen 判断这次 flush 是否还属于同一个弹窗会话。
-    local gen = self._img_gen
-    local function flush()
-        widget._img_refresh_pending = false
-        if gen ~= widget._img_gen then return end
-        if widget._scroll_container then widget:_refreshImageArea() end
-    end
-    local ok = pcall(function() UIManager:scheduleIn(0.35, flush) end)
-    if not ok then flush() end
 end
 
 function ThoughtPopupWidget:onCloseWidget()
