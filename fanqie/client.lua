@@ -526,19 +526,31 @@ function Client:official_app_reset_identity()
     return ok_set and ok_key
 end
 
--- 段评气泡注入（官方 App 协议）。
--- App 正文是 HTML，段落形如 <p idx="N" p_idx="40000"><blk p_idx="N">正文</blk></p>，
--- blk 的 p_idx 正是段评统计（idea/list）用的段落序号。把
--- <comment ident="official:<book>/<item>/<pid>" count="N" /> 插到该段落 </p> 前，
--- 后续交给 content.lua 既有的气泡清洗管线处理。
--- 返回 (注入后的正文, para_reviews)，para_reviews 顺序与气泡序号一致。
+-- 段评气泡注入（官方 App 协议）：把
+-- <comment ident="official:<book>/<item>/<pid>" count="N" /> 插到段落 </p> 前
+-- （blk 的 p_idx 正是段评统计用的段落序号），交给 content.lua 既有气泡管线。
+--- 把段评统计注入正文气泡，并回报「命中率异常」。
+-- 返回 content, para_reviews, anomaly
+--   anomaly = { expected=, injected=, blk_seen=, kind="none"|"partial" }
+-- 为什么要回报：泡泡依赖正文里的 `<blk p_idx="N">` 段落标记。番茄前端一改版
+-- （去掉 blk 或改属性名），气泡会全部消失且**零报错**——用户以为这本书本来
+-- 没段评，插件以为一切正常。这里把静默失效变成一条可查的 WARN。
 local function inject_comment_tags(content, book_id, item_id, stats)
     local para_reviews = {}
     if type(content) ~= "string" or type(stats) ~= "table" then
         return content, para_reviews
     end
+    -- 期望命中段数：stats 里 count > 0 的段
+    local expected = 0
+    for _, info in pairs(stats) do
+        if type(info) == "table" and (tonumber(info.count) or 0) > 0 then
+            expected = expected + 1
+        end
+    end
+    local blk_seen = 0
     local out = content:gsub("(<p%s[^>]*>[%s%S]-</p>)", function(seg)
         local pid = tonumber(seg:match('<blk[^>]*p_idx="(%d+)"'))
+        if pid then blk_seen = blk_seen + 1 end
         local info = pid and stats[pid]
         local n = info and (tonumber(info.count) or 0) or 0
         if n > 0 and not seg:find("<comment", 1, true) then
@@ -549,7 +561,15 @@ local function inject_comment_tags(content, book_id, item_id, stats)
         end
         return seg
     end)
-    return out, para_reviews
+
+    local anomaly = nil
+    local injected = #para_reviews
+    if expected > 0 and injected == 0 then
+        anomaly = { expected = expected, injected = 0, blk_seen = blk_seen, kind = "none" }
+    elseif expected >= 10 and injected * 2 < expected then
+        anomaly = { expected = expected, injected = injected, blk_seen = blk_seen, kind = "partial" }
+    end
+    return out, para_reviews, anomaly
 end
 
 -- 通过番茄 App reading 协议取正文：设备注册 → registerkey → batch_full → 本地解密。
@@ -579,11 +599,19 @@ function Client:official_app_get_content(book_id, item_id, opts)
             stats, stats_err = nil, stats
         end
         if type(stats) == "table" then
-            local ok_inject, content2, reviews = pcall(inject_comment_tags,
+            local ok_inject, content2, reviews, inject_anomaly = pcall(inject_comment_tags,
                 row.content or "", tostring(book_id), tostring(item_id), stats)
             if ok_inject then
                 row.content = content2
                 para_reviews = reviews or {}
+                if inject_anomaly then
+                    -- 命中率异常：大概率是番茄正文结构改版（blk 标记没了/改名了）。
+                    -- 这条 WARN 是「气泡为什么全没了」的唯一线索。
+                    log_warn(string.format(
+                        "[FanQie][official] 段评气泡注入异常(%s)：stats 命中 %d 段，实际注入 %d 个，正文 blk 标记 %d 处 —— 番茄正文结构可能已改版",
+                        tostring(inject_anomaly.kind), inject_anomaly.expected,
+                        inject_anomaly.injected, inject_anomaly.blk_seen))
+                end
             else
                 log_warn("[FanQie][official] 段评气泡注入失败:",
                     tostring(content2))
@@ -784,6 +812,14 @@ end
 -- 与书山段评返回格式一致，main.lua 的 _displayParaReviewDetail 可直接解析。
 function Client:zhiqiu_get_para_review(ident, opts)
     opts = opts or {}
+    -- 知秋的 paragraph_list 只能用 page/size（cursor/offset 参数被服务端忽略，
+    -- 与 reply 接口同源）。服务端返回的 common_list_info.cursor 是**条数偏移**
+    -- （"30" 表示下一屏从第 30 条开始），这里换算成页码。
+    local size = tonumber(opts.size) or 30
+    if size < 1 then size = 30 end
+    local offset = tonumber(tostring(opts.cursor or "0"))
+    if not offset or offset < 0 then offset = 0 end
+    local page = math.floor(offset / size) + 1
     local cfg = self.settings:get_source("zhiqiu")
     local ZhiQiu = require("fanqie.zhiqiu")
     local base = H.trim(cfg.server_url or ZhiQiu.DEFAULT_BASE)
@@ -811,10 +847,17 @@ function Client:zhiqiu_get_para_review(ident, opts)
         error("知秋段评 ident 无效: " .. tostring(ident):sub(1, 80))
     end
 
-    -- 知秋用 page 翻页（不是 cursor/offset）。size 服务端固定 30 条/页，不认。
-    local PAGE     = tonumber(opts.page) or 1
-    local SIZE     = tonumber(opts.size) or 30
-    local PAGE_MAX = tonumber(opts.page_max) or 1
+    local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
+        .. "&cid=" .. H.url_encode(cid)
+        .. "&pid=" .. H.url_encode(pid)
+        .. "&page=" .. tostring(page)
+        .. "&size=" .. tostring(size)
+
+    local ok_logger, logger_mod = pcall(require, "fanqie.logger")
+    if ok_logger and logger_mod then
+        logger_mod.info("[FanQie] 知秋段评请求:", "pid=" .. tostring(pid),
+            "page=" .. tostring(page), "url=" .. url:sub(1, 150))
+    end
 
     local headers = {
         ["User-Agent"]       = FanQie.MOBILE_UA,
@@ -825,17 +868,23 @@ function Client:zhiqiu_get_para_review(ident, opts)
         ["Content-Type"]     = "application/json",
     }
 
+    -- 首屏和续拉的页数上限：opts.page_max 控制，默认 1（只拉一页）。
+    -- 之前这里用的是未定义的 PAGE_MAX，导致 while 直接崩。
+    local page_max = tonumber(opts.page_max) or 1
+    if page_max < 1 then page_max = 1 end
+    -- 每页条数（已被 size 钳制过），用作「本页是否拉满」的判据
+    local page_size = size
+
     local merged = {}
     local last_total, last_has_more = nil, nil
-    local page = PAGE
     local pages_done = 0
-    while pages_done < PAGE_MAX do
+    while pages_done < page_max do
         pages_done = pages_done + 1
         local url = base .. "/novel/comment/paragraph_list?bid=" .. H.url_encode(bid)
             .. "&cid=" .. H.url_encode(cid)
             .. "&pid=" .. H.url_encode(pid)
             .. "&page=" .. tostring(page)
-            .. "&size=" .. tostring(SIZE)
+            .. "&size=" .. tostring(page_size)
 
         local ok_logger, logger_mod = pcall(require, "fanqie.logger")
         if ok_logger and logger_mod then
@@ -872,15 +921,29 @@ function Client:zhiqiu_get_para_review(ident, opts)
             last_has_more = clinfo.has_more
         end
 
-        if #list < SIZE then break end
+        if #list < page_size then break end
         if last_has_more == false then break end
         page = page + 1
     end
 
-    -- cursor 语义：下一页页码。循环里 has_more=true 时已 page=page+1，
-    -- 所以这里直接用 page，不能再 +1（否则会跳过一页）。
-    local has_more_out = (last_has_more == true)
-    local next_page = page
+    -- 知秋服务端不返回 common_list_info.has_more，last_has_more 恒为 nil。
+    -- 用「本次拉到的条数是否达到 page_size」判断是否还有下一页：
+    --   拉满一页 → 可能还有，has_more = true
+    --   不足一页 → 到底了，has_more = false
+    -- 这是分页接口的通用判据，不依赖服务端显式字段。
+    local has_more_out
+    if last_has_more ~= nil then
+        has_more_out = (last_has_more == true)
+    else
+        has_more_out = (#merged > 0 and #merged % page_size == 0)
+    end
+
+    -- cursor 语义必须和入参 opts.cursor 一致，都是「条数偏移」。
+    -- 之前返回的是页码 next_page，load_more 下次传进来被当条数偏移算页码，
+    -- 又回到第 1 页 → 看起来"继续加载没反应"。
+    -- 正确值 = 起始偏移 + 本次拉到的条数。
+    local next_offset = offset + #merged
+
     return {
         code = 0,
         msg = "susscess",
@@ -889,9 +952,107 @@ function Client:zhiqiu_get_para_review(ident, opts)
             common_list_info = {
                 total = last_total or #merged,
                 has_more = has_more_out,
-                cursor = next_page,
+                cursor = next_offset,
             },
         },
+    }
+    end
+
+-- 知秋二级评论（回复列表）：GET {base}/novel/comment/reply?bid=&rid=&page=&size=
+--   → { code:0, data:{ reply_list:[{Common,stat,reply_id,reply_to_comment_id,
+--        reply_to_reply_id,reply_to_user_info,sub_reply}], comment_list_info:{total,has_more,cursor} } }
+--
+-- 分页用 page/size：2026-10-26 实测 cursor / offset 参数被服务端忽略
+-- （page=1&size=20&cursor=2 仍然返回全部 3 条），所以cursor 在这里是**条数偏移**，
+-- 由调用方传进来的 cursor 换算成页码。
+-- 返回 { replies, total, has_more, cursor }，与 official_get_para_replies 同构，
+-- replies 是 Comments.flatten_reply 的扁平结构（Common 大写也认）。
+function Client:zhiqiu_get_para_replies(book_id, comment_id, opts)
+    opts = opts or {}
+    local bid = tostring(book_id or "")
+    local rid = tostring(comment_id or "")
+    if bid == "" or rid == "" then
+        return nil, "缺少书籍或段评 ID"
+    end
+    local cfg = self.settings:get_source("zhiqiu") or {}
+    local ZhiQiu = require("fanqie.zhiqiu")
+    local base = H.trim(cfg.server_url or ZhiQiu.DEFAULT_BASE)
+    if base:sub(-1) == "/" then base = base:sub(1, -2) end
+
+    local token = H.trim(cfg.token or "")
+    if token == "" then
+        token = ZhiQiu.ensure_token(self, self.settings, false)
+    end
+    if token == "" then
+        return nil, "知秋书源未配置共享 Token，无法加载回复"
+    end
+    local android_id = H.trim(cfg.android_id or "")
+    local ok_aid, aid_val = pcall(function() return ZhiQiu.resolve_android_id(self.settings) end)
+    if ok_aid and type(aid_val) == "string" and aid_val ~= "" then android_id = aid_val end
+
+    local size = math.max(1, math.min(tonumber(opts.count) or 20, 50))
+    local offset = math.max(0, math.floor(tonumber(opts.cursor) or 0))
+    local page = math.floor(offset / size) + 1
+
+    local url = base .. "/novel/comment/reply?bid=" .. H.url_encode(bid)
+        .. "&rid=" .. H.url_encode(rid)
+        .. "&page=" .. tostring(page)
+        .. "&size=" .. tostring(size)
+
+    local headers = {
+        ["User-Agent"]      = FanQie.MOBILE_UA,
+        ["x-sec-token"]     = token,
+        ["x-android-id"]    = android_id,
+        ["Accept"]          = "application/json, text/plain, */*",
+        ["Accept-Encoding"] = "identity",
+        ["Content-Type"]    = "application/json",
+    }
+    local ok_req, text, code = pcall(function()
+        return self:request({ url = url, method = "GET", headers = headers, timeout = 15 })
+    end)
+    if not ok_req or not code or code < 200 or code >= 300 then
+        return nil, "知秋回复请求失败: HTTP " .. tostring(code or "nil")
+            .. " " .. tostring(ok_req and "" or text)
+    end
+    local ok_decode, result = pcall(function() return self:json_decode(text) end)
+    if not ok_decode or type(result) ~= "table" then
+        return nil, "知秋回复响应解析失败: " .. tostring(text or ""):sub(1, 160)
+    end
+    if result.code and result.code ~= 0 then
+        return nil, string.format("知秋回复错误: code=%s %s",
+            tostring(result.code), tostring(result.error or result.msg or ""))
+    end
+
+    local data = type(result.data) == "table" and result.data or {}
+    local list = type(data.reply_list) == "table" and data.reply_list or {}
+    local Comments = require("fanqie.reading.comments")
+    local flat = {}
+    for _, item in ipairs(list) do
+        local r = Comments.flatten_reply(item)
+        -- sub_reply 是「回复的回复」内联数组；渲染端是平铺列表，
+        -- 直接按顺序接在后面，避免「点开只有一级」看着缺条。
+        if type(r) == "table" then
+            flat[#flat + 1] = r
+        end
+        local subs = type(item.sub_reply) == "table" and item.sub_reply or {}
+        for _, sub in ipairs(subs) do
+            local sr = Comments.flatten_reply(sub)
+            if type(sr) == "table" then
+                sr.reply_to_user_name = sr.reply_to_user_name
+                    or (type(r) == "table" and r.user_name or nil)
+                flat[#flat + 1] = sr
+            end
+        end
+    end
+    local info = type(data.comment_list_info) == "table" and data.comment_list_info or {}
+    local total = tonumber(info.total) or (#flat + offset)
+    local has_more = info.has_more
+    if has_more == nil then has_more = (offset + #flat) < total end
+    return {
+        replies = flat,
+        total = total,
+        has_more = has_more == true,
+        cursor = offset + #flat,
     }
 end
 

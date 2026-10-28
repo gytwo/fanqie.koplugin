@@ -183,6 +183,18 @@ function M.resolve(file_path, settings)
         return nil
     end
 
+    -- 书名以 App 正式名为准（fanqie/book_names.lua）：书架缓存可能还没刷新，
+    -- 这里再兜一层。统计行靠 md5 定位，改名只是更新显示列，不拆历史。
+    do
+        local ok_bn, BookNames = pcall(require, "fanqie.book_names")
+        if ok_bn and type(BookNames) == "table" and BookNames.get then
+            local ok_n, app_name = pcall(BookNames.get, settings, book_id)
+            if ok_n and is_str(app_name) and app_name ~= "" then
+                book.title = app_name
+            end
+        end
+    end
+
     -- 作者兜底：书架/目录接口都不带作者，唯一可靠来源是书籍详情页
     -- （fanqie/book_meta.lua 抓取并缓存）。有缓存就直接用，没有先留 N/A，
     -- 由 main.lua 在文档就绪后异步抓取并回填统计库。
@@ -318,6 +330,16 @@ local function align_total_pages(id_book, v)
 end
 
 -- 读取库里当前记录的全书页数（降级时保底用，绝不让它被本章页数覆盖）
+-- 当前阅读会话正在使用的 book 行 id。
+-- 合并统计行（book_meta.merge_identity_rows）要把这一行保护起来：删掉它，
+-- KOReader 内存里的 id_curr_book 就会一直指向不存在的行，后续每页统计都
+-- 变成孤儿。返回 nil 表示当前没有会话（或 statistics 未启用）。
+function M.current_book_db_id()
+    local st = M._session
+    if type(st) ~= "table" then return nil end
+    return tonumber(st.id_curr_book)
+end
+
 function M.current_book_pages(id_book)
     if not id_book then return nil end
     return with_db(function(db)
@@ -361,6 +383,12 @@ function M.sync(ui, settings)
     local st = find_statistics(ui)
     if type(st) ~= "table" then return identity end
     if st[M._mark] then return identity end
+
+    -- 记下当前阅读会话的实例：book_meta 合并统计行时必须绕开它正在用的行。
+    -- KOReader 把 id_curr_book 缓存在内存里，行一旦被删，之后每一页的统计都会
+    -- 写向一个不存在的 id —— 2026-10-26 在 Kindle 上抓到的 6 条孤儿就是这么来的
+    -- （改名后 KOReader 用新 title/authors 查不到旧行，另插了一行，随后被合并删掉）。
+    M._session = st
 
     -- 计算并把身份/页数应用到一个 statistics 实例上（initData 与 insertDB 共用）
     local function apply(s, idn)

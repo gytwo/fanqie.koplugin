@@ -274,11 +274,6 @@ function Content.load_cache_index(settings, book_id)
     return index
 end
 
-function Content.verify_cache_path(path)
-    if not path then return false end
-    return H.file_exists(path)
-end
-
 -- Catalog (chapter directory) persistence: saves the full chapter list
 -- so we don't have to re-fetch it from the server every time.
 -- title / cover 为可选参数：首次落盘时若目录不存在，按「title-id」建目录，
@@ -354,19 +349,6 @@ function Content.load_catalog_cache(settings, book_id)
     return catalog
 end
 
-function Content.clear_catalog_cache(settings, book_id)
-    -- 同步清理内存缓存，避免删文件后内存仍返回陈旧数据
-    local ok_state, _state = pcall(require, "fanqie.state")
-    if ok_state and _state and _state.invalidateDirectoryCache then
-        _state.invalidateDirectoryCache(book_id)
-    end
-    local dir = Content.book_cache_dir(settings, book_id)
-    local path = H.join_path(dir, "catalog_cache.lua")
-    if H.file_exists(path) then
-        os.remove(path)
-    end
-end
-
 -- Find a chapter file directly from filesystem, even if cache index is missing
 function Content.find_chapter_file(settings, book_id, item_id)
     local dir = Content.book_cache_dir(settings, book_id)
@@ -376,27 +358,6 @@ function Content.find_chapter_file(settings, book_id, item_id)
         return expected_path
     end
     return nil
-end
-
-function Content.book_resolved_dir(settings, book_id, book)
-    if book and H.is_str(book.cache_dir) and book.cache_dir ~= "" then
-        return book.cache_dir
-    end
-    local function dirname(path)
-        if H.is_str(path) then
-            return path:match("^(.*)/[^/]+$")
-        end
-    end
-    local dir = book and dirname(book.cached_file)
-    if not dir and book and H.is_tbl(book.cached_chapters) then
-        for _i, chapter_path in pairs(book.cached_chapters) do
-            dir = dirname(chapter_path)
-            if dir then
-                break
-            end
-        end
-    end
-    return dir or Content.book_cache_dir(settings, book_id)
 end
 
 local function filename_safe(value)
@@ -426,14 +387,14 @@ local function media_type_for(data)
     return ".bin", "application/octet-stream"
 end
 
--- Public wrapper: returns (ext, media_type) only for valid image data, else nil
+--- 根据图片数据头返回扩展名（.png / .jpg / .gif / .webp / .bin）。
+--- 供 save_catalog_cache 等调用方使用；内部复用 media_type_for 的第一个返回值。
+--- 数据为空或不是图片时返回 nil，调用方自行兜底（通常是 ".jpg"）。
 function Content.detect_image_type(data)
-    if type(data) ~= "string" or #data < 12 then return nil end
-    local ext, mt = media_type_for(data)
-    if mt and mt:match("^image/") then
-        return ext, mt
-    end
-    return nil
+    if type(data) ~= "string" or #data < 4 then return nil end
+    local ext = media_type_for(data)
+    if ext == ".bin" then return nil end
+    return ext
 end
 
 local function xml_escape(value)
@@ -536,18 +497,6 @@ function Content.decode_pua_content(content)
         ::continue::
     end
     return table.concat(result)
-end
-
-function Content.strip_html(html)
-    if not html then return "" end
-    html = html:gsub("<br%s*/?>", "\n"):gsub("</p%s*>", "\n")
-    html = html:gsub("</div%s*>", "\n"):gsub("</h[1-6]%s*>", "\n")
-    html = html:gsub("<[^>]+>", ""):gsub("&nbsp;", " ")
-    html = html:gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
-    html = html:gsub("&quot;", "\""):gsub("&#39;", "'")
-    html = html:gsub("&ldquo;", "\u{201C}"):gsub("&rdquo;", "\u{201D}")
-    html = html:gsub("&hellip;", "\u{2026}"):gsub("&mdash;", "\u{2014}"):gsub("&ndash;", "\u{2013}")
-    return html
 end
 
 local function utf8_char(code)
@@ -922,20 +871,6 @@ function Content.clean_chapter_content(raw_content, title)
     return result
 end
 
-function Content.txt_to_xhtml(text)
-    text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
-    local parts = {}
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        line = line:match("^(.-)%s*$") or ""
-        if line ~= "" then
-            table.insert(parts, "<p>" .. xml_escape(line) .. "</p>")
-        end
-    end
-    return '<?xml version="1.0" encoding="utf-8"?>\n'
-        .. '<html xmlns="http://www.w3.org/1999/xhtml"><head><title></title></head>\n'
-        .. '<body>\n' .. table.concat(parts, "\n") .. '\n</body></html>'
-end
-
 -- 确保 itemId/bookId 等大整数ID始终为字符串，防止 Lua number 精度丢失
 -- 返回: (string_id, was_numeric, precision_lost)
 local function to_precise_id(value)
@@ -1033,14 +968,6 @@ function Content.normalize_chapters(payload, book_id)
         end
     end
     return records
-end
-
-function Content.first_readable_chapter(chapters)
-    for chapter_index, chapter in ipairs(chapters or {}) do
-        if tostring(chapter.title or "") ~= "封面" then
-            return chapter
-        end
-    end
 end
 
 function Content.readable_chapters(chapters)

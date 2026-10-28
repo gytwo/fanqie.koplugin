@@ -38,9 +38,8 @@ local defaults = {
     advanced = {
         developer_logs = false,
     },
-    shelf = {
-        sort_order = "time_desc",
-    },
+    -- 注：原 shelf.sort_order 已删。该设置项全仓从未被消费（排序函数读的是
+    -- 另一个从未被赋值的 _state.shelf_sort_type），属于「能配但不生效」的死配置。
     -- 段评开关（持久化到用户设置，重启后保持）
     para_review_enabled = false,
     download_dir = "",
@@ -405,7 +404,9 @@ function Settings:apply_config(config, options)
     end
 
     if apply_preferences and H.is_tbl(config.shelf) then
-        local shelf = self:get("shelf")
+        -- or {} 兜底：DEFAULTS 里已删 shelf（排序设置是死配置），
+        -- 但老的用户配置文件里可能还带着 shelf 表，取回 nil 时不能索引。
+        local shelf = self:get("shelf") or {}
         if override_existing then
             for key, value in pairs(config.shelf) do
                 shelf[key] = value

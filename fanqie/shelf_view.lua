@@ -366,6 +366,14 @@ end
 -- 网格布局：每页 GRID_COLS x GRID_ROWS 个封面卡。
 -- 可用总高 = item_dimen.h * perpage（Menu 以此反推每页条数），cell_h = 可用总高 / 行数
 function ShelfMenu:updateItems(select_number, no_recalculate_dimen)
+    -- 坏状态兜底：item_table 必须是数组。一旦被写成数字（历史上
+    -- ShelfView.update 用错 switchItemTable 签名就是这么坏的），
+    -- 下面的 self.item_table[index] 会抛错，而这条路径跑在
+    -- UIManager 的按键事件里 —— 插件侧拦不住，只能整机重启。
+    -- 宁可这一帧不重排，也不能把 KOReader 打崩。
+    if type(self.item_table) ~= "table" then
+        return
+    end
     local old_dimen = self.dimen and self.dimen:copy()
     self.layout = {}
     self.item_group:clear()
@@ -476,18 +484,30 @@ function ShelfView.show(opts)
     return menu
 end
 
--- 动态更新书架菜单内容（不关闭重开，避免闪烁）
--- 刷新数据回来后直接 switchItemTable 更新，保持当前页
+-- 动态更新书架菜单内容（不关闭重开，避免闪烁；保持当前页）
+--
+-- ⚠️ 这里**不要**改用 Menu:switchItemTable。它的签名是
+--     switchItemTable(new_title, new_item_table, itemnumber, itemmatch, new_subtitle)
+--   第一个参数是**标题**，不是 item_table。2026-10-26 按「(items, 页码索引, true)」
+--   调用，结果 self.item_table 被写成 number；紧接着外层 pcall 把内部的比较错误
+--   吞掉，菜单就带着这个坏状态继续活着 —— 用户一按「上一页」，
+--   ShelfMenu:updateItems 里 self.item_table[index] 直接崩掉整个 KOReader。
+--   我们只需要「换数据 + 保持当前页」这两件事，直接改字段比猜签名安全，
+--   也不依赖 KOReader 版本之间 switchItemTable 的参数顺序。
 function ShelfView.update(menu, books, opts)
-    if not menu then return end
+    if type(menu) ~= "table" then return end
     opts = opts or {}
     local items = build_items(books or {}, opts)
-    -- 保持当前页：switchItemTable 第二参数是 item_number（全局索引），不是 page
-    local current_page = menu.page or 1
-    local perpage = menu.perpage or (GRID_COLS * GRID_ROWS)
-    local item_number = (current_page - 1) * perpage + 1
-    if item_number > #items then item_number = 1 end
-    menu:switchItemTable(items, item_number, true)
+    if #items == 0 then return end
+    menu.item_table = items
+    local perpage = tonumber(menu.perpage) or (GRID_COLS * GRID_ROWS)
+    if perpage < 1 then perpage = GRID_COLS * GRID_ROWS end
+    local max_page = math.max(1, math.ceil(#items / perpage))
+    local page = tonumber(menu.page) or 1
+    if page > max_page then page = max_page end
+    if page < 1 then page = 1 end
+    menu.page = page
+    menu:updateItems(1, true)
 end
 
 return ShelfView

@@ -604,6 +604,16 @@ function Comments.normalize_images(images)
                     or (type(im.thumb_nails) == "table"
                         and type(im.thumb_nails[1]) == "table"
                         and im.thumb_nails[1].dynamic_url)
+                -- ⚠️ 本地补丁（非上游）：书山聚合的段评图只给 `web_uri` 一个字段，
+                -- 值与 web_url 同为完整 https 地址。上游只认 web_url/dynamic_url/url，
+                -- 单独一个 web_uri 会让书山段评的图**全部静默丢失**（2026-10-26 实测）。
+                -- 只接受绝对地址：web_uri 在某些接口里是相对 uri（不含协议），
+                -- 那种情况宁可返回 0 条图，也不要拼出坏链让下载层反复重试。
+                if (not url or url == "")
+                    and type(im.web_uri) == "string"
+                    and im.web_uri:match("^https?://") then
+                    url = im.web_uri
+                end
                 if url and url ~= "" then
                     local ext = image_ext(url)
                     local unsupported = (ext and IMAGE_EXT_UNSUPPORTED[ext] == true) or false

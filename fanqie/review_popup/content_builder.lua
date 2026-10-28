@@ -58,22 +58,20 @@ local function grayForLevel(level)
     return GRAY_LEVELS[level] or Blitbuffer.COLOR_GRAY_5
 end
 
---- Apply the contrast delta to a base gray level. Level 0 is pure black and
---- 15 the lightest, so a positive delta (higher contrast) darkens the text
---- linearly and a negative delta lightens it. The maximum delta (9) pushes
---- every block down to pure black.
-local function adjustedGray(level, contrast)
-    local delta = tonumber(contrast) or 0
-    return grayForLevel(level - delta)
-end
-
---- 阅读器的「对比度」(font_gamma) 为负时正文不再纯黑。cre 的 gamma 只作用于
---- crengine 自己的字形栅格，弹框这套自绘字体读不到，只能在字色上近似；
---- 正 gamma 表现为笔画变粗，由 face_factory 的仿粗档位负责。
+--- 阅读器的「对比度」低于标准（gamma < 1.0）时正文不再是纯黑。cre 的 gamma
+--- 只作用于 crengine 自己的字形栅格，弹框这套自绘字体读不到，只能在字色上近似；
+--- 高于标准则表现为笔画变粗，由 face_factory 的仿粗档位负责。
+--- 传入的是**换算后的 gamma 值**（1.0 = 标准），不是设置里的索引。
+--- 基准用 1 档(#11)而不是纯黑：同样的字重下，纯黑在墨水屏上比正文更「实」，
+--- 略淡一档的观感才和正文齐平。
+local BODY_BASE_LEVEL = 1
 local function textColorForGamma(gamma)
-    local g = tonumber(gamma) or 0
-    if g >= 0 then return Blitbuffer.COLOR_BLACK end
-    return grayForLevel(math.min(4, math.floor(-g * 4 + 0.5)))
+    local g = tonumber(gamma) or 1
+    -- 标准对比度：纯黑，与正文一致（weread 的想法弹窗也是纯黑）。
+    if g >= 0.95 then return Blitbuffer.COLOR_BLACK end
+    -- 对比度调低时正文笔画变细。弹框这条自建渲染链只能改字色，
+    -- 改多了就整片发虚（0.8 就灰成 #33 是明显过头），所以最多淡一档。
+    return grayForLevel(BODY_BASE_LEVEL)
 end
 
 --- UTF-8-safe truncation with an ellipsis suffix.
@@ -195,6 +193,17 @@ function ContentBuilder.build(items, opts)
     end
 
     for item_index, item in ipairs(items) do
+        -- 一级评论之间加分隔线（与自己的回复树之间、回复彼此之间不加）：
+        -- 只有新的一条一级评论开始前才插。间距全交给 separator，
+        -- 所以下面 meta 不再设 spacing_before（否则双重叠加显得过松）。
+        if item_index > 1 then
+            blocks[#blocks + 1] = {
+                kind = "separator",
+                fg = grayForLevel(10),   -- 灰阶约 #AAA
+                spacing_before = 0.54,
+                spacing_after = 0.54,
+            }
+        end
         -- 一级评论的作者行用中点（与点赞数前的分隔点同一个字符），名字前后
         -- 各一个点：`· 张三 · ♥ 2`。下面「▸ 展开 N 条回复」仍用三角：
         -- 两者符号相同会让读者分不清哪行是作者、哪行是可点的开关。
@@ -209,7 +218,6 @@ function ContentBuilder.build(items, opts)
             variant = "meta",
             text = meta,
             fg = grayForLevel(5),
-            spacing_before = item_index > 1 and 0.45 or nil,
             spacing_after = 0.18,
         }
 
@@ -223,11 +231,22 @@ function ContentBuilder.build(items, opts)
             }
         end
 
+        -- 段评配图：纯图评论（无文字）也会走到这里 —— 归一层已放开「必须有文字」
+        -- 的判据，否则这类图整个被丢弃。
+        if type(item.pics) == "table" and #item.pics > 0 then
+            blocks[#blocks + 1] = {
+                kind = "image",
+                pics = item.pics,
+                item_index = item_index,
+                spacing_before = 0.2,
+                spacing_after = 0.2,
+            }
+        end
+
         -- ── 二级评论（官方源）──────────────────────────────────────────
-        -- 入口单独占一行且可点（弹窗整体是「点左/右半屏翻页」，所以不能把
-        -- 整条评论做成开关，否则翻页就没了）。展开后回复按接口顺序平铺，
-        -- 用「回复 @某人」表达层级：接口里 sub_reply 恒空，层级只靠
-        -- reply_to_reply_id，平铺展示不会丢条，也不会无限缩进。
+        -- 入口单独占一行且可点。展开后回复按接口顺序平铺，用「回复 @某人」
+        -- 表达层级：接口里 sub_reply 恒空，层级只靠 reply_to_reply_id，
+        -- 平铺展示不会丢条，也不会无限缩进。
         if item.can_replies and (tonumber(item.reply_count) or 0) > 0 then
             local reply_count = tonumber(item.reply_count) or 0
             local toggle_text
@@ -238,10 +257,8 @@ function ContentBuilder.build(items, opts)
             else
                 toggle_text = "▸ 展开 " .. tostring(reply_count) .. " 条回复"
             end
-            -- ⚠️ 不用 `cond and nil or x`：Lua 里 X 为 nil 时该表达式恒得 x，
-            --    会让「加载中」的行仍然可点（点下去重复发请求）。
-            local toggle_action = "toggle_replies"
-            if item.replies_loading then toggle_action = nil end
+            -- 加载中不挂 action：piece.action 为空即不可点，避免重复发请求
+            local toggle_action = not item.replies_loading and "toggle_replies" or nil
             blocks[#blocks + 1] = {
                 kind = "paragraph",
                 variant = "reply_toggle",
@@ -284,6 +301,19 @@ function ContentBuilder.build(items, opts)
                             item_index = item_index,
                         }
                     end
+                    -- 二级回复也可能带图（实测书山内联回复里就有，纯表情+图很常见）。
+                    -- 纯图回复 rtext 为空，只有这段能把它显示出来；缩进 1 级与
+                    -- 回复正文对齐，宽度同步收窄（见 pages.lua 的 image 分支）。
+                    if type(reply.pics) == "table" and #reply.pics > 0 then
+                        blocks[#blocks + 1] = {
+                            kind = "image",
+                            pics = reply.pics,
+                            item_index = item_index,
+                            indent_level = 1,
+                            spacing_before = 0.12,
+                            spacing_after = 0.06,
+                        }
+                    end
                 end
 
                 if item.replies_more then
@@ -299,8 +329,7 @@ function ContentBuilder.build(items, opts)
                     if item.replies_loading then
                         more_text = "… 正在加载更多回复…"
                     end
-                    local more_action = "more_replies"
-                    if item.replies_loading then more_action = nil end
+                    local more_action = not item.replies_loading and "more_replies" or nil
                     blocks[#blocks + 1] = {
                         kind = "paragraph",
                         variant = "reply_toggle",
