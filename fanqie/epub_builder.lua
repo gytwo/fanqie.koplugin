@@ -39,7 +39,18 @@ end
 -- 提取 body 并剥掉所有段评痕迹
 local function clean_chapter_body(html)
     if not html then return "" end
-    local body = html:match("<body[^>]*>([%s%S]*)</body>") or html
+    -- 用 find 定位 <body...> 和 </body>，避免 match 贪婪匹配被正文里的
+    -- 畸形标签/嵌套 <body> 干扰导致只取到一小段。
+    local body = html
+    local open_s, open_e = html:find("<body[^>]*>")
+    if open_s then
+        local close_s = html:find("</body>", open_e + 1, true)
+        if close_s then
+            body = html:sub(open_e + 1, close_s - 1)
+        else
+            body = html:sub(open_e + 1)
+        end
+    end
     body = body:gsub("<[cC][oO][mM][mM][eE][nN][tT][^>]*/?>", "")
     body = body:gsub("</[cC][oO][mM][mM][eE][nN][tT]%s*>", "")
     body = body:gsub('<a[^>]-class="para%-comment"[^>]*>.-</a>', "")
@@ -364,6 +375,9 @@ function EpubBuilder.build(settings, book, chapters, opts)
             -- 先落到局部变量再写，写完立刻置 nil，让 XHTML 字符串尽早可回收
             local xhtml = build_chapter_xhtml(title, body)
             body = nil
+print("[epub-debug] chapter " .. i
+    .. " body_len=" .. tostring(xhtml and #xhtml or -1)
+    .. " has_case=" .. tostring(xhtml and xhtml:find("六、案例分析题") ~= nil))  -- 加这行
             write_entry("OEBPS/" .. fname, xhtml)
             xhtml = nil
             -- 每 20 章显式推一次 GC（step 不阻塞，比 full 温和）
