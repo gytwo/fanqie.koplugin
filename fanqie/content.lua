@@ -535,11 +535,10 @@ function Content.clean_chapter_content(raw_content, title)
     local content = raw_content
 
     -- 移除不可见字符（零宽空格、BOM、软连字符、双向控制符等，聚合源广告中大量掺杂）
-    -- U+200B-200F, U+2028-202E, U+FEFF, U+00AD
-    content = content:gsub("\226\128[\139\140\141\142\143]", "")  -- U+200B-200F 零宽空格/方向标记
-    content = content:gsub("\226\128[\168\169\170\171\172\173\174]", "")  -- U+2028-202E 行/段分隔符与双向控制符
-    content = content:gsub("\194\173", "")  -- U+00AD 软连字符
-    content = content:gsub("\239\187\191", "")  -- U+FEFF BOM
+    content = content:gsub("\226\128[\139\140\141\142\143]", "")
+    content = content:gsub("\226\128[\168\169\170\171\172\173\174]", "")
+    content = content:gsub("\194\173", "")
+    content = content:gsub("\239\187\191", "")
 
     -- Remove unwanted elements but preserve <img> and <comment> tags
     content = content:gsub("<header[^>]->[%s%S]-</header>", "")
@@ -553,9 +552,7 @@ function Content.clean_chapter_content(raw_content, title)
         content = body_match
     end
 
-    -- 移除末尾广告：部分聚合源广告以 📣 或 "本书源" 开头
-    -- 广告可能跨多行，从起始标志到内容结尾全部删除
-    -- 📣 = U+1F4E3 = F0 9F 93 A3
+    -- 移除末尾广告
     local ad_start = nil
     local qt_ad = content:find("\240\159\147\163", 1, true)  -- 📣
     local dl_ad = content:find("本书源", 1, true)
@@ -565,14 +562,11 @@ function Content.clean_chapter_content(raw_content, title)
         content = content:sub(1, ad_start - 1)
     end
 
-    -- 段评气泡生成（全局占位符方案）
-    -- <comment> 可能在 <p> 内部，直接处理会被 strip_tags 当普通标签删掉 → 气泡永不出现。
-    -- 所以先换成占位符 \001CMTN\001（不含 <>&" 等字符），穿过整条清洗流程后再还原。
-    local comment_bubbles = {}   -- 占位符序号 → 气泡 HTML
+    -- 段评气泡占位符方案
+    local comment_bubbles = {}
     local comment_count = 0
-    local comment_samples = {}  -- 保留前 3 个 <comment> 原文用于日志诊断
+    local comment_samples = {}
 
-    -- 1. 匹配带 count 的 <comment ident="..." count="..." />
     content = content:gsub('<comment%s+ident="([^"]*)"%s+count="([^"]*)"%s*/?>', function(ident, count)
         comment_count = comment_count + 1
         local idx = comment_count
@@ -580,10 +574,6 @@ function Content.clean_chapter_content(raw_content, title)
         if #comment_samples < 3 then
             table.insert(comment_samples, string.format('<comment ident="%s" count="%s" />', ident:sub(1, 80), count))
         end
-        -- 用 <a href="fanqie-para:N"> 代替 <span onclick>，因为 KOReader 的 crengine
-        -- 不支持 JavaScript onclick 事件，但支持 <a> 链接点击 → 触发 onGotoLink 事件
-        -- href 中的 N 是段评在 para_reviews 表中的序号，插件通过 onGotoLink 拦截
-        -- 超过 99 条显示 99+，避免四位数字气泡过宽
         local n_label = tostring(n)
         if n > 99 then n_label = "99+" end
         comment_bubbles[idx] = string.format(
@@ -592,7 +582,6 @@ function Content.clean_chapter_content(raw_content, title)
         )
         return "\001CMT" .. idx .. "\001"
     end)
-    -- 2. 匹配不带 count 的 <comment ident="..." />
     content = content:gsub('<comment%s+ident="([^"]*)"%s*/?>', function(ident)
         comment_count = comment_count + 1
         local idx = comment_count
@@ -614,9 +603,7 @@ function Content.clean_chapter_content(raw_content, title)
         end
     end
 
-    -- SVG 墨水屏兼容修正：在段落处理前统一处理所有 data:image/svg+xml;base64 图片
-    -- crengine 不支持 rgba()、opacity、stroke-opacity 等半透明属性，
-    -- 会导致 SVG 背景变黑。这里提前解码→修正→重编码。
+    -- SVG 墨水屏兼容修正
     local svg_count_before = 0
     for _ in content:gmatch('data:image/svg%+xml;base64,') do
         svg_count_before = svg_count_before + 1
@@ -628,8 +615,7 @@ function Content.clean_chapter_content(raw_content, title)
         end
     end
 
-    -- 辅助函数：从文本中提取占位符（用于段落之间的 <comment>，已变成占位符）
-    -- 占位符 \001CMTN\001 不含 <>&" ，不会被 strip_tags 删除
+    -- 辅助：提取占位符
     local function extract_placeholders(text)
         local phs = {}
         for ph in text:gmatch("\001CMT%d+\001") do
@@ -638,9 +624,7 @@ function Content.clean_chapter_content(raw_content, title)
         return table.concat(phs, "")
     end
 
-    -- 辅助函数：从文本中提取 <img> 标签（用于段落之间的正文插图 / 神评预览图）
-    -- 这些 <img> 不在任何 <p> 内部（位于 </p> 与下一个 <p> 之间，或正文末尾），
-    -- 若不主动保留，会被下面的段落切分逻辑静默丢弃，导致正文插图被"清洗段评"误删。
+    -- 辅助：提取 <img>
     local function extract_images(text)
         local imgs = {}
         for img in text:gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -649,14 +633,36 @@ function Content.clean_chapter_content(raw_content, title)
         return table.concat(imgs, "")
     end
 
-    -- Extract paragraphs, preserving inline images IN THEIR ORIGINAL ORDER.
-    -- 段落之间的占位符（原 <comment>）提取后追加到段落末尾。
-    -- 段落内部的占位符随文字流自然保留，最终还原为内联气泡。
+    -- 辅助：把一段纯文本（可含 <br>、占位符、零散标签）拆成 <p> 行
+    -- 这是修复的核心：无 <p> 包裹的正文（书山等源）必须走这里才不会丢
+    local function emit_text_lines(text, paragraphs_ref, ph_holder)
+        text = text:gsub("<br%s*/?>", "\n")
+        text = text:gsub("<[^>]+>", "")
+        text = Content.decode_html_entities(text)
+        local lines = {}
+        for line in (text .. "\n"):gmatch("([^\n]+)\n") do
+            line = H.trim(line)
+            if line ~= "" then
+                lines[#lines + 1] = "<p>" .. xml_escape(line) .. "</p>"
+            end
+        end
+        if ph_holder and ph_holder ~= "" then
+            if #lines > 0 then
+                lines[#lines] = lines[#lines] .. ph_holder
+            else
+                lines[#lines + 1] = "<p>" .. ph_holder .. "</p>"
+            end
+        end
+        for _, l in ipairs(lines) do
+            paragraphs_ref[#paragraphs_ref + 1] = l
+        end
+    end
+
     local paragraphs = {}
+    local matched_any_p = false
     local para_regex = "<p[^>]->([%s%S]-)</p>"
     local pos = 1
 
-    -- 图片追踪：统计各位置发现的 <img> 数量，用于诊断"正文插图被清洗"问题
     local img_stats = { before = 0, inner = 0, tail = 0, fallback = 0 }
     local img_before_clean = 0
     for _ in content:gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -665,33 +671,32 @@ function Content.clean_chapter_content(raw_content, title)
 
     while true do
         local start_pos, end_pos, inner = content:find(para_regex, pos)
+        if start_pos then
+            matched_any_p = true
+        end
+
         if not start_pos then
-            -- 没有更多 <p> 标签，处理最后一段残留内容中的 <img> 与占位符
+            -- ===== 修复点 1：tail 分支不再只提取图片，纯文本也要拆成 <p> =====
             local tail = content:sub(pos)
-            local tail_imgs = extract_images(tail)
-            for _ in tail_imgs:gmatch("<[iI][mM][gG][^>]*/?>") do
+            local scan = 1
+            local tail_len = #tail
+            while scan <= tail_len do
+                local img_start, img_end, img_tag = tail:find("(<[iI][mM][gG][^>]*/?>)", scan)
+                local before = img_start and tail:sub(scan, img_start - 1) or tail:sub(scan)
+                local ph_html = extract_placeholders(before)
+                -- 纯文本拆成 <p>
+                emit_text_lines(before, paragraphs, ph_html)
+
+                if not img_start then break end
+                -- 图片单独成段（不包 <p>）
+                table.insert(paragraphs, img_tag)
                 img_stats.tail = img_stats.tail + 1
-            end
-            if tail_imgs ~= "" then
-                if #paragraphs > 0 then
-                    paragraphs[#paragraphs] = paragraphs[#paragraphs] .. tail_imgs
-                else
-                    table.insert(paragraphs, tail_imgs)
-                end
-            end
-            local ph_html = extract_placeholders(tail)
-            if ph_html ~= "" then
-                if #paragraphs > 0 then
-                    paragraphs[#paragraphs] = paragraphs[#paragraphs] .. ph_html
-                else
-                    table.insert(paragraphs, "<p>" .. ph_html .. "</p>")
-                end
+                scan = img_end + 1
             end
             break
         end
 
-        -- 处理 <p> 标签之前的内容（段落之间的 <img> 正文插图/神评预览图 与占位符）
-        -- 段落之间的 <img> 必须主动保留并挂到上一段末尾，否则会被段落切分丢弃
+        -- <p> 之前的内容：保留其中的 <img> 和占位符，文本不丢
         local before_text = content:sub(pos, start_pos - 1)
         local before_imgs = extract_images(before_text)
         for _ in before_imgs:gmatch("<[iI][mM][gG][^>]*/?>") do
@@ -704,17 +709,25 @@ function Content.clean_chapter_content(raw_content, title)
                 table.insert(paragraphs, before_imgs)
             end
         end
-        local ph_html = extract_placeholders(before_text)
+        -- <p> 之间的纯文本（少见但可能存在）也拆成段落
+        local before_ph = extract_placeholders(before_text)
+        local before_plain = before_text:gsub("<[iI][mM][gG][^>]*/?>", "")
+            :gsub("\001CMT%d+\001", "")
+        if before_plain:match("%S") then
+            emit_text_lines(before_plain, paragraphs, before_ph)
+        elseif before_ph ~= "" then
+            if #paragraphs > 0 then
+                paragraphs[#paragraphs] = paragraphs[#paragraphs] .. before_ph
+            else
+                table.insert(paragraphs, "<p>" .. before_ph .. "</p>")
+            end
+        end
 
-        -- Walk through the paragraph, interleaving text snippets with images
-        -- in exactly the order they appear in the source.
-        -- 注意：段落内部的占位符 \001CMTN\001 是纯文本，不会被
-        -- gsub("<[^>]+>","") 删除，会随文字一起进入 parts，最终内联显示。
+        -- 处理 <p> 内部：文字与 <img> 按原顺序交错
         local parts = {}
         local scan = 1
         local inner_len = #inner
         while scan <= inner_len do
-            -- Try to find the next <img ...> or <img .../> tag
             local img_start, img_end, img_tag = inner:find('(<[iI][mM][gG][^>]*/?>)', scan)
             local br_start, br_end, br_tag = inner:find('(<br%s*/?>)', scan)
             local next_tag_start, next_tag_end, next_tag = nil, nil, nil
@@ -729,7 +742,6 @@ function Content.clean_chapter_content(raw_content, title)
             end
 
             if next_tag_start then
-                -- Text before this tag
                 if next_tag_start > scan then
                     local txt = inner:sub(scan, next_tag_start - 1)
                     txt = txt:gsub("<[^>]+>", "")
@@ -747,7 +759,6 @@ function Content.clean_chapter_content(raw_content, title)
                 end
                 scan = next_tag_end + 1
             else
-                -- No more tags; tail text
                 local txt = inner:sub(scan)
                 txt = txt:gsub("<[^>]+>", "")
                 txt = Content.decode_html_entities(txt)
@@ -760,16 +771,15 @@ function Content.clean_chapter_content(raw_content, title)
         end
 
         local para_content = table.concat(parts, "\n")
+        local ph_html = extract_placeholders(inner)
         if para_content ~= "" then
-            -- 检测是否为纯图片段落（去除 img 标签后无文字内容）
-            -- 纯图片段落直接输出 img 标签本身，去掉外层 p，避免 text-indent 缩进
             local stripped = para_content:gsub("<[iI][mM][gG][^>]*/?>", "")
             stripped = stripped:gsub("%s", "")
             local is_img_only = stripped == "" and para_content:find("<[iI][mM][gG]")
             if is_img_only then
                 table.insert(paragraphs, para_content .. ph_html)
             else
-                            table.insert(paragraphs, "<p>" .. para_content .. "</p>" .. ph_html)
+                table.insert(paragraphs, "<p>" .. para_content .. "</p>" .. ph_html)
             end
         elseif ph_html ~= "" then
             table.insert(paragraphs, "<p>" .. ph_html .. "</p>")
@@ -777,65 +787,24 @@ function Content.clean_chapter_content(raw_content, title)
         pos = end_pos + 1
     end
 
-    -- If no <p> tags found, extract text and images directly.
-    -- We walk the content linearly, splitting on newlines AND <img> tags,
-    -- so images appear in their original position relative to the text.
-    if #paragraphs == 0 then
-        local lines = {}
+    -- ===== 修复点 2：全文都没匹配到 <p> 时，整体 fallback（逐行 + 图片） =====
+    -- 注意：tail 分支修好后，正常情况下 paragraphs 已非空；这里作为双保险。
+    if not matched_any_p and #paragraphs == 0 then
         local scan = 1
         local content_len = #content
         while scan <= content_len do
             local img_start, img_end, img_tag = content:find("(<[iI][mM][gG][^>]*/?>)", scan)
-            if not img_start then
-                -- No more images; emit the trailing text
-                local tail = content:sub(scan)
-                local ph_html = extract_placeholders(tail)
-                tail = tail:gsub("<br%s*/?>", "\n")
-                tail = tail:gsub("<[^>]+>", "")
-                tail = Content.decode_html_entities(tail)
-                for line in (tail .. "\n"):gmatch("([^\n]+)\n") do
-                    line = H.trim(line)
-                    if line ~= "" then
-                        table.insert(lines, "<p>" .. xml_escape(line) .. "</p>")
-                    end
-                end
-                if ph_html ~= "" then
-                    if #lines > 0 then
-                        lines[#lines] = lines[#lines] .. ph_html
-                    else
-                        table.insert(lines, "<p>" .. ph_html .. "</p>")
-                    end
-                end
-                break
-            end
-            -- Emit text before the image
-            local before = content:sub(scan, img_start - 1)
+            local before = img_start and content:sub(scan, img_start - 1) or content:sub(scan)
             local ph_html = extract_placeholders(before)
-            before = before:gsub("<br%s*/?>", "\n")
-            before = before:gsub("<[^>]+>", "")
-            before = Content.decode_html_entities(before)
-            for line in (before .. "\n"):gmatch("([^\n]+)\n") do
-                line = H.trim(line)
-                if line ~= "" then
-                    table.insert(lines, "<p>" .. xml_escape(line) .. "</p>")
-                end
-            end
-            if ph_html ~= "" then
-                if #lines > 0 then
-                    lines[#lines] = lines[#lines] .. ph_html
-                else
-                    table.insert(lines, "<p>" .. ph_html .. "</p>")
-                end
-            end
-            -- 直接输出 img 标签本身，不包外层 p
-            table.insert(lines, img_tag)
+            emit_text_lines(before, paragraphs, ph_html)
+            if not img_start then break end
+            table.insert(paragraphs, img_tag)
             img_stats.fallback = img_stats.fallback + 1
             scan = img_end + 1
         end
-        paragraphs = lines
     end
 
-    -- 最终还原：把所有占位符 \001CMTN\001 替换为真实气泡 HTML
+    -- 最终还原占位符为气泡 HTML
     local result = table.concat(paragraphs, "\n")
     local restored_count = 0
     result = result:gsub("\001CMT(%d+)\001", function(idx_str)
@@ -851,7 +820,6 @@ function Content.clean_chapter_content(raw_content, title)
         logger.info(LOG_MODULE, "[段评] 气泡还原: restored=" .. restored_count .. "/" .. comment_count)
     end
 
-    -- 图片追踪汇总：对比清洗前后的 <img> 数量，定位"正文插图被清洗"问题
     if logger then
         local img_after = 0
         for _ in result:gmatch("<[iI][mM][gG][^>]*/?>") do
