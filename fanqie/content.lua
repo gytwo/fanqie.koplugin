@@ -399,6 +399,7 @@ end
 
 local function xml_escape(value)
     value = tostring(value or "")
+    value = value:gsub("[%z\2-\8\11\12\14-\31]", "")
     value = value:gsub("&", "&amp;")
     value = value:gsub("<", "&lt;")
     value = value:gsub(">", "&gt;")
@@ -534,6 +535,9 @@ function Content.clean_chapter_content(raw_content, title)
 
     local content = raw_content
 
+    -- 官方源 <blk> 标签剥除（书山/知秋没有，gsub 不匹配就原样返回）
+    content = content:gsub("<blk[^>]->", ""):gsub("</blk>", "")
+
     -- 脚注链接 <a href="#zhu1" id="zw1">[1]</a> 先转占位符，避免被“裸 < 转义”吃掉
     local footnote_links = {}
     local footnote_count = 0
@@ -543,7 +547,7 @@ function Content.clean_chapter_content(raw_content, title)
         return "\001FN" .. footnote_count .. "\001"
     end)
 
-    -- <sup>...</sup> 和 <sub>...</sub> 也转占位符，避免 <p> 内部处理把 <sup> 当裸 < 转义
+    -- <sup>...</sup> 和 <sub>...</sub> 也转占位符
     local sup_sub_links = {}
     local sup_sub_count = 0
     content = content:gsub('(<[sS][uU][pP][^>]->[%s%S]-</[sS][uU][pP]>)', function(full_tag)
@@ -557,13 +561,13 @@ function Content.clean_chapter_content(raw_content, title)
         return "\001SS" .. sup_sub_count .. "\001"
     end)
 
-    -- 移除不可见字符（零宽空格、BOM、软连字符、双向控制符等，聚合源广告中大量掺杂）
+    -- 移除不可见字符
     content = content:gsub("\226\128[\139\140\141\142\143]", "")
     content = content:gsub("\226\128[\168\169\170\171\172\173\174]", "")
     content = content:gsub("\194\173", "")
     content = content:gsub("\239\187\191", "")
 
-    -- Remove unwanted elements but preserve <img> and <comment> tags
+    -- 移除不需要的元素，保留 <img> 和 <comment>
     content = content:gsub("<header[^>]->[%s%S]-</header>", "")
     content = content:gsub("<script[^>]->[%s%S]-</script>", "")
     content = content:gsub("<style[^>]->[%s%S]-</style>", "")
@@ -746,6 +750,7 @@ function Content.clean_chapter_content(raw_content, title)
 
         -- 处理 <p> 内部：文字与 <img> 按原顺序交错
         -- <a> / <sup> / <sub> 已转占位符，这里只需处理 <img> 和 <br>
+        -- 段评占位符 \001CMTn\001 作为文字保留在 parts 里，末尾统一还原
         local parts = {}
         local scan = 1
         local inner_len = #inner
@@ -801,18 +806,15 @@ function Content.clean_chapter_content(raw_content, title)
         end
 
         local para_content = table.concat(parts, "\n")
-        local ph_html = extract_placeholders(inner)
         if para_content ~= "" then
             local stripped = para_content:gsub("<[iI][mM][gG][^>]*/?>", "")
             stripped = stripped:gsub("%s", "")
             local is_img_only = stripped == "" and para_content:find("<[iI][mM][gG]")
             if is_img_only then
-                table.insert(paragraphs, para_content .. ph_html)
+                table.insert(paragraphs, para_content)
             else
-                table.insert(paragraphs, "<p>" .. para_content .. "</p>" .. ph_html)
+                table.insert(paragraphs, "<p>" .. para_content .. "</p>")
             end
-        elseif ph_html ~= "" then
-            table.insert(paragraphs, "<p>" .. ph_html .. "</p>")
         end
         pos = end_pos + 1
     end
@@ -1254,18 +1256,7 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
         if #preview > 4000 then preview = preview:sub(1, 4000) .. "...[truncated]" end
         logger.debug(LOG_MODULE, "[debug] raw content before clean, len=" .. tostring(#content) .. " img_count=" .. img_count .. ":\n" .. preview)
     end
-    local cleaned
-    if _src_id == "official" then
-        -- 官方源返回的就是完整 HTML（<p>/<img>/<a>/<sup>/<h1>/<blk> 齐全），
-        -- 原样保留，只剥掉最外层 <body> 标签和番茄自定义的 <blk>。
-        -- 不走 clean_chapter_content（那是给书山/知秋纯文本设计的，
-        -- 会把 <sup>/<a> 转义成字面量，把 <blk> 吞掉）。
-        local body = content:match("<body[^>]*>([%s%S]*)</body>") or content
-        body = body:gsub("<blk[^>]->", ""):gsub("</blk>", "")
-        cleaned = body
-    else
-        cleaned = Content.clean_chapter_content(content, title)
-    end
+    local cleaned = Content.clean_chapter_content(content, title)
     local clean_elapsed = now_ms() - t_clean
     if logger then
         local preview2 = cleaned
