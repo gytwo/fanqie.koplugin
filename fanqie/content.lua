@@ -534,6 +534,29 @@ function Content.clean_chapter_content(raw_content, title)
 
     local content = raw_content
 
+    -- 脚注链接 <a href="#zhu1" id="zw1">[1]</a> 先转占位符，避免被“裸 < 转义”吃掉
+    local footnote_links = {}
+    local footnote_count = 0
+    content = content:gsub('(<a[^>]->[%s%S]-</a>)', function(full_a)
+        footnote_count = footnote_count + 1
+        footnote_links[footnote_count] = full_a
+        return "\001FN" .. footnote_count .. "\001"
+    end)
+
+    -- <sup>...</sup> 和 <sub>...</sub> 也转占位符，避免 <p> 内部处理把 <sup> 当裸 < 转义
+    local sup_sub_links = {}
+    local sup_sub_count = 0
+    content = content:gsub('(<[sS][uU][pP][^>]->[%s%S]-</[sS][uU][pP]>)', function(full_tag)
+        sup_sub_count = sup_sub_count + 1
+        sup_sub_links[sup_sub_count] = full_tag
+        return "\001SS" .. sup_sub_count .. "\001"
+    end)
+    content = content:gsub('(<[sS][uU][bB][^>]->[%s%S]-</[sS][uU][bB]>)', function(full_tag)
+        sup_sub_count = sup_sub_count + 1
+        sup_sub_links[sup_sub_count] = full_tag
+        return "\001SS" .. sup_sub_count .. "\001"
+    end)
+
     -- 移除不可见字符（零宽空格、BOM、软连字符、双向控制符等，聚合源广告中大量掺杂）
     content = content:gsub("\226\128[\139\140\141\142\143]", "")
     content = content:gsub("\226\128[\168\169\170\171\172\173\174]", "")
@@ -634,16 +657,18 @@ function Content.clean_chapter_content(raw_content, title)
     end
 
     -- 辅助：把一段纯文本（可含 <br>、占位符、零散标签）拆成 <p> 行
-    -- 这是修复的核心：无 <p> 包裹的正文（书山等源）必须走这里才不会丢
     local function emit_text_lines(text, paragraphs_ref, ph_holder)
-        text = text:gsub("<br%s*/?>", "\n")
-        text = text:gsub("<[^>]+>", "")
+        text = text:gsub("<br%s*/?>", "\1BR\1")
+        text = text:gsub("<", "\1LT\1")
         text = Content.decode_html_entities(text)
         local lines = {}
         for line in (text .. "\n"):gmatch("([^\n]+)\n") do
             line = H.trim(line)
             if line ~= "" then
-                lines[#lines + 1] = "<p>" .. xml_escape(line) .. "</p>"
+                line = xml_escape(line)
+                line = line:gsub("\1LT\1", "&lt;")
+                line = line:gsub("\1BR\1", "<br/>")
+                lines[#lines + 1] = "<p>" .. line .. "</p>"
             end
         end
         if ph_holder and ph_holder ~= "" then
@@ -676,7 +701,6 @@ function Content.clean_chapter_content(raw_content, title)
         end
 
         if not start_pos then
-            -- ===== 修复点 1：tail 分支不再只提取图片，纯文本也要拆成 <p> =====
             local tail = content:sub(pos)
             local scan = 1
             local tail_len = #tail
@@ -684,11 +708,9 @@ function Content.clean_chapter_content(raw_content, title)
                 local img_start, img_end, img_tag = tail:find("(<[iI][mM][gG][^>]*/?>)", scan)
                 local before = img_start and tail:sub(scan, img_start - 1) or tail:sub(scan)
                 local ph_html = extract_placeholders(before)
-                -- 纯文本拆成 <p>
                 emit_text_lines(before, paragraphs, ph_html)
 
                 if not img_start then break end
-                -- 图片单独成段（不包 <p>）
                 table.insert(paragraphs, img_tag)
                 img_stats.tail = img_stats.tail + 1
                 scan = img_end + 1
@@ -709,7 +731,6 @@ function Content.clean_chapter_content(raw_content, title)
                 table.insert(paragraphs, before_imgs)
             end
         end
-        -- <p> 之间的纯文本（少见但可能存在）也拆成段落
         local before_ph = extract_placeholders(before_text)
         local before_plain = before_text:gsub("<[iI][mM][gG][^>]*/?>", "")
             :gsub("\001CMT%d+\001", "")
@@ -724,6 +745,7 @@ function Content.clean_chapter_content(raw_content, title)
         end
 
         -- 处理 <p> 内部：文字与 <img> 按原顺序交错
+        -- <a> / <sup> / <sub> 已转占位符，这里只需处理 <img> 和 <br>
         local parts = {}
         local scan = 1
         local inner_len = #inner
@@ -744,11 +766,15 @@ function Content.clean_chapter_content(raw_content, title)
             if next_tag_start then
                 if next_tag_start > scan then
                     local txt = inner:sub(scan, next_tag_start - 1)
-                    txt = txt:gsub("<[^>]+>", "")
+                    txt = txt:gsub("<br%s*/?>", "\1BR\1")
+                    txt = txt:gsub("<", "\1LT\1")
                     txt = Content.decode_html_entities(txt)
                     local trimmed = H.trim(txt)
                     if trimmed ~= "" then
-                        table.insert(parts, xml_escape(trimmed))
+                        trimmed = xml_escape(trimmed)
+                        trimmed = trimmed:gsub("\1LT\1", "&lt;")
+                        trimmed = trimmed:gsub("\1BR\1", "<br/>")
+                        table.insert(parts, trimmed)
                     end
                 end
                 if is_img then
@@ -760,11 +786,15 @@ function Content.clean_chapter_content(raw_content, title)
                 scan = next_tag_end + 1
             else
                 local txt = inner:sub(scan)
-                txt = txt:gsub("<[^>]+>", "")
+                txt = txt:gsub("<br%s*/?>", "\1BR\1")
+                txt = txt:gsub("<", "\1LT\1")
                 txt = Content.decode_html_entities(txt)
                 local trimmed = H.trim(txt)
                 if trimmed ~= "" then
-                    table.insert(parts, xml_escape(trimmed))
+                    trimmed = xml_escape(trimmed)
+                    trimmed = trimmed:gsub("\1LT\1", "&lt;")
+                    trimmed = trimmed:gsub("\1BR\1", "<br/>")
+                    table.insert(parts, trimmed)
                 end
                 break
             end
@@ -787,8 +817,7 @@ function Content.clean_chapter_content(raw_content, title)
         pos = end_pos + 1
     end
 
-    -- ===== 修复点 2：全文都没匹配到 <p> 时，整体 fallback（逐行 + 图片） =====
-    -- 注意：tail 分支修好后，正常情况下 paragraphs 已非空；这里作为双保险。
+    -- 全文都没匹配到 <p> 时，整体 fallback（逐行 + 图片）
     if not matched_any_p and #paragraphs == 0 then
         local scan = 1
         local content_len = #content
@@ -834,6 +863,22 @@ function Content.clean_chapter_content(raw_content, title)
             .. " fallback=" .. img_stats.fallback
             .. " total=" .. found_total .. "}"
             .. (img_before_clean ~= img_after and " <<< 图片丢失!" or " OK"))
+    end
+
+    -- 还原脚注链接
+    if footnote_count > 0 then
+        result = result:gsub("\001FN(%d+)\001", function(idx_str)
+            local idx = tonumber(idx_str)
+            return footnote_links[idx] or ""
+        end)
+    end
+
+    -- 还原 <sup>/<sub>
+    if sup_sub_count > 0 then
+        result = result:gsub("\001SS(%d+)\001", function(idx_str)
+            local idx = tonumber(idx_str)
+            return sup_sub_links[idx] or ""
+        end)
     end
 
     return result
@@ -1000,7 +1045,15 @@ local function image_set_local_src(attrs, href)
     cleaned = image_remove_attr(cleaned, "data%-actual-src")
     cleaned = image_remove_attr(cleaned, "srcset")
     cleaned = cleaned:gsub("^%s+", "")
-    return ' src="' .. href .. '"' .. (cleaned or "")
+    -- ⚠️ 必须用空格分隔 src 与其余属性。否则会拼出
+    --   <img src="..."img-width="...">
+    -- 这种畸形标签：单章 HTML 按 HTML 容错模式能解析，
+    -- 但 EPUB 的 XHTML 按严格 XML 解析会在第一张图处报错中断，
+    -- 导致“第一张图之后就跳到下一章”。
+    if cleaned ~= "" then
+        return ' src="' .. href .. '" ' .. cleaned
+    end
+    return ' src="' .. href .. '"'
 end
 
 local function image_unique_href(used, prefix, index, ext)
@@ -1016,7 +1069,7 @@ local function image_unique_href(used, prefix, index, ext)
     return href
 end
 
-function Content.download_remote_images(client, xhtml, used_names, progress)
+function Content.download_remote_images(client, xhtml, used_names, progress, img_prefix)
     local assets = {}
     used_names = used_names or {}
     local source_map = {}  -- maps URL -> local href
@@ -1100,7 +1153,7 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
 
             -- Generate unique href
             local img_index = #assets + 1
-            local href = image_unique_href(used_names, "img", img_index, ext)
+            local href = image_unique_href(used_names, img_prefix or "img", img_index, ext)
             local local_path = "../" .. href
 
             assets[#assets + 1] = {
@@ -1201,7 +1254,18 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
         if #preview > 4000 then preview = preview:sub(1, 4000) .. "...[truncated]" end
         logger.debug(LOG_MODULE, "[debug] raw content before clean, len=" .. tostring(#content) .. " img_count=" .. img_count .. ":\n" .. preview)
     end
-    local cleaned = Content.clean_chapter_content(content, title)
+    local cleaned
+    if _src_id == "official" then
+        -- 官方源返回的就是完整 HTML（<p>/<img>/<a>/<sup>/<h1>/<blk> 齐全），
+        -- 原样保留，只剥掉最外层 <body> 标签和番茄自定义的 <blk>。
+        -- 不走 clean_chapter_content（那是给书山/知秋纯文本设计的，
+        -- 会把 <sup>/<a> 转义成字面量，把 <blk> 吞掉）。
+        local body = content:match("<body[^>]*>([%s%S]*)</body>") or content
+        body = body:gsub("<blk[^>]->", ""):gsub("</blk>", "")
+        cleaned = body
+    else
+        cleaned = Content.clean_chapter_content(content, title)
+    end
     local clean_elapsed = now_ms() - t_clean
     if logger then
         local preview2 = cleaned
@@ -1310,7 +1374,7 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
     -- ⚠️ 图片多时全部 base64 内联会让子进程内存峰值暴涨（79 张图 base64 后
     --    可能几十 MB），被 OOM Killer 杀掉，async 报 "subprocess exited without output"。
     --    超过阈值时改为只写磁盘文件、HTML 用相对路径引用（见下方 gsub 的回退）。
-    local INLINE_IMAGE_LIMIT = 10
+    local INLINE_IMAGE_LIMIT = 0
     local href_to_data = {}
     if assets and #assets > 0 and #assets <= INLINE_IMAGE_LIMIT then
         for _, a in ipairs(assets) do
@@ -1465,7 +1529,9 @@ a.para-comment {
     if cache.download_book_images ~= false then
         local used_names = {}
         local t_img = now_ms()
-        local ok_img, inline_xhtml, inline_assets = pcall(Content.download_remote_images, client, xhtml, used_names)
+        local ok_img, inline_xhtml, inline_assets = pcall(
+    Content.download_remote_images, client, xhtml, used_names, nil,
+    "img_" .. tostring(item_id))
         img_elapsed = now_ms() - t_img
         if ok_img and inline_xhtml then
             xhtml = inline_xhtml
