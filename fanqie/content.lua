@@ -1306,9 +1306,13 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
         end
     end
 
-    -- 2. Build href -> base64 data URI map (primary strategy, single-file embedding)
+    -- 2. Build href -> base64 data URI map.
+    -- ⚠️ 图片多时全部 base64 内联会让子进程内存峰值暴涨（79 张图 base64 后
+    --    可能几十 MB），被 OOM Killer 杀掉，async 报 "subprocess exited without output"。
+    --    超过阈值时改为只写磁盘文件、HTML 用相对路径引用（见下方 gsub 的回退）。
+    local INLINE_IMAGE_LIMIT = 10
     local href_to_data = {}
-    if assets and #assets > 0 then
+    if assets and #assets > 0 and #assets <= INLINE_IMAGE_LIMIT then
         for _, a in ipairs(assets) do
             href_to_data[a.href] = "data:" .. a.media_type .. ";base64," .. base64_encode(a.data)
             href_to_data["../" .. a.href] = "data:" .. a.media_type .. ";base64," .. base64_encode(a.data)
@@ -1352,7 +1356,6 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
 
         local new_src = nil
         if src then
-            -- First, try data-URI embedding for downloaded assets
             local data_uri = href_to_data[src]
             if not data_uri then
                 local stripped = src:gsub("^%.%./", "")
@@ -1361,8 +1364,16 @@ function Content.save_chapter_html(settings, book, chapter, xhtml, assets, css)
             if data_uri then
                 new_src = data_uri
             else
-                -- Not a downloaded asset; still decode HTML entities so URLs are valid
-                new_src = Content.decode_html_entities(src)
+                -- 没内联（超过阈值/未下载）：优先用已写盘的相对路径
+                local rel = href_to_rel[src]
+                if not rel then
+                    rel = href_to_rel[src:gsub("^%.%./", "")]
+                end
+                if rel then
+                    new_src = rel
+                else
+                    new_src = Content.decode_html_entities(src)
+                end
             end
         end
 
