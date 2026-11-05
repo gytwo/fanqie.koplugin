@@ -535,10 +535,7 @@ function Content.clean_chapter_content(raw_content, title)
 
     local content = raw_content
 
-    -- 官方源 <blk> 标签剥除（书山/知秋没有，gsub 不匹配就原样返回）
-    content = content:gsub("<blk[^>]->", ""):gsub("</blk>", "")
-
-    -- 脚注链接 <a href="#zhu1" id="zw1">[1]</a> 先转占位符，避免被“裸 < 转义”吃掉
+    -- 脚注链接 <a href="#zhu1" id="zw1">[1]</a> 先转占位符
     local footnote_links = {}
     local footnote_count = 0
     content = content:gsub('(<a[^>]->[%s%S]-</a>)', function(full_a)
@@ -547,7 +544,7 @@ function Content.clean_chapter_content(raw_content, title)
         return "\001FN" .. footnote_count .. "\001"
     end)
 
-    -- <sup>...</sup> 和 <sub>...</sub> 也转占位符
+    -- <sup>...</sup> 和 <sub>...</sub> 也转占位符（处理剩下的非 FN 的 <sup>）
     local sup_sub_links = {}
     local sup_sub_count = 0
     content = content:gsub('(<[sS][uU][pP][^>]->[%s%S]-</[sS][uU][pP]>)', function(full_tag)
@@ -561,12 +558,6 @@ function Content.clean_chapter_content(raw_content, title)
         return "\001SS" .. sup_sub_count .. "\001"
     end)
 
-    -- 移除不可见字符
-    content = content:gsub("\226\128[\139\140\141\142\143]", "")
-    content = content:gsub("\226\128[\168\169\170\171\172\173\174]", "")
-    content = content:gsub("\194\173", "")
-    content = content:gsub("\239\187\191", "")
-
     -- 移除不需要的元素，保留 <img> 和 <comment>
     content = content:gsub("<header[^>]->[%s%S]-</header>", "")
     content = content:gsub("<script[^>]->[%s%S]-</script>", "")
@@ -574,14 +565,9 @@ function Content.clean_chapter_content(raw_content, title)
     content = content:gsub("<nav[^>]->[%s%S]-</nav>", "")
     content = content:gsub("<!--[%s%S]--->", "")
 
-    local body_match = content:match("<body[^>]->([%s%S]-)</body>")
-    if body_match then
-        content = body_match
-    end
-
     -- 移除末尾广告
     local ad_start = nil
-    local qt_ad = content:find("\240\159\147\163", 1, true)  -- 📣
+    local qt_ad = content:find("\240\159\147\163", 1, true)
     local dl_ad = content:find("本书源", 1, true)
     if qt_ad then ad_start = qt_ad end
     if dl_ad and (not ad_start or dl_ad < ad_start) then ad_start = dl_ad end
@@ -749,7 +735,6 @@ function Content.clean_chapter_content(raw_content, title)
         end
 
         -- 处理 <p> 内部：文字与 <img> 按原顺序交错
-        -- <a> / <sup> / <sub> 已转占位符，这里只需处理 <img> 和 <br>
         -- 段评占位符 \001CMTn\001 作为文字保留在 parts 里，末尾统一还原
         local parts = {}
         local scan = 1
@@ -1256,7 +1241,35 @@ function Content.fetch_chapter_content(client, settings, book, chapter, opts)
         if #preview > 4000 then preview = preview:sub(1, 4000) .. "...[truncated]" end
         logger.debug(LOG_MODULE, "[debug] raw content before clean, len=" .. tostring(#content) .. " img_count=" .. img_count .. ":\n" .. preview)
     end
-    local cleaned = Content.clean_chapter_content(content, title)
+    local cleaned
+    if _src_id == "official" then
+        -- 官方源返回的就是完整 HTML，原样保留。
+        -- 只剥 <body> 外层和 <blk>，<comment> 转段评气泡，其它不动。
+        local body = content:match("<body[^>]*>([%s%S]*)</body>") or content
+        body = body:gsub("<blk[^>]->", ""):gsub("</blk>", "")
+
+        -- <comment ident="..." count="N" /> → <a class="para-comment" href="fanqie-para:N">[N]</a>
+        local bubbles = {}
+        local bubble_count = 0
+        body = body:gsub('<comment%s+ident="([^"]*)"%s+count="([^"]*)"%s*/?>', function(ident, count)
+            bubble_count = bubble_count + 1
+            local n = tonumber(count) or 0
+            local n_label = n > 99 and "99+" or tostring(n)
+            bubbles[bubble_count] = string.format(
+                '<a class="para-comment" href="fanqie-para:%d">[%s]</a>', bubble_count, n_label)
+            return "\001CMT" .. bubble_count .. "\001"
+        end)
+        body = body:gsub("\001CMT(%d+)\001", function(idx)
+            return bubbles[tonumber(idx)] or ""
+        end)
+
+        -- <p> 之间加换行，让 local_review 按 \n 拆段时能拆出每段
+        body = body:gsub("</p>", "</p>\n")
+        
+        cleaned = body
+    else
+        cleaned = Content.clean_chapter_content(content, title)
+    end
     local clean_elapsed = now_ms() - t_clean
     if logger then
         local preview2 = cleaned
