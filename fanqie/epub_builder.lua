@@ -344,6 +344,9 @@ function EpubBuilder.build(settings, book, chapters, opts)
         end
 
         -- 章节：逐章读文件 → 生成 XHTML → 写入 → 释放
+        -- ⚠️ 这一段的峰值内存 = 单章 HTML 的 3~4 倍（clean 的中间字符串 +
+        -- rewrite_image_hrefs 的产物 + build_chapter_xhtml 的完整 XHTML 同时
+        -- 存活）。低内存设备上靠自动 GC 追不上分配速度，每 20 章显式 GC 一次。
         for i, plan in ipairs(chapter_plans) do
             local ch = plan.chapter
             local fname = string.format("text/chapter-%03d.xhtml", i)
@@ -358,8 +361,15 @@ function EpubBuilder.build(settings, book, chapters, opts)
                 body = string.format('<h1>%s</h1>\n<p>[内容下载失败]</p>',
                     xml_escape(title))
             end
-            write_entry("OEBPS/" .. fname, build_chapter_xhtml(title, body))
+            -- 先落到局部变量再写，写完立刻置 nil，让 XHTML 字符串尽早可回收
+            local xhtml = build_chapter_xhtml(title, body)
             body = nil
+            write_entry("OEBPS/" .. fname, xhtml)
+            xhtml = nil
+            -- 每 20 章显式推一次 GC（step 不阻塞，比 full 温和）
+            if i % 20 == 0 then
+                pcall(collectgarbage, "step")
+            end
         end
 
         -- 元数据
