@@ -204,49 +204,104 @@ function Download.execute(parent, book, chapters, start_idx, end_idx, opts)
         end
 
         -- ★ 下载完成后自动合并 EPUB
+        -- ⚠️ 构建全程在 Async 子进程里跑：EPUB 打包峰值内存很高，放主进程会
+        -- 被系统 OOM Killer 直接杀掉（症状：停在「正在生成 EPUB」闪退）。
+        -- 子进程 OOM 只会让本次构建失败并走 on_done(false, ...)，主进程无恙。
         if not cancelled and state.build_epub then
             self_ref:showBusy(_("正在生成 EPUB..."))
-            UIManager:scheduleIn(0.2, function()
-                local EpubBuilder = require("fanqie.epub_builder")
-                local ok_b, path, count, missing = pcall(function()
-                    return EpubBuilder.build(settings, book, state.chapters, {
+            local chapters_for_build = state.chapters
+            local Async_mod = Async
+            if ok_Async and Async_mod and Async_mod.run then
+                Async_mod.run(function()
+                    local EpubBuilder = require("fanqie.epub_builder")
+                    local p, c, m = EpubBuilder.build(settings, book, chapters_for_build, {
                         require_all = false,
                     })
-                end)
-                self_ref:closeBusy()
-                if not ok_b or not path then
-                    self_ref:showError(T(_("生成 EPUB 失败：\n%1"), tostring(path)))
-                    return
-                end
-                pcall(function()
-                    local ReadCollection = require("readcollection")
-                    if not ReadCollection.coll then ReadCollection:_read() end
-                    if not ReadCollection.coll["fanqie"] then
-                        ReadCollection:addCollection("fanqie")
+                    -- Async 子进程只透传第一个返回值，三个结果打包成一个表
+                    return { path = p, count = c, missing = m }
+                end, function(ok_b, result_b, err_b)
+                    self_ref:closeBusy()
+                    if not ok_b or type(result_b) ~= "table" or not result_b.path then
+                        self_ref:showError(T(_("生成 EPUB 失败：\n%1"),
+                            tostring(err_b or (result_b and result_b.path) or "未知错误")))
+                        return
                     end
-                    if not ReadCollection:isFileInCollection(path, "fanqie") then
-                        ReadCollection:addItem(path, "fanqie")
-                        ReadCollection:write({ fanqie = true })
+                    local path = result_b.path
+                    local count = result_b.count
+                    local missing = result_b.missing
+                    pcall(function()
+                        local ReadCollection = require("readcollection")
+                        if not ReadCollection.coll then ReadCollection:_read() end
+                        if not ReadCollection.coll["fanqie"] then
+                            ReadCollection:addCollection("fanqie")
+                        end
+                        if not ReadCollection:isFileInCollection(path, "fanqie") then
+                            ReadCollection:addItem(path, "fanqie")
+                            ReadCollection:write({ fanqie = true })
+                        end
+                    end)
+                    local text = T(_("已下载 %1 章并生成 EPUB：\n%2"), count, path)
+                    if missing and missing > 0 then
+                        text = text .. T(_("\n（跳过未下载 %1 章）"), missing)
+                    end
+                    if ConfirmBox then
+                        UIManager:show(ConfirmBox:new{
+                            text = text .. _("\n\n现在打开？"),
+                            ok_text = _("打开"),
+                            cancel_text = _("关闭"),
+                            ok_callback = function()
+                                local ReaderUI = require("apps/reader/readerui")
+                                ReaderUI:showReader(path)
+                            end,
+                        })
+                    else
+                        self_ref:showInfo(text)
+                    end
+                end, { poll_interval = 0.3, timeout = 900 })
+            else
+                -- 降级：Async 模块不可用时仍走主进程（旧行为，仅兜底）
+                UIManager:scheduleIn(0.2, function()
+                    local EpubBuilder = require("fanqie.epub_builder")
+                    local ok_b, path, count, missing = pcall(function()
+                        return EpubBuilder.build(settings, book, chapters_for_build, {
+                            require_all = false,
+                        })
+                    end)
+                    self_ref:closeBusy()
+                    if not ok_b or not path then
+                        self_ref:showError(T(_("生成 EPUB 失败：\n%1"), tostring(path)))
+                        return
+                    end
+                    pcall(function()
+                        local ReadCollection = require("readcollection")
+                        if not ReadCollection.coll then ReadCollection:_read() end
+                        if not ReadCollection.coll["fanqie"] then
+                            ReadCollection:addCollection("fanqie")
+                        end
+                        if not ReadCollection:isFileInCollection(path, "fanqie") then
+                            ReadCollection:addItem(path, "fanqie")
+                            ReadCollection:write({ fanqie = true })
+                        end
+                    end)
+                    local text = T(_("已下载 %1 章并生成 EPUB：\n%2"), count, path)
+                    if missing and missing > 0 then
+                        text = text .. T(_("\n（跳过未下载 %1 章）"), missing)
+                    end
+                    if ConfirmBox then
+                        UIManager:show(ConfirmBox:new{
+                            text = text .. _("\n\n现在打开？"),
+                            ok_text = _("打开"),
+                            cancel_text = _("关闭"),
+                            ok_callback = function()
+                                local ReaderUI = require("apps/reader/readerui")
+                                ReaderUI:showReader(path)
+                            end,
+                        })
+                    else
+                        self_ref:showInfo(text)
                     end
                 end)
-                local text = T(_("已下载 %1 章并生成 EPUB：\n%2"), count, path)
-                if missing and missing > 0 then
-                    text = text .. T(_("\n（跳过未下载 %1 章）"), missing)
-                end
-                if ConfirmBox then
-                    UIManager:show(ConfirmBox:new{
-                        text = text .. _("\n\n现在打开？"),
-                        ok_text = _("打开"),
-                        cancel_text = _("关闭"),
-                        ok_callback = function()
-                            local ReaderUI = require("apps/reader/readerui")
-                            ReaderUI:showReader(path)
-                        end,
-                    })
-                else
-                    self_ref:showInfo(text)
-                end
-            end)
+            end
             return
         end
 
