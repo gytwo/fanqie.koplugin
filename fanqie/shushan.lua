@@ -119,6 +119,58 @@ local function hex_to_bytes(s)
     return table.concat(out)
 end
 
+local function bytes_to_hex(s)
+    return (tostring(s or ""):gsub(".", function(c)
+        return string.format("%02x", c:byte())
+    end))
+end
+
+-- ── libcrypto 加速的 SHA-256（2026-11-20）───────────────────────────────
+-- ffi/sha2 的 sha256 实测 ~80µs/次（Sean 双机基准：20 万次 Kindle 8.3s /
+-- Kobo 16.5s），altcha PoW 迭代数方差很大（期望 ~65k，尾部可到 40 万），
+-- Kobo 上整个求解 20~40s，撞死段评 60s 子进程超时（fanqie.log 里那串
+-- 「[async] 子进程超时 60 s」就是这么来的）。KOReader 自带 libcrypto
+-- （LibreSSL/OpenSSL），ffi 直调单次 ≈1µs，PoW 压回 1 秒级。
+-- 加载时用 SHA256("abc") 标准摘要自检；任何一步不成就整体禁用，
+-- 走回下面的 ffi/sha2 十六进制循环 —— 行为一致，只差速度。
+local _crypto_SHA256, _sha256_md, _sha256_string, _ffi
+do
+    local ok_ffi, ffi = pcall(require, "ffi")
+    if ok_ffi and type(ffi) == "table" then
+        _ffi = ffi
+        local ok_cdef = pcall(ffi.cdef,
+            -- 用 const char * 声明：LuaJIT 只对 char 指针做 Lua string 自动转换；
+            -- 与 lib 里真正的 unsigned char * 形参在 ABI 上完全等价。
+            "unsigned char *SHA256(const char *d, size_t n, unsigned char *md);")
+        if ok_cdef then
+            for _, name in ipairs({ "libcrypto.so.57", "libcrypto.so.1.1", "libcrypto.so.3", "libcrypto" }) do
+                local ok_load, lib = pcall(ffi.load, name)
+                if ok_load and (type(lib) == "cdata" or type(lib) == "userdata") and pcall(function() return lib.SHA256 end) then
+                    _crypto_SHA256 = lib.SHA256
+                    break
+                end
+            end
+        end
+    end
+    if _crypto_SHA256 then
+        local known = "\xba\x78\x16\xbf\x8f\x01\xcf\xea\x41\x41\x40\xde\x5d\xae\x22\x23"
+            .. "\xb0\x03\x61\xa3\x96\x17\x7a\x9c\xb4\x10\xff\x61\xf2\x00\x15\xad" -- SHA256("abc")
+        local ok_test, md = pcall(ffi.new, "unsigned char[32]")
+        if ok_test and type(md) == "cdata" then
+            local ok_call = pcall(_crypto_SHA256, "abc", 3, md)
+            if not ok_call or ffi.string(md, 32) ~= known then
+                _crypto_SHA256 = nil
+            else
+                _sha256_md = md
+                _sha256_string = ffi.string
+            end
+        else
+            _crypto_SHA256 = nil
+        end
+    end
+end
+
+
 local function altcha_solve(parameters)
     if not sha256_v6 or type(parameters) ~= "table" then return nil end
     local salt = hex_to_bytes(parameters.salt or "")
@@ -128,6 +180,41 @@ local function altcha_solve(parameters)
     if salt == "" or nonce == "" or prefix == "" then return nil end
     local prefix_len = #prefix
     if prefix_len == 0 or prefix_len > 64 then return nil end
+    -- 快路径：libcrypto 直调。要点（2026-11-20 双机真机实测踩坑）：
+    -- ① Kobo/Kindle 的 luajit 里 ffi.load 返回 userdata 不是 cdata，守卫别断言类型；
+    -- ② 这套老 luajit 的自动 GC 在「每迭代都分配 Lua 字符串」的 ffi 热循环里会段错误
+    --    （双机实测），所以循环体零分配：输入写进预填的 ffi 缓冲、前缀用 md 下标比较；
+    -- ③ 只在 cost==1 时启用：cost>1 的哈希链（慢路径按 hex 链）语义未验证，交回慢路径。
+    -- 服务端要完整 64-hex derivedKey（截到 keyLength 会 401），命中才 hex 一次。
+    if _crypto_SHA256 and _ffi and cost == 1 then
+        local prefix_bytes = hex_to_bytes(prefix)
+        if #prefix_bytes * 2 == prefix_len then
+            local base_len = #salt + #nonce
+            local total = base_len + 4
+            local inbuf = _ffi.new("unsigned char[?]", total)
+            _ffi.copy(inbuf, salt, #salt)
+            _ffi.copy(inbuf + #salt, nonce, #nonce)
+            local in_ptr = _ffi.cast("const char *", inbuf)
+            local pb = {}
+            for i = 1, #prefix_bytes do pb[i - 1] = prefix_bytes:byte(i) end
+            local plen = #prefix_bytes
+            for counter = 0, 2000000 do
+                inbuf[base_len] = math.floor(counter / 16777216) % 256
+                inbuf[base_len + 1] = math.floor(counter / 65536) % 256
+                inbuf[base_len + 2] = math.floor(counter / 256) % 256
+                inbuf[base_len + 3] = counter % 256
+                _crypto_SHA256(in_ptr, total, _sha256_md)
+                local match = true
+                for i = 0, plen - 1 do
+                    if _sha256_md[i] ~= pb[i] then match = false break end
+                end
+                if match then
+                    return { counter = counter, derivedKey = bytes_to_hex(_sha256_string(_sha256_md, 32)), time = 0 }
+                end
+            end
+            return nil
+        end
+    end
     for counter = 0, 2000000 do
         local c3 = string.char(
             math.floor(counter / 16777216) % 256,
