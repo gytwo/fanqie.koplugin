@@ -575,7 +575,7 @@ function FanQiePlugin:showParaReviewDetail(index)
             return result
         end, function(ok, result, err)
             self_ref:_displayParaReviewDetail(review_index, total_reviews, ok, result, err, bubble_count)
-        end, { poll_interval = 0.125, timeout = 60 })
+        end, { poll_interval = 0.125, timeout = 120 })
     else
         -- 降级：Async 模块未加载（极端情况），同步执行
         local c = self_ref.client or Client:new(self_ref.settings)
@@ -1619,20 +1619,34 @@ function FanQiePlugin:getSourceDetailMenuItems(source_id)
                 local settings = self.settings
                 Async.run(function()
                     local c = Client:new(settings)
-                    return c:shushan_login()
-                end, function(ok, api_key, err)
+                    local ok_login, key = c:shushan_login()
+                    if not ok_login then error("书山登录失败", 0) end
+                    -- 顺带取段评 JWT：altcha PoW 在 Kobo 这类单核设备要 5-40 秒，
+                    -- 放在这里做一次并缓存 6 天，阅读时点段评就不用再等。
+                    local ok_jwt, jwt = pcall(function()
+                        local cfg2 = settings:get_source("shushan") or {}
+                        return require("fanqie.shushan").ensure_jwt(c, settings, cfg2, true)
+                    end)
+                    return {
+                        api_key = tostring(key or ""),
+                        jwt_ok = (ok_jwt and type(jwt) == "string" and #jwt > 0),
+                    }
+                end, function(ok, data, err)
                     self:closeBusy()
-                    if ok and api_key and api_key ~= "" then
+                    local key = ok and type(data) == "table" and tostring(data.api_key or "") or ""
+                    if key ~= "" then
+                        local extra = (data and data.jwt_ok) and _("\n段评凭证已就绪")
+                            or _("\n段评凭证获取失败，首次点段评会再试一次（可能要等一会儿）")
                         UIManager:show(InfoMessage:new{
-                            text = _("✅ 书山登录成功！api_key 已保存"), timeout = 3,
+                            text = _("✅ 书山登录成功！api_key 已保存") .. extra, timeout = 4,
                         })
                     else
                         UIManager:show(InfoMessage:new{
-                            text = _("登录失败: ") .. tostring(err), timeout = 4,
+                            text = _("登录失败: ") .. tostring(ok and "" or (err or data)), timeout = 4,
                         })
                     end
                     if touchmenu_instance then touchmenu_instance:updateItems() end
-                end)
+                end, { poll_interval = 0.2, timeout = 180 })
             end,
         })
         table.insert(items, {
@@ -2958,6 +2972,44 @@ function FanQiePlugin:openChapter(book, chapters, chapter_index)
     })
 end
 
+-- 书山段评凭证（JWT）后台预热。
+-- 为什么需要：书山段评要先把一道 altcha 验证题解出来（本地 SHA-256 暴力试），
+-- 慢设备（Kobo 实测比 Kindle 再慢一倍）要 5–40 秒，放在用户点击时算就容易被
+-- 异步超时掐断，而且失败不落盘 → 下次还得重算。这里在打开正文后空闲时先算好。
+function FanQiePlugin:_prewarmShushanJwt()
+    local settings = self.settings
+    local cfg = settings:get_source("shushan") or {}
+    if cfg.enabled == false then return end
+    local now = os.time()
+    local at = tonumber(cfg.jwt_at or 0) or 0
+    local fresh = (cfg.jwt or "") ~= "" and (now - at) < (6 * 24 * 3600)
+    if fresh then return end
+    if self._jwt_prewarm_at and (now - self._jwt_prewarm_at) < 600 then return end
+    self._jwt_prewarm_at = now
+
+    Log.info("[段评] 后台预热书山凭证")
+    Async.run(function()
+        local c = Client:new(settings)
+        local ok, jwt = pcall(function()
+            return require("fanqie.shushan").ensure_jwt(c, settings, cfg, false)
+        end)
+        return { jwt = (ok and type(jwt) == "string") and jwt or "" }
+    end, function(ok2, data)
+        local jwt = (ok2 and type(data) == "table") and tostring(data.jwt or "") or ""
+        if jwt ~= "" then
+            -- 同步回父进程内存：子进程只改了文件，父进程这份缓存还是旧的，
+            -- 不写回的话用户本次会话点段评仍会重新算一遍。
+            pcall(function()
+                settings:set_source_field("shushan", "jwt", jwt)
+                settings:set_source_field("shushan", "jwt_at", tostring(os.time()))
+            end)
+            Log.info("[段评] 书山凭证已缓存")
+        else
+            Log.warn("[段评] 书山凭证预热失败", tostring(data))
+        end
+    end, { delay = 20, poll_interval = 0.5, timeout = 300 })
+end
+
 function FanQiePlugin:showReaderUI(path, chapter)
     local ReaderUI = require("apps/reader/readerui")
 
@@ -2979,6 +3031,9 @@ function FanQiePlugin:showReaderUI(path, chapter)
     end
     _state.current_document_path = path
     _state.document_opened = true
+
+    -- 打开正文后顺手预热书山段评凭证（Async 内部会再延迟 20 秒）
+    UIManager:scheduleIn(3, function() self:_prewarmShushanJwt() end)
 
     if _state.current_book then
         UIManager:scheduleIn(1.0, function()
