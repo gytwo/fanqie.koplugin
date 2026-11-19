@@ -49,18 +49,22 @@ local ShuShan = {}
 -- 可覆盖的计时器（单测注入确定性延迟序列用）
 ShuShan._now_ms = now_ms
 
-ShuShan.DEFAULT_BASE = "http://113.44.163.166:7001"
+ShuShan.DEFAULT_BASE = "https://v4.vossc.com"
 -- 官方节点池：同一套账号/api_key/设备码在各节点通用（2026-09-14 实测同 key 可跨
--- 节点访问）。Sean 指定 113.44.163.166 作首选，1.94.248.5 作第一备选，其余按延迟兜底。
+-- 节点访问）。
+-- 2026-11-20 设备端实测（Kindle，分阶段）：TCP 40-60ms / TLS 70-330ms，
+--   服务端处理才是大头，且同一节点 0.4s~5s 横跳。
+--   实测排序：v1 388-509 / v4 571-785 / v2 584-989 / v5 505-1047 / v3 623-3536，
+--   113.44.163.166 虽免 TLS，但服务端已稳定 5s，故排到最后（仍保留，恢复后可用）。
+--   1.94.248.5 持续 6s 超时 / 502，已摘除；要恢复可在「书山服务器地址」手填。
+-- ⚠️ 单次「成功但慢」还会被 mark_node_ok 降权 1 小时，顺序不是唯一判据。
 ShuShan.DEFAULT_NODES = {
-    -- 延迟实测(ms)：v1 153 / v2 172 / 113.44.163.166 199 / 1.94.248.5 200 / v3 222 / v4 472。
-    -- Sean 指定两个 http:7001 直连 IP 置顶（主 + 备），其余域名按延迟升序兜底。
-    "http://113.44.163.166:7001",
-    "http://1.94.248.5:7001",
+    "https://v4.vossc.com",
     "https://v1.vossc.com",
     "https://v2.vossc.com",
+    "https://v5.vossc.com",
     "https://v3.vossc.com",
-    "https://v4.vossc.com",
+    "http://113.44.163.166:7001",
 }
 -- 内存态（进程内有效，KOReader 重启后重新探测）：
 --   _preferred_base  最近一次成功的节点，后续请求优先走它
@@ -68,17 +72,137 @@ ShuShan.DEFAULT_NODES = {
 ShuShan._preferred_base = nil
 ShuShan._node_cooldown = {}
 ShuShan.NODE_COOLDOWN_SECONDS = 120
--- 测速探针：/detection 是服务端轻量存活端点，正常 200-500ms，单节点超时给 6s。
-ShuShan.DETECT_PATH = "/detection"
-ShuShan.PROBE_TIMEOUT = 6
+-- 「成功但慢」的节点降权窗口：超过 SLOW_MS 视为慢，降权 SLOW_TTL 秒。
+-- 只影响排序，不影响可用性（全慢时照样能用）。
+ShuShan.SLOW_MS = 4000
+ShuShan.SLOW_TTL = 3600
+-- 「持久化首选」的准入线：active_base 自己上次的耗时超过这个值就不再优先，
+-- 否则 113.44 那种「成功但 1.9s」的节点会一直霸占第一位。
+ShuShan.ACTIVE_MS_OK = 1500
+-- 测速探针：旧 /detection 已 404，改用 /api/site/public（200 + JSON，无需鉴权）。
+-- 正常节点设备端 470-820ms，但服务端负载波动大（实测同一节点 0.7~3.7s 都出现过），
+-- 超时压到 3s 会误杀「慢但活着」的节点，故仍给 5s。
+ShuShan.DETECT_PATH = "/api/site/public"
+ShuShan.PROBE_TIMEOUT = 5
 ShuShan.DEFAULT_SOURCE = "番茄小说"
 ShuShan.DEFAULT_TAB = "novel"
 ShuShan.CONTENT_VERSION = "12"
-ShuShan.X_NOVEL_TOKEN = "SHUSAN_READ_2025"
--- AES keys used by 书山 when it DOES return base64-encrypted content (fallback).
-ShuShan.AES_KEY = "G@tY3$jK7#mL2&pW8"
-ShuShan.AES_IV  = "C!eH4&sM6@wP9^zX1"
 
+-- ─────────────────────────────────────────────────────────────────────────
+-- v6 协议（2026-11-19）：书山服务端下线了旧 /login /search /catalog /content
+-- （全部 404），换成 /api/* + x-novel-* 签名头。旧 api_key 仍是同一把钥匙：
+-- x-novel-token = base64(api_key)，x-novel-public = md5(api_key + 设备码 + 秒级时间)。
+-- 实测签名用 api_key **原文**（不是 token 原文），否则 40105。正文/目录返回明文，
+-- 无需 AES 解密（decryptIfEncrypted 只是书源兜底，插件侧不触发）。
+ShuShan.API_VERSION = "11"  -- x-novel-version；服务端对其宽松，保留可配置
+-- 内存缓存：书级 sing（按书名查一次）与 item_id→chapter_index 映射（拉一次目录）。
+-- 进程内有效，落盘见 _cache_path。
+ShuShan._v6_sing = {}       -- [book_id] = { sing, tab, source }
+ShuShan._v6_chindex = {}    -- [book_id] = { [item_id] = chapter_index }
+
+local ok_sha2_v6, sha2_v6 = pcall(require, "ffi/sha2")
+local md5_v6 = (ok_sha2_v6 and type(sha2_v6) == "table" and sha2_v6.md5) or nil
+local sha256_v6 = (ok_sha2_v6 and type(sha2_v6) == "table" and sha2_v6.sha256) or nil
+-- 前向声明：v6_resolve_params 在 request_json_multi 定义之前就需要引用它。
+local request_json_multi
+
+-- ── v6 段评 JWT（2026-11-19）─────────────────────────────────────────────
+-- 书山 v6 的段评 API（/api/comment*）不走 api_key，走网页 SPA 的 JWT。
+-- 拿 JWT 需要：GET /api/captcha/challenge → 算 altcha PoW（sha256，约几千次）→
+-- POST /api/auth/login {email,password,altcha} → data.jwt（有效期约 7 天）。
+-- 邮箱密码与书山登录相同；PoW 在 LuaJIT 里实测 <1s。JWT 缓存到 settings，
+-- 过期才重算。失败返回 nil（段评降级到知秋，不影响正文）。
+ShuShan.JWT_TTL = 6 * 24 * 3600  -- 提前一天刷新（服务端有效期 ~7 天）
+local function hex_to_bytes(s)
+    local out = {}
+    for h in tostring(s or ""):gmatch("%x%x") do out[#out + 1] = string.char(tonumber(h, 16)) end
+    return table.concat(out)
+end
+
+local function altcha_solve(parameters)
+    if not sha256_v6 or type(parameters) ~= "table" then return nil end
+    local salt = hex_to_bytes(parameters.salt or "")
+    local nonce = hex_to_bytes(parameters.nonce or "")
+    local prefix = tostring(parameters.keyPrefix or "")
+    local cost = math.max(1, tonumber(parameters.cost) or 1)
+    if salt == "" or nonce == "" or prefix == "" then return nil end
+    local prefix_len = #prefix
+    if prefix_len == 0 or prefix_len > 64 then return nil end
+    for counter = 0, 2000000 do
+        local c3 = string.char(
+            math.floor(counter / 16777216) % 256,
+            math.floor(counter / 65536) % 256,
+            math.floor(counter / 256) % 256,
+            counter % 256)
+        local key = sha256_v6(salt .. nonce .. c3)
+        for _ = 1, cost - 1 do key = sha256_v6(key) end
+        -- 服务端验证要完整 64-hex derivedKey（altcha-insecure.js 虽截断到
+        -- keyLength，本站实测传完整值才过签；截到 32 会 401）。
+        if key:sub(1, prefix_len):lower() == prefix:lower() then
+            return { counter = counter, derivedKey = key:lower(), time = 0 }
+        end
+    end
+    return nil
+end
+
+function ShuShan.ensure_jwt(client, settings, cfg, force)
+    local now = os.time()
+    if not force then
+        local cached = H.trim(cfg.jwt or "")
+        local at = tonumber(cfg.jwt_at or 0) or 0
+        if cached ~= "" and (now - at) < ShuShan.JWT_TTL then return cached end
+    end
+    local email = H.trim(cfg.email or "")
+    local password = H.trim(cfg.password or "")
+    if email == "" or password == "" then return nil end
+    local base = nil
+    local bases = ShuShan.candidate_bases(cfg)
+    base = bases[1]
+    if not base then return nil end
+    local headers = { ["User-Agent"] = FanQie.MOBILE_UA, ["Accept"] = "application/json" }
+    -- ① challenge
+    local ok_ch, ch = pcall(function()
+        local t, code = client:request({ url = base .. "/api/captcha/challenge",
+            method = "GET", headers = headers, timeout = 15 })
+        if not code or code < 200 or code >= 300 then return nil end
+        return client:json_decode(t)
+    end)
+    if not ok_ch or type(ch) ~= "table" or type(ch.parameters) ~= "table" then return nil end
+    -- ② PoW
+    local solution = altcha_solve(ch.parameters)
+    if not solution then return nil end
+    -- ③ payload = base64({challenge:{parameters,signature},solution})
+    local challenge = { parameters = ch.parameters, signature = ch.signature }
+    local ok_enc, payload = pcall(function()
+        return ShuShan.base64_encode(client:json_encode({ challenge = challenge, solution = solution }))
+    end)
+    if not ok_enc or not payload then return nil end
+    -- ④ SPA login
+    local body = client:json_encode({ email = email, password = password, altcha = payload })
+    local lg = { ["User-Agent"] = FanQie.MOBILE_UA, ["Accept"] = "application/json",
+                 ["Content-Type"] = "application/json" }
+    local ok_lg, jwt = pcall(function()
+        local t, code = client:request({ url = base .. "/api/auth/login", method = "POST",
+            headers = lg, body = body, timeout = 20 })
+        if not code or code < 200 or code >= 300 then return nil end
+        local o = client:json_decode(t)
+        if type(o) ~= "table" or o.code ~= 0 then return nil end
+        local d = o.data or {}
+        local j = d.jwt or d.access_token or ""
+        if type(j) ~= "string" or j == "" then return nil end
+        return j
+    end)
+    if not ok_lg or not jwt then return nil end
+    -- ⑤ persist
+    pcall(function()
+        local nc = settings:get_source("shushan") or {}
+        nc.jwt = jwt
+        nc.jwt_at = tostring(now)
+        settings:set_source("shushan", nc)
+    end)
+    cfg.jwt, cfg.jwt_at = jwt, tostring(now)
+    return jwt
+end
 -- Local base64 implementation (pure Lua, no external deps). KOReader does not
 -- ship base64 in the sandbox, so we implement encode + decode here.
 local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -140,10 +264,154 @@ end
 ShuShan.base64_encode = base64_encode
 ShuShan.base64_decode = base64_decode
 
---  base64(api_key) helper — the actual X-Api-Key header value.
-function ShuShan.secret_key_header(cfg)
+-- ── v6 鉴权头 ────────────────────────────────────────────────────────────
+-- 返回 2 个值：(headers, err)。api_key 与真实 android_id 必填。
+-- x-novel-token = base64(api_key)；x-novel-public = md5(api_key 原文 .. deviceid .. ts)。
+function ShuShan.v6_headers(cfg)
     local api_key = H.trim(cfg.api_key or "")
-    return base64_encode(api_key)
+    local aid = H.trim(cfg.android_id or "")
+    if api_key == "" then return nil, "书山未登录（无 api_key）" end
+    if aid == "" then return nil, "书山需要真实 Android ID（v6 签名）" end
+    if not md5_v6 then return nil, "缺少 ffi/sha2（无法计算书山签名）" end
+    local ts = tostring(os.time())
+    local token = base64_encode(api_key)
+    local public = md5_v6(api_key .. aid .. ts)
+    if type(public) ~= "string" then public = "" end
+    return {
+        ["User-Agent"] = FanQie.MOBILE_UA,
+        ["Accept"] = "application/json, text/plain, */*",
+        ["Content-Type"] = "application/json",
+        ["x-novel-token"] = token,
+        ["x-novel-deviceid"] = aid,
+        ["x-novel-timestamap"] = ts,
+        ["x-novel-public"] = public:lower(),
+        ["x-novel-version"] = ShuShan.API_VERSION,
+    }
+end
+
+-- v6 元数据缓存（sing / item_id→chapter_index）落盘路径：
+-- <cache_dir>/<book_id>/_shushan_v6.lua。放书缓存目录，随书一起管理。
+local function v6_cache_path(settings, book_id)
+    local ok_content, Content = pcall(require, "fanqie.content")
+    if not ok_content or not Content or not Content.book_cache_dir then return nil end
+    local dir = Content.book_cache_dir(settings, book_id)
+    return dir .. "/_shushan_v6.lua"
+end
+
+local function v6_cache_load(settings, book_id)
+    local p = v6_cache_path(settings, book_id)
+    if not p or not H.file_exists(p) then return nil end
+    local ok, obj = pcall(dofile, p)
+    if ok and type(obj) == "table" then return obj end
+    return nil
+end
+
+local function v6_cache_save(settings, book_id, obj)
+    local p = v6_cache_path(settings, book_id)
+    if not p then return end
+    pcall(function()
+        local dir = p:match("^(.*)/[^/]+$")
+        if dir and H.make_dir then H.make_dir(dir) end
+        local f = io.open(p, "w")
+        if not f then return end
+        local function ser(v)
+            if type(v) == "table" then
+                local parts = {}
+                for k, val in pairs(v) do
+                    parts[#parts + 1] = "[" .. string.format("%q", tostring(k)) .. "]=" .. ser(val)
+                end
+                return "{" .. table.concat(parts, ",") .. "}"
+            elseif type(v) == "number" then
+                return tostring(v)
+            else
+                return string.format("%q", tostring(v))
+            end
+        end
+        f:write("return " .. ser(obj) .. "\n")
+        f:close()
+    end)
+end
+
+-- v6 取正文需要 sing（书级，书名查一次）+ chapter_index（书山目录里的序号）。
+-- 插件调用链只有 book_id/item_id，这里内部闭环补齐并缓存：
+--   sing    —— 用 book_names 缓存的书名查 /api/search，取该书的 sing/tab/source；
+--   chindex —— 拉一次 /api/catalog（按 sing），建 item_id→chapter_index 映射。
+-- 两者落盘缓存（<book_cache>/_shushan_v6.lua），一本书只查一次。
+-- 返回 (sing, chapter_index, err)。
+function ShuShan.v6_resolve_params(client, settings, cfg, book_id, item_id)
+    local bid = tostring(book_id)
+    local iid = tostring(item_id)
+    local meta = v6_cache_load(settings, bid) or {}
+
+    -- ① 书籍 sing
+    local sing = H.trim(meta.sing or "")
+    local tab = H.trim(meta.tab or cfg.tab or ShuShan.DEFAULT_TAB)
+    local source = H.trim(meta.source or cfg.source or ShuShan.DEFAULT_SOURCE)
+    if sing == "" then
+        local name = ""
+        local ok_bn, BookNames = pcall(require, "fanqie.book_names")
+        if ok_bn and BookNames and BookNames.get then
+            name = H.trim(BookNames.get(settings, bid) or "")
+        end
+        if name == "" then
+            return nil, nil, "书山v6缺少书名（无法查 sing）：请先刷新书架校正书名"
+        end
+        local ok_s, rows = pcall(ShuShan.search, client, settings, name, { source = source, tab = tab })
+        if not ok_s or type(rows) ~= "table" then
+            return nil, nil, "书山v6按书名查 sing 失败"
+        end
+        for _, row in ipairs(rows) do
+            if type(row) == "table" and tostring(row.book_id or "") == bid then
+                sing = H.trim(row.sing or "")
+                tab = H.trim(row.tab or tab)
+                source = H.trim(row.source or source)
+                break
+            end
+        end
+        if sing == "" then
+            return nil, nil, "书山v6搜索结果里没有这本书的 sing"
+        end
+        meta.sing, meta.tab, meta.source = sing, tab, source
+        meta.index = meta.index or {}
+        v6_cache_save(settings, bid, meta)
+    end
+
+    -- ② chapter_index：从缓存的 item_id→index 映射取
+    local index_map = meta.index or {}
+    local chindex = tonumber(index_map[iid])
+    if not chindex then
+        local v6h, herr = ShuShan.v6_headers(cfg)
+        if not v6h then return nil, nil, herr end
+        local body = client:json_encode({
+            sing = sing, book_id = bid, source = source, tab = tab,
+            title = H.trim(meta.title or ""),
+        })
+        local ok_c, obj = pcall(request_json_multi, client, settings, cfg, {
+            path = "/api/catalog", method = "POST", body = body,
+            headers = v6h, label = "书山v6目录",
+        })
+        if not ok_c or type(obj) ~= "table" or obj.code ~= 0 then
+            local msg = ok_c and obj and obj.message or tostring(obj)
+            return nil, nil, "书山v6目录失败: " .. H.truncate_utf8(tostring(msg), 80)
+        end
+        index_map = {}
+        for _, ch in ipairs(obj.data or {}) do
+            if type(ch) == "table" then
+                local ci = tonumber(ch.chapter_index)
+                local cid = tostring(ch.item_id or "")
+                if ci and cid ~= "" then index_map[cid] = ci end
+                -- 顺手记书名，供下次 search 用（虽然已有 sing 缓存）
+                if ch.title and meta.title == nil then meta.title = tostring(ch.title) end
+            end
+        end
+        chindex = tonumber(index_map[iid])
+        if not chindex then
+            return nil, nil, "书山v6目录里找不到该章节 item_id=" .. iid
+        end
+        meta.index = index_map
+        v6_cache_save(settings, bid, meta)
+    end
+    return sing, chindex, nil
 end
 
 --  Settings accessors
@@ -176,22 +444,44 @@ function ShuShan.candidate_bases(cfg)
     -- 持久化的最近可用节点：仅当用户没改过 server_url 时才沿用
     -- （用户显式改地址 = 有意换节点，旧记忆作废）
     local active = H.trim(cfg.active_base or "")
-    if active ~= "" and normalize_base(cfg.active_base_src) == normalize_base(cfg.server_url) then
+    local active_ms = tonumber(cfg.active_ms or 0) or 0
+    local active_fast = (active_ms <= 0) or (active_ms <= (ShuShan.ACTIVE_MS_OK or 1500))
+    if active ~= "" and active_fast
+        and normalize_base(cfg.active_base_src) == normalize_base(cfg.server_url) then
         add(active)
     end
-    add(cfg.server_url)
+    -- server_url 若就是内置节点，别提前插队：否则一旦首选失败，会先撞上
+    -- 池子里排最后的慢节点（113.44），而不是次快的 v1。
+    local url_in_pool = false
+    local norm_url = normalize_base(cfg.server_url)
+    if norm_url ~= "" then
+        for _, u in ipairs(ShuShan.DEFAULT_NODES) do
+            if normalize_base(u) == norm_url then url_in_pool = true break end
+        end
+    end
+    if not url_in_pool then add(cfg.server_url) end
     for _, u in ipairs(ShuShan.DEFAULT_NODES) do add(u) end
 
     local now = os.time()
-    local hot, cold = {}, {}
+    -- 「慢节点」：最近一次成功但耗时超过 SLOW_MS 的节点，排到所有正常节点之后。
+    -- 实测同一节点会在 0.4s~5s 之间横跳（113.44 那台尤其明显），光靠「失败才切」
+    -- 永远切不走它 —— 它每次都成功，只是慢。
+    local slow_base = normalize_base(cfg.slow_base or "")
+    local slow_until = tonumber(cfg.slow_until or 0) or 0
+    if slow_base == "" or slow_until < now then slow_base = nil end
+
+    local hot, slow, cold = {}, {}, {}
     for _, u in ipairs(out) do
         local until_t = ShuShan._node_cooldown[u]
         if until_t and until_t > now then
             cold[#cold + 1] = u
+        elseif slow_base and u == slow_base then
+            slow[#slow + 1] = u
         else
             hot[#hot + 1] = u
         end
     end
+    for _, u in ipairs(slow) do hot[#hot + 1] = u end
     for _, u in ipairs(cold) do hot[#hot + 1] = u end
     return hot
 end
@@ -199,18 +489,44 @@ end
 -- 节点健康反馈：成功 → 记忆为首选并解除冷却；传输层失败 → 进入冷却。
 -- settings 非空时把"最近可用节点"持久化：章节抓取跑在 fork 子进程里，内存态
 -- 不会回传父进程，不持久化的话主节点持续故障时每个新章节都要重撞一次超时。
-function ShuShan.mark_node_ok(base, settings)
+function ShuShan.mark_node_ok(base, settings, elapsed_ms)
     if not base or base == "" then return end
     ShuShan._preferred_base = base
     ShuShan._node_cooldown[base] = nil
     if not settings then return end
     pcall(function()
         local cfg = settings:get_source("shushan") or {}
-        if H.trim(cfg.active_base or "") == base then return end
-        cfg.active_base = base
-        cfg.active_base_src = normalize_base(cfg.server_url)  -- 记住当时的用户配置
-        cfg.active_base_at = tostring(os.time())
-        settings:set_source("shushan", cfg)
+        local now = os.time()
+        local is_slow = elapsed_ms and elapsed_ms > (ShuShan.SLOW_MS or 1500)
+        local slow_base = H.trim(cfg.slow_base or "")
+        local changed = false
+
+        local new_ms = elapsed_ms and math.floor(elapsed_ms) or nil
+        if H.trim(cfg.active_base or "") ~= base then
+            cfg.active_base = base
+            cfg.active_base_src = normalize_base(cfg.server_url)  -- 记住当时的用户配置
+            cfg.active_base_at = tostring(now)
+            changed = true
+        end
+        -- 记录该节点本次耗时：下次候选排序时用它判断「还配不配当首选」
+        if new_ms and tonumber(cfg.active_ms or 0) ~= new_ms then
+            cfg.active_ms = tostring(new_ms)
+            changed = true
+        end
+        if is_slow then
+            -- 成功但慢：降权 10 分钟，让候选顺序把别的节点排到前面
+            if slow_base ~= base or (tonumber(cfg.slow_until or 0) or 0) < now then
+                cfg.slow_base = base
+                cfg.slow_until = tostring(now + (ShuShan.SLOW_TTL or 600))
+                changed = true
+            end
+        elseif slow_base == base then
+            -- 同一节点这次快了：立刻解除降权
+            cfg.slow_base = nil
+            cfg.slow_until = nil
+            changed = true
+        end
+        if changed then settings:set_source("shushan", cfg) end
     end)
 end
 
@@ -253,7 +569,7 @@ end
 
 -- 多节点请求：只对传输层故障换节点 —— 无响应/超时/连接错误、5xx、2xx 但非 JSON；
 -- 4xx（凭据/设备码/参数问题）不换，直接报错。成功节点记为后续首选并解除冷却。
-local function request_json_multi(client, settings, cfg, opts)
+request_json_multi = function(client, settings, cfg, opts)
     local bases = ShuShan.candidate_bases(cfg)
     local label = opts.label or "书山请求"
     local errors = {}
@@ -266,6 +582,7 @@ local function request_json_multi(client, settings, cfg, opts)
         }
         for k, v in pairs(opts.headers or {}) do h[k] = v end
 
+        local t_req0 = now_ms()
         local ok_req, text, code = pcall(function()
             return client:request({
                 url = base .. opts.path,
@@ -298,7 +615,7 @@ local function request_json_multi(client, settings, cfg, opts)
                 if opts.accept_nonjson then
                     -- 存活探针（/detection）返回的是纯文本 "书山聚合"，不是 JSON。
                     -- 调用方显式声明"可接受非 JSON"时，2xx 即视为该节点成功。
-                    ShuShan.mark_node_ok(base, settings)
+                    ShuShan.mark_node_ok(base, settings, now_ms() - t_req0)
                     if i > 1 then
                         warn("[FanQie] 书山已切换备用节点[" .. label .. "] 节点=" .. short(base)
                             .. " 失败节点数=" .. tostring(i - 1))
@@ -311,7 +628,7 @@ local function request_json_multi(client, settings, cfg, opts)
                     .. " body=" .. H.truncate_utf8(tostring(text):gsub("%s+", " "), 80))
             else
                 local switched = (i > 1)
-                ShuShan.mark_node_ok(base, settings)
+                ShuShan.mark_node_ok(base, settings, now_ms() - t_req0)
                 if switched then
                     warn("[FanQie] 书山已切换备用节点[" .. label .. "] 节点=" .. short(base)
                         .. " 失败节点数=" .. tostring(i - 1))
@@ -336,25 +653,30 @@ function ShuShan.login(client, settings, override_email, override_password)
     if email == "" or password == "" then
         error("书山未填写邮箱/密码（请在书源管理→书山中配置）")
     end
-    -- Build form-urlencoded body (url-encode values).
-    local body = "email=" .. H.url_encode(email) .. "&password=" .. H.url_encode(password)
+    -- v6: POST /api/login {email,password} → data.token (= base64 api_key).
+    -- token 解码回 api_key 原文落盘（v6 签名要用原文；旧路径仍存 base64 兼容）。
+    local body = client:json_encode({ email = email, password = password })
     local obj = request_json_multi(client, settings, cfg, {
-        path = "/login",
+        path = "/api/login",
         method = "POST",
         body = body,
         headers = {
-            ["Content-Type"] = "application/x-www-form-urlencoded",
-            ["X-Novel-Token"] = ShuShan.X_NOVEL_TOKEN,
+            ["Content-Type"] = "application/json",
+            ["User-Agent"] = FanQie.MOBILE_UA,
         },
         label = "书山登录",
     })
-    if not (obj.success or obj.code == 200) then
+    if not (obj.success or obj.code == 0 or obj.code == 200) then
         error(string.format("书山登录失败: %s", tostring(obj.message or obj.msg or obj.error or "")))
     end
-    local user = (obj.data or {}).user or {}
-    local api_key = H.trim(user.api_key or "")
+    local token = H.trim((obj.data or {}).token or "")
+    local api_key = ""
+    if token ~= "" then
+        api_key = H.trim(base64_decode(token))  -- v6: token = base64(api_key)
+        if api_key == "" then api_key = token end
+    end
     if api_key == "" then
-        error("书山登录成功但未返回 api_key")
+        error("书山登录成功但未返回 token")
     end
     -- persist
     local new_cfg = settings:get_source("shushan")
@@ -390,7 +712,8 @@ end
 function ShuShan.get_content(client, settings, book_id, item_id, opts)
     opts = opts or {}
     local cfg = settings:get_source("shushan")
-    local api_key = ShuShan.ensure_api_key(client, settings, false)
+    -- 只为「没登录时自动登录」的副作用；v6 的密钥从 cfg 现取（v6_headers）
+    ShuShan.ensure_api_key(client, settings, false)
     local aid = ShuShan.resolve_android_id(cfg)
     local ok_aid, aid_norm = ShuShan.validate_android_id(aid)
     if not ok_aid then
@@ -398,31 +721,32 @@ function ShuShan.get_content(client, settings, book_id, item_id, opts)
     end
     local dev_type = ShuShan.resolve_device_type(cfg)
     local source = H.trim(opts.source or cfg.source or ShuShan.DEFAULT_SOURCE)
-    -- 书山段评目前只支持番茄聚合源（/para?source=fq 用番茄 item_id 作 chapter_id）。
-    -- 非番茄书（晋江/七猫/…）暂不做段评：避免用番茄通道去错拉其它源的段落评论。
+    -- 段评开关打开时，仅对番茄聚合源注入气泡（段落序号与番茄段评同源）。
     local is_fq_source = source:find("番茄", 1, true) ~= nil
     local cid = tonumber(opts.cid) or 0
     local version = H.trim(opts.version or cfg.content_version or ShuShan.CONTENT_VERSION)
 
+    -- ── v6 正文（2026-11-19）：/api/content + x-novel-* + sing + chapter_index ──
+    local v6h, v6err = ShuShan.v6_headers(cfg)
+    if not v6h then error("书山正文: " .. tostring(v6err)) end
+    local sing, chindex, perr = ShuShan.v6_resolve_params(client, settings, cfg, book_id, item_id)
+    if not sing then error("书山正文: " .. tostring(perr)) end
     local body = client:json_encode({
-        cid = cid,
-        source = source,
+        sing = sing,
         book_id = tostring(book_id),
         item_id = tostring(item_id),
+        chapter_index = chindex,
+        source = source,
+        tab = H.trim(opts.tab or cfg.tab or ShuShan.DEFAULT_TAB),
+        content_md5 = H.trim(opts.content_md5 or ""),
         version = version,
+        devicetype = dev_type,
     })
-
     local obj = request_json_multi(client, settings, cfg, {
-        path = "/content",
+        path = "/api/content",
         method = "POST",
         body = body,
-        headers = {
-            ["Content-Type"] = "application/json",
-            ["X-Api-Key"] = ShuShan.secret_key_header(cfg),
-            ["X-Novel-Token"] = ShuShan.X_NOVEL_TOKEN,
-            ["X-Device-Type"] = dev_type,
-            ["X-Device-Id"] = aid_norm,
-        },
+        headers = v6h,
         label = "书山正文",
     })
 
@@ -430,7 +754,7 @@ function ShuShan.get_content(client, settings, book_id, item_id, opts)
     if obj.status == 429 or obj.code == 429 then
         error(string.format("书山正文被拒(设备码无效): %s 请确认 Android ID 是已登录书山的真实设备。", tostring((obj.data or {}).content or "")))
     end
-    if obj.code and obj.code ~= 200 then
+    if obj.code and obj.code ~= 0 and obj.code ~= 200 then
         error(string.format("书山正文错误 code=%s: %s",
             tostring(obj.code), tostring(obj.msg or (obj.data and obj.data.content) or "")))
     end
@@ -448,9 +772,10 @@ function ShuShan.get_content(client, settings, book_id, item_id, opts)
 
     local para_reviews = {}
     -- 段评气泡：仅当段评开关打开且当前为番茄源时启用。
-    -- GET {host}/para?source=fq&chapter_id=<item_id> → { data:{ list:[{paragraph_id, comment_count}] } }
-    -- paragraph_id 是 0-based 段落行号，与 /content 明文正文的非空行一一对应。
-    -- 这里只注入「每段几条评论」，查看正文走 ShuShan.get_para_review（/idea_comment?api=1）。
+    -- 计数由 _fetch_fq_para_reviews 提供（知秋 paragraph_info / 官方 idea-list），
+    -- 返回 [{paragraph_id, comment_count}]；paragraph_id 是 0-based 段落行号，
+    -- 与 /api/content 明文正文的非空行一一对应。
+    -- 点击查看正文走 ShuShan.get_para_review（书山 v6 /api/comment + JWT）。
     if opts.review and is_fq_source then
         local ok_pr, pr_list = pcall(ShuShan._fetch_fq_para_reviews,
             client, settings, tostring(book_id), tostring(item_id))
@@ -519,133 +844,284 @@ function ShuShan.get_content(client, settings, book_id, item_id, opts)
     }
 end
 
---  番茄段评列表拉取 — GET {host}/para?source=fq&chapter_id=<番茄item_id>
--- 返回 [{paragraph_id, comment_count, hot, ...}, ...]；任何失败返回 nil。
--- 仅对番茄源的章节有意义（其它上游源的 /para source 取值不同，本函数不处理）。
-function ShuShan._fetch_fq_para_reviews(client, settings, book_id, item_id)
-    local cfg = settings:get_source("shushan") or {}
-    ShuShan.ensure_api_key(client, settings, false)
-    local aid = ShuShan.resolve_android_id(cfg)
-    local ok_aid, aid_norm = ShuShan.validate_android_id(aid)
-    if not ok_aid then
-        -- 无设备码则无法拉段评（与正文同源校验）：降级但必须留痕
-        warn("[FanQie] 书山段评跳过: 未配置真实 Android ID, itemId=" .. tostring(item_id))
-        return nil
-    end
-    local dev_type = ShuShan.resolve_device_type(cfg)
-    local obj = request_json_multi(client, settings, cfg, {
-        path = "/para?source=fq&chapter_id=" .. H.url_encode(tostring(item_id)),
-        method = "GET",
-        headers = {
-            ["X-Api-Key"] = ShuShan.secret_key_header(cfg),
-            ["X-Novel-Token"] = ShuShan.X_NOVEL_TOKEN,
-            ["X-Device-Type"] = dev_type,
-            ["X-Device-Id"] = aid_norm,
-        },
-        label = "书山段评",
-    })
-    if obj.code and obj.code ~= 0 then
-        -- /para 是独立通道：失败时正文照常，只有段评气泡消失。2026-09-14 曾发生
-        -- 集群级故障（v1~v4 统一返回 code=-1 "获取番茄段评失败"），正是这条日志定位的。
-        warn("[FanQie] 书山段评接口返回错误: itemId=" .. tostring(item_id)
-            .. " code=" .. tostring(obj.code)
-            .. " msg=" .. H.truncate_utf8(tostring(obj.message or obj.msg or ""):gsub("%s+", " "), 120))
-        return nil
-    end
-    local data = obj.data or {}
-    local list = data.list
-    if type(list) ~= "table" then
-        warn("[FanQie] 书山段评响应结构异常: itemId=" .. tostring(item_id)
-            .. " data_type=" .. type(obj.data) .. " list_type=" .. type(list))
-        return nil
-    end
-    -- 只保留落在「正文实际行数」内的 pid（书山可能返回稀疏的超大全局段id，
-    -- 需在注入前由调用方过滤；这里也先剔除明显的非行号杂值）
-    local out = {}
-    for _, item in ipairs(list) do
-        if type(item) == "table" then
-            table.insert(out, item)
+--  番茄段评气泡计数（按章）—— 返回 [{paragraph_id, comment_count}, ...] 或 nil。
+--  v6（2026-11-19）书山已没有「按章列段落计数」的接口（旧 /para 直接 404），
+--  计数改走番茄自己的 App 段评统计：
+--    ① 官方 idea/list（Comments.stats，按 blk p_idx 计数）—— 主通道；
+--    ② 官方设备身份不可用时，退知秋 paragraph_info 兜底。
+--  段评详情仍由 ShuShan.get_para_review（书山 v6 /api/comment + JWT）提供，
+--  两边共用同一个 pid（para=pid 已实测能取回该段原文与评论）。
+--
+--  ⚡ 计数结果按章落盘缓存（`<book_cache>/<bid>/_pc_<item_id>.lua`）：
+--  这一路请求约 370ms，而翻回老章、重开同一章都会重新进这里，缓存后为 0 请求。
+--  有评论的章缓存 7 天；「本章无评论」只缓存 12 小时（新评论可能随时冒出来）。
+ShuShan.PARA_COUNT_TTL = 7 * 24 * 3600
+ShuShan.PARA_COUNT_TTL_EMPTY = 12 * 3600
+
+local function para_count_path(settings, book_id, item_id)
+    local ok_content, Content = pcall(require, "fanqie.content")
+    if not ok_content or not Content or not Content.book_cache_dir then return nil end
+    local dir = Content.book_cache_dir(settings, book_id)
+    if not dir then return nil end
+    return dir .. "/_pc_" .. tostring(item_id) .. ".lua", dir
+end
+
+-- 返回 (list, hit)：hit=true 表示命中缓存（list 可能是空表 =「本章确认无评论」）
+local function para_count_load(settings, book_id, item_id)
+    local p = para_count_path(settings, book_id, item_id)
+    if not p or not H.file_exists(p) then return nil, false end
+    local ok, obj = pcall(dofile, p)
+    if not ok or type(obj) ~= "table" then return nil, false end
+    local list = {}
+    for _, item in ipairs(obj.list or {}) do
+        local pid = tonumber(item[1])
+        local n = tonumber(item[2])
+        if pid and n and n > 0 then
+            list[#list + 1] = { paragraph_id = pid, comment_count = n }
         end
     end
-    if #out == 0 then
-        log_debug("[FanQie] 书山段评: 本章暂无段评数据 itemId=" .. tostring(item_id))
+    local ttl = (#list == 0) and (ShuShan.PARA_COUNT_TTL_EMPTY or 43200)
+        or (ShuShan.PARA_COUNT_TTL or 604800)
+    local age = os.time() - (tonumber(obj.t) or 0)
+    if age < 0 or age > ttl then return nil, false end
+    return list, true
+end
+
+local function para_count_save(settings, book_id, item_id, list)
+    local p, dir = para_count_path(settings, book_id, item_id)
+    if not p then return end
+    local parts = {}
+    for _, it in ipairs(list or {}) do
+        parts[#parts + 1] = string.format("{%d,%d}", it.paragraph_id, it.comment_count)
     end
-    return out
+    pcall(function()
+        if dir and H.make_dir then H.make_dir(dir) end
+        local f = io.open(p, "w")
+        if not f then return end
+        f:write("return {t=", tostring(os.time()), ",list={",
+            table.concat(parts, ","), "}}\n")
+        f:close()
+    end)
+end
+
+function ShuShan._fetch_fq_para_reviews(client, settings, book_id, item_id)
+    local bid, cid = tostring(book_id), tostring(item_id)
+
+    local cached, hit = para_count_load(settings, bid, cid)
+    if hit then
+        log_debug("[FanQie] 书山段评气泡: 命中本地缓存 paras=" .. #cached
+            .. " itemId=" .. cid)
+        if #cached == 0 then return nil end
+        return cached
+    end
+
+    -- ① 官方 App 段评统计（idea/list，番茄原生计数）
+    local ok_c, Comments = pcall(require, "fanqie.reading.comments")
+    if ok_c and type(Comments) == "table" and Comments.stats then
+        local ok_s, stats = pcall(Comments.stats, client, settings, cid)
+        if ok_s and type(stats) == "table" then
+            local out = {}
+            for pid, info in pairs(stats) do
+                local n = tonumber(type(info) == "table" and info.count or 0) or 0
+                local ipid = tonumber(pid)
+                if ipid and n > 0 then
+                    out[#out + 1] = { paragraph_id = ipid, comment_count = n }
+                end
+            end
+            -- 官方答复是权威的：空结果也缓存，免得下次再白跑一次知秋。
+            para_count_save(settings, bid, cid, out)
+            if #out == 0 then
+                log_debug("[FanQie] 书山段评气泡: 官方统计确认本章无评论 itemId=" .. cid)
+                return nil
+            end
+            log_debug("[FanQie] 书山段评气泡: 计数走官方 idea/list, 有评论段落=" .. #out
+                .. " itemId=" .. cid)
+            return out
+        end
+    end
+
+    -- ② 兜底：知秋 paragraph_info（0-based 非空行号，与书山正文逐行对齐）
+    local ok_z, ZhiQiu = pcall(require, "fanqie.zhiqiu")
+    if ok_z and type(ZhiQiu) == "table" then
+        local ok, data = pcall(function()
+            local zcfg = settings:get_source("zhiqiu") or {}
+            local base = H.trim(zcfg.server_url or ZhiQiu.DEFAULT_BASE)
+            local token = ZhiQiu.ensure_token(client, settings, false)
+            local aid = ZhiQiu.resolve_android_id(settings)
+            local d = ZhiQiu._fetch_paragraph_info(client, settings, bid, cid, token, aid, base)
+            if type(d) ~= "table" then
+                -- 本地 token 还在 3 天窗口内但服务端已失效时，_fetch 只回 nil；
+                -- 这里强刷一次再试，避免整本书都没气泡。
+                token = ZhiQiu.ensure_token(client, settings, true)
+                aid = ZhiQiu.resolve_android_id(settings)
+                d = ZhiQiu._fetch_paragraph_info(client, settings, bid, cid, token, aid, base)
+            end
+            return d
+        end)
+        if ok and type(data) == "table" then
+            local out = {}
+            for pid, info in pairs(data) do
+                local n = tonumber(type(info) == "table" and info.count or 0) or 0
+                local ipid = tonumber(pid)
+                if ipid and n > 0 then
+                    out[#out + 1] = { paragraph_id = ipid, comment_count = n }
+                end
+            end
+            para_count_save(settings, bid, cid, out)
+            if #out > 0 then
+                warn("[FanQie] 书山段评气泡: 官方计数不可用，已退知秋 paragraph_info, itemId=" .. cid)
+                return out
+            end
+        end
+    end
+
+    -- 两条通道都失败：不缓存（下次仍应重试）
+    warn("[FanQie] 书山段评气泡: 计数通道全部失败（官方/知秋），本章不带气泡 itemId=" .. cid)
+    return nil
 end
 
 -- 段落级段评 —— GET {host}/idea_comment?api=1&book_id&item_id&para&cursor
 -- 返回番茄原生结构（与知秋 paragraph_list 同构），main.lua 的解析器可直接吃；
 -- 唯一差异是段落原文在 data.para_src_content，这里注入补齐。
 -- cursor 是偏移量（0/20/40…），不是服务端游标。
+-- 段评详情内存缓存（进程内，30 分钟 / 最多 40 条）
+ShuShan.PR_CACHE_TTL = 30 * 60
+ShuShan.PR_CACHE_MAX = 40
+
 function ShuShan.get_para_review(client, settings, book_id, item_id, para_id, opts)
     opts = opts or {}
     local cfg = settings:get_source("shushan") or {}
     ShuShan.ensure_api_key(client, settings, false)
-    local aid = ShuShan.resolve_android_id(cfg)
-    local ok_aid, aid_norm = ShuShan.validate_android_id(aid)
-    if not ok_aid then
-        error("书山段评需要真实的 Android ID（16/32位hex）。请在书山设置中填写已登录书山的安卓设备 ID。")
-    end
-    local dev_type = ShuShan.resolve_device_type(cfg)
 
     local COUNT    = tonumber(opts.count) or 20
-    -- 懒加载：默认一次只拉 1 页（20 条），首屏 1 次 RTT 即出内容；
-    -- 剩余条数由调用方带 opts.cursor 续拉。page_max 供调用方显式放宽。
     local PAGE_MAX = tonumber(opts.page_max) or 1
-    local sort     = tostring(opts.sort or "1")     -- 1=默认/最热, 0=最新
+    local sort     = tostring(opts.sort or "1")
 
-    local headers = {
-        ["X-Api-Key"]     = ShuShan.secret_key_header(cfg),
-        ["X-Novel-Token"] = ShuShan.X_NOVEL_TOKEN,
-        ["X-Device-Type"] = dev_type,
-        ["X-Device-Id"]   = aid_norm,
+    -- 段评详情内存缓存：同一段反复点开（关掉再点）不必再打网络。
+    -- 只存活在当前进程，上限 40 条、30 分钟过期，评论增删由过期兜底。
+    -- key 必须带上 count / page_max：同一段「首屏 20 条」与「一次拉两页 40 条」
+    -- 结果不同，只按 cursor 做键会互相串用。
+    local cache_key = table.concat({ tostring(book_id), tostring(item_id),
+        tostring(para_id), tostring(tonumber(opts.cursor) or 0),
+        tostring(COUNT), tostring(PAGE_MAX), sort }, ":")
+    local cache = ShuShan._pr_cache
+    if not cache then
+        cache = {}
+        ShuShan._pr_cache = cache
+    end
+    local ce = cache[cache_key]
+    if ce and (os.time() - (ce.t or 0)) < (ShuShan.PR_CACHE_TTL or 1800) then
+        log_debug("[FanQie] 书山段评: 命中内存缓存 para=" .. tostring(para_id)
+            .. " cursor=" .. tostring(opts.cursor or 0))
+        return ce.res
+    end
+
+    -- v6 段评走 SPA JWT（不是 api_key）。JWT 缓存 6 天，过期才重算 PoW。
+    local jwt = ShuShan.ensure_jwt(client, settings, cfg, false)
+    if not jwt then error("书山段评无法获取 JWT（请检查邮箱密码；失败将降级到知秋）") end
+    local h = {
+        ["User-Agent"] = FanQie.MOBILE_UA,
+        ["Accept"] = "application/json",
+        ["Authorization"] = "Bearer " .. jwt,
     }
+    local source = H.trim(opts.source or cfg.source or ShuShan.DEFAULT_SOURCE)
+
+    -- v6 items[] → 插件 data_list[]（main.lua 的 _parseParaReviewResult 可直接吃）
+    local function map_item(it)
+        if type(it) ~= "table" then return nil end
+        local images = {}
+        for _, seg in ipairs(it.segments or {}) do
+            if type(seg) == "table" and seg.type == "image" and type(seg.url) == "string" and seg.url ~= "" then
+                images[#images + 1] = { url = seg.url }
+            end
+        end
+        if #images == 0 then
+            for _, im in ipairs(it.images or {}) do
+                if type(im) == "table" and type(im.url) == "string" and im.url ~= "" then
+                    images[#images + 1] = { url = im.url }
+                end
+            end
+        end
+        local replies = {}
+        for _, r in ipairs(it.reply_list or {}) do
+            if type(r) == "table" then
+                replies[#replies + 1] = {
+                    Common = {
+                        content = { text = tostring(r.content or "") },
+                        user_info = { user_name = tostring(r.user_name or "匿名") },
+                        create_timestamp = r.time,
+                    },
+                    stat = { digg_count = tonumber(r.likes) or 0 },
+                }
+            end
+        end
+        return {
+            comment = {
+                comment_id = tostring(it.id or ""),
+                common = {
+                    content = {
+                        text = tostring(it.content or ""),
+                        image_data_list = images,
+                    },
+                    user_info = { user_name = tostring(it.user_name or "匿名") },
+                    create_timestamp = it.time,
+                },
+                stat = {
+                    digg_count = tonumber(it.likes) or 0,
+                    reply_count = tonumber(it.replies) or 0,
+                },
+                expand = { para_src_content = tostring(it.para_text or it.quote or "") },
+            },
+            replies = replies,
+        }
+    end
 
     local merged = {}
     local para_src = ""
-    local cursor = tostring(opts.cursor or "0")
+    local offset = tonumber(opts.cursor) or 0
+    local next_offset = offset
     local last_total, last_has_more, last_page_full = nil, nil, false
     local page = 0
     while page < PAGE_MAX do
         page = page + 1
-        local path = "/idea_comment?api=1"
-            .. "&book_id=" .. H.url_encode(tostring(book_id))
+        local query = "source=" .. H.url_encode(source)
+            .. "&tab=paras&book_id=" .. H.url_encode(tostring(book_id))
             .. "&item_id=" .. H.url_encode(tostring(item_id))
-            .. "&para="    .. H.url_encode(tostring(para_id))
-            .. "&cursor="  .. H.url_encode(tostring(cursor))
-            .. "&count="   .. tostring(COUNT)
-            .. "&sort="    .. H.url_encode(sort)
+            .. "&para=" .. H.url_encode(tostring(para_id))
+            .. "&offset=" .. tostring(offset) .. "&count=" .. tostring(COUNT)
+            .. "&sort=" .. H.url_encode(sort)
         local obj = request_json_multi(client, settings, cfg, {
-            path = path,
-            method = "GET",
-            headers = headers,
-            label = "书山段评",
-            timeout = opts.timeout or 15,
+            path = "/api/comment?" .. query, method = "GET", headers = h,
+            label = "书山段评", timeout = opts.timeout or 15,
         })
         if obj.code and obj.code ~= 0 then
             error(string.format("书山段评错误: code=%s %s",
                 tostring(obj.code), tostring(obj.message or obj.msg or "")))
         end
         local data = obj.data or {}
-        if para_src == "" and type(data.para_src_content) == "string" then
-            para_src = data.para_src_content
+        if para_src == "" then
+            para_src = tostring(data.quote or "")
+            if para_src == "" and type(data.book) == "table" then para_src = "" end
         end
-        local list = data.data_list
-        if type(list) ~= "table" or #list == 0 then break end
-        for _, item in ipairs(list) do merged[#merged + 1] = item end
-        last_page_full = (#list >= COUNT)
-        local clinfo = data.common_list_info
-        if type(clinfo) == "table" then
-            last_total = tonumber(clinfo.total) or last_total
-            last_has_more = clinfo.has_more
+        local items = data.items
+        if type(items) ~= "table" or #items == 0 then
+            last_page_full = false
+            break
         end
-        if #list < COUNT then break end        -- 本页不足一页 → 到底
-        if type(clinfo) == "table" and clinfo.cursor ~= nil then
-            cursor = tostring(clinfo.cursor)   -- 服务端给了游标则优先采用
-            if clinfo.has_more == false then break end
-        else
-            cursor = tostring((tonumber(cursor) or 0) + #list)  -- 否则按偏移量累加
+        for _, it in ipairs(items) do
+            local mapped = map_item(it)
+            if mapped then merged[#merged + 1] = mapped end
         end
+        last_total = tonumber(data.total) or last_total
+        last_has_more = (data.has_more == true)
+        last_page_full = (#items >= COUNT)
+        -- 下一页 offset：服务端 next 优先（实测是数字；万一是 URL 就按本页条数累加）
+        next_offset = offset + #items
+        local next_off = tonumber(data.next)
+        if next_off then next_offset = next_off end
+        if last_has_more == false or not last_page_full then break end
+        offset = next_offset
+        next_offset = offset
     end
 
     -- 引文注入：让 main.lua 解析器的 comment.expand.para_src_content 拿到段落原文
@@ -668,15 +1144,23 @@ function ShuShan.get_para_review(client, settings, book_id, item_id, para_id, op
             "para=" .. tostring(para_id), "条数=" .. tostring(#merged))
     end
 
-    -- has_more 判定：服务端明确给值优先；否则按「本页是否拉满一页」推断
+    -- has_more 判定：服务端明确给值优先；否则看「本页是否拉满 / 已拉条数是否小于 total」。
+    -- ⚠️ 旧代码这里引用了从未赋值的 last_page_full + 未定义的 cursor，导致
+    -- cursor 恒为 0、has_more 恒为 nil ——「继续加载」点了永远拿到第一页（全重复）。
     local has_more_out = false
     if last_has_more ~= nil then
         has_more_out = (last_has_more == true)
-    else
-        has_more_out = last_page_full
+    end
+    if not has_more_out and last_total then
+        -- 注意用「已拉到的绝对位置」比 total，别用本页条数：
+        -- 续拉时 merged 只有这一页，拿 #merged < total 会永远为真。
+        has_more_out = (next_offset < last_total)
+    end
+    if not has_more_out and not last_total and last_page_full then
+        has_more_out = true
     end
 
-    return {
+    local result = {
         code = 0,
         data = {
             data_list = merged,
@@ -684,10 +1168,25 @@ function ShuShan.get_para_review(client, settings, book_id, item_id, para_id, op
             common_list_info = {
                 total = last_total or #merged,
                 has_more = has_more_out,
-                cursor = tonumber(cursor) or 0,
+                cursor = next_offset,
             },
         },
     }
+
+    -- 写缓存（超过上限先淘汰最旧的一条，LRU 简化版：按写入时间）
+    cache[cache_key] = { t = os.time(), res = result }
+    local n = 0
+    for _ in pairs(cache) do n = n + 1 end
+    if n > (ShuShan.PR_CACHE_MAX or 40) then
+        local oldest_key, oldest_t = nil, nil
+        for k, v in pairs(cache) do
+            local t = (type(v) == "table" and v.t) or 0
+            if not oldest_t or t < oldest_t then oldest_key, oldest_t = k, t end
+        end
+        if oldest_key then cache[oldest_key] = nil end
+    end
+
+    return result
 end
 
 --  Catalog — POST /catalog for one book's chapter list.
@@ -702,22 +1201,42 @@ function ShuShan.get_catalog(client, settings, book_url, opts)
     local tab = H.trim(opts.tab or ShuShan.DEFAULT_TAB)
     local bookid = H.trim(opts.bookid or "")
 
+    -- v6 目录需要 sing：优先从 opts 传，否则按书名查并缓存。
+    local v6h, herr = ShuShan.v6_headers(cfg)
+    if not v6h then error("书山目录: " .. tostring(herr)) end
+    local bookid_str = tostring(bookid)
+    local meta = v6_cache_load(settings, bookid_str) or {}
+    local sing = H.trim(opts.sing or meta.sing or "")
+    if sing == "" then
+        local name2 = H.trim(opts.name or name or "")
+        if name2 == "" then error("书山v6目录缺少 sing 且无书名") end
+        local ok_s, rows = pcall(ShuShan.search, client, settings, name2, { source = source, tab = tab })
+        if ok_s and type(rows) == "table" then
+            for _, row in ipairs(rows) do
+                if type(row) == "table" and (tostring(row.book_id or "") == bookid_str or name2 == H.trim(row.title or "")) then
+                    sing = H.trim(row.sing or "")
+                    if sing ~= "" then
+                        meta.sing, meta.tab, meta.source = sing, H.trim(row.tab or tab), H.trim(row.source or source)
+                        v6_cache_save(settings, bookid_str, meta)
+                        break
+                    end
+                end
+            end
+        end
+        if sing == "" then error("书山v6目录查 sing 失败") end
+    end
     local body = client:json_encode({
+        sing = sing,
+        book_id = bookid_str,
         source = source,
-        url = tostring(book_url),
-        name = name,
         tab = tab,
-        bookid = bookid,
+        title = name,
     })
     local obj = request_json_multi(client, settings, cfg, {
-        path = "/catalog",
+        path = "/api/catalog",
         method = "POST",
         body = body,
-        headers = {
-            ["Content-Type"] = "application/json",
-            ["X-Api-Key"] = ShuShan.secret_key_header(cfg),
-            ["X-Novel-Token"] = ShuShan.X_NOVEL_TOKEN,
-        },
+        headers = v6h,
         label = "书山目录",
     })
     local data = obj.data or obj
@@ -742,18 +1261,21 @@ function ShuShan.search(client, settings, keyword, opts)
     ShuShan.ensure_api_key(client, settings, false)
     local source = H.trim(opts.source or cfg.source or ShuShan.DEFAULT_SOURCE)
     local page = tonumber(opts.page) or 1
-    local path = "/search?login=search&key=" .. H.url_encode(keyword)
-        .. "&page=" .. tostring(page) .. "&source=" .. H.url_encode(source)
+    local tab = H.trim(opts.tab or cfg.tab or ShuShan.DEFAULT_TAB)
+    local v6h, herr = ShuShan.v6_headers(cfg)
+    if not v6h then error("书山搜索: " .. tostring(herr)) end
+    -- v6: GET /api/search?keyword=&page=&tab=[&source=]
+    local path = "/api/search?keyword=" .. H.url_encode(keyword)
+        .. "&page=" .. tostring(page) .. "&tab=" .. H.url_encode(tab)
+        .. "&source=" .. H.url_encode(source)
     local obj = request_json_multi(client, settings, cfg, {
         path = path,
         method = "GET",
-        headers = {
-            ["X-Api-Key"] = ShuShan.secret_key_header(cfg),
-            ["X-Novel-Token"] = ShuShan.X_NOVEL_TOKEN,
-        },
+        headers = v6h,
         label = "书山搜索",
     })
-    return obj.data or obj
+    local data = obj.data or obj
+    return (type(data) == "table" and data.list) or data
 end
 
 -- 按 book_id 精确认领一条搜索结果。
@@ -774,11 +1296,17 @@ function ShuShan.find_book(client, settings, book_id, keyword, opts)
     local ok, rows = pcall(ShuShan.search, client, settings, kw, opts)
     if not ok or type(rows) ~= "table" then return nil end
 
-    local target = "book_id=" .. tostring(book_id)
+    local target = tostring(book_id)
     for _, row in ipairs(rows) do
         if type(row) == "table" then
-            local raw = ShuShan.base64_decode(tostring(row.book_url or ""))
-            if type(raw) == "string" and raw:find(target, 1, true) then
+            -- v6 搜索结果直接带 book_id；旧版需 base64 解 book_url 取 book_id=。
+            local bid = tostring(row.book_id or "")
+            local matched = (bid == target)
+            if not matched then
+                local raw = ShuShan.base64_decode(tostring(row.book_url or ""))
+                matched = (type(raw) == "string" and raw:find("book_id=" .. target, 1, true) ~= nil)
+            end
+            if matched then
                 return {
                     name = H.trim(row.title or ""),
                     cover = H.trim(row.cover or ""),
@@ -881,17 +1409,14 @@ function ShuShan.select_fastest(client, settings, opts)
 end
 
 -- 服务器连通性检查（多节点，任一可达即通过）。
--- /detection 是纯文本探针：必须显式 accept_nonjson，2xx 即算连通；且不带 api_key。
+-- v6 的 /api/site/public 返回 JSON（200），无需鉴权；2xx 即算连通。
 function ShuShan.query_status(client, settings)
     local cfg = settings:get_source("shushan")
     local obj = request_json_multi(client, settings, cfg, {
         path = ShuShan.DETECT_PATH,
         method = "GET",
-        headers = {
-            ["X-Novel-Token"] = ShuShan.X_NOVEL_TOKEN,
-        },
         label = "书山状态",
-        accept_nonjson = true,
+        accept_nonjson = true,   -- 老节点仍可能回纯文本，2xx 即视为可达
     })
     return obj.data or obj
 end

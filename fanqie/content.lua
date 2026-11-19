@@ -457,6 +457,16 @@ function Content.decode_html_entities(text)
     return text
 end
 
+-- 段落文本收尾：去掉 Unicode 前导空白（段首全角空格、NBSP 等）。
+-- 书山 v6 返回的正文每段自带两个 U+3000，而样式表又给了 p{text-indent:2em}，
+-- 两者叠加会变成 4 字符缩进（只有不含全角空格的首段是正常的 2 字符），
+-- 于是出现「有的段落缩进两级、有的正常」。缩进统一交给 CSS，这里只清源文本。
+-- ⚠️ 只动行首空白，不改行数与换行结构（段评 pid 按非空行号对齐）。
+local function trim_para_text(txt)
+    if type(txt) ~= "string" or txt == "" then return "" end
+    return H.trim(H.strip_leading_blank(txt))
+end
+
 function Content.clean_chapter_content(raw_content, title)
     if not raw_content then return "" end
 
@@ -662,7 +672,7 @@ function Content.clean_chapter_content(raw_content, title)
                     local txt = inner:sub(scan, next_tag_start - 1)
                     txt = txt:gsub("<[^>]+>", "")
                     txt = Content.decode_html_entities(txt)
-                    local trimmed = H.trim(txt)
+                    local trimmed = trim_para_text(txt)
                     if trimmed ~= "" then
                         table.insert(parts, xml_escape(trimmed))
                     end
@@ -679,7 +689,7 @@ function Content.clean_chapter_content(raw_content, title)
                 local txt = inner:sub(scan)
                 txt = txt:gsub("<[^>]+>", "")
                 txt = Content.decode_html_entities(txt)
-                local trimmed = H.trim(txt)
+                local trimmed = trim_para_text(txt)
                 if trimmed ~= "" then
                     table.insert(parts, xml_escape(trimmed))
                 end
@@ -722,7 +732,7 @@ function Content.clean_chapter_content(raw_content, title)
                 tail = tail:gsub("<[^>]+>", "")
                 tail = Content.decode_html_entities(tail)
                 for line in (tail .. "\n"):gmatch("([^\n]+)\n") do
-                    line = H.trim(line)
+                    line = trim_para_text(line)
                     if line ~= "" then
                         table.insert(lines, "<p>" .. xml_escape(line) .. "</p>")
                     end
@@ -743,7 +753,7 @@ function Content.clean_chapter_content(raw_content, title)
             before = before:gsub("<[^>]+>", "")
             before = Content.decode_html_entities(before)
             for line in (before .. "\n"):gmatch("([^\n]+)\n") do
-                line = H.trim(line)
+                line = trim_para_text(line)
                 if line ~= "" then
                     table.insert(lines, "<p>" .. xml_escape(line) .. "</p>")
                 end

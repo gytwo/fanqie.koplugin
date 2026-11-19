@@ -557,10 +557,10 @@ function FanQiePlugin:showParaReviewDetail(index)
                         .. "（若持续失败可在书源管理里重置官方设备身份）")
                 end
             elseif is_shushan then
-                -- 书山自有段落级段评 JSON 通道（GET /idea_comment?api=1，2026-09-13 实测可用），
-                -- 不再依赖知秋。ident 格式 shushan:<bid>:<cid>:<pid>，返回番茄原生结构，
-                -- 与 _displayParaReviewDetail 解析器兼容。
-                ok, result = pcall(function() return c:shushan_get_para_review(ident, { page_max = 2 }) end)
+                -- 书山段落级段评走 v6 /api/comment + JWT。ident 格式 shushan:<bid>:<cid>:<pid>。
+                -- 首屏只取一页 30 条（与官方/知秋一致）：两页要两次网络往返，
+                -- 弹窗会多等 300-700ms；看完点「继续加载」再取（cursor 已修好）。
+                ok, result = pcall(function() return c:shushan_get_para_review(ident, { count = 30, page_max = 1 }) end)
                 if not ok then
                     error("书山段评获取失败：" .. tostring(result or "")
                         .. "（请确认书山账号已登录、Android ID 为真实设备）")
@@ -591,8 +591,8 @@ function FanQiePlugin:showParaReviewDetail(index)
                 error("官方段评获取失败：" .. tostring(result or ""))
             end
         elseif is_shushan then
-            -- 书山自有段评通道（不依赖知秋）
-            ok, result = pcall(function() return c:shushan_get_para_review(ident, { page_max = 2 }) end)
+            -- 首屏一页 30 条，与异步分支/其它书源保持一致
+            ok, result = pcall(function() return c:shushan_get_para_review(ident, { count = 30, page_max = 1 }) end)
             if not ok then
                 error("书山段评获取失败：" .. tostring(result or "")
                     .. "（请确认书山账号已登录、Android ID 为真实设备）")
@@ -1122,7 +1122,7 @@ function FanQiePlugin:_displayParaReviewDetail(index, total_reviews, ok, result,
                         { cursor = st.cursor, size = 30 })
                 end
                 return c:shushan_get_para_review(idt,
-                    { cursor = st.cursor, count = 20, page_max = 1 })
+                    { cursor = st.cursor, count = 30, page_max = 1 })
             end, function(ok2, result2, err2)
                 st.busy = false
                 local added = 0   -- 本页真正新增的条数（去重后），供自动续拉判断
